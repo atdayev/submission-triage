@@ -26,11 +26,14 @@ jobs:
           fi
 
       # golangci-lint also runs govet + staticcheck + errcheck, so they
-      # aren't separate steps. Pinned to the version verified locally.
+      # aren't separate steps. install-mode goinstall builds it from source
+      # with this job's Go toolchain, so its build-Go matches go.mod's target
+      # (the prebuilt binaries lag and refuse a newer module Go version).
       - name: lint
         uses: golangci/golangci-lint-action@v6
         with:
           version: v1.64.8
+          install-mode: goinstall
 
       - name: build
         run: go build ./...
