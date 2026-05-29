@@ -1,0 +1,47 @@
+name: Commercial General Liability
+policy_type: cgl
+required_items:
+  - id: acord_125
+    description: "ACORD 125 Commercial Insurance Application"
+    match:
+      filename_patterns:
+        - "*ACORD*125*"
+        - "*acord*125*"
+        - "*application*"
+      content_keywords:
+        - "Commercial Insurance Application"
+        - "ACORD 125"
+  - id: acord_126
+    description: "ACORD 126 Commercial General Liability Section"
+    match:
+      filename_patterns:
+        - "*ACORD*126*"
+        - "*acord*126*"
+        - "*GL*section*"
+      content_keywords:
+        - "Commercial General Liability Section"
+        - "ACORD 126"
+  - id: loss_runs
+    description: "Loss runs for the past 5 years"
+    match:
+      filename_patterns:
+        - "*loss*run*"
+        - "*claims*history*"
+      content_keywords:
+        - "Loss Run"
+        - "Claims History"
+    requires_field:
+      name: years_covered
+      type: number
+      min_value: 5
+  - id: schedule_of_locations
+    description: "Schedule of insured locations"
+    match:
+      filename_patterns:
+        - "*schedule*location*"
+        - "*locations*list*"
+      content_keywords:
+        - "Schedule of Locations"
+escalation:
+  threshold_hours: 72
+  action: email_digest

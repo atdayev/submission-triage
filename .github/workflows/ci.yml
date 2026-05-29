@@ -1,0 +1,42 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      # golangci-lint also runs govet + staticcheck + errcheck, so they
+      # aren't separate steps. Pinned to the version verified locally.
+      - name: lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.64.8
+
+      - name: build
+        run: go build ./...
+
+      - name: test (race)
+        run: go test -race -count=1 ./...
+
+      - name: e2e
+        run: go test -tags=e2e -count=1 ./test/e2e/...

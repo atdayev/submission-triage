@@ -1,0 +1,36 @@
+# Build output
+bin/
+*.exe
+*.test
+
+# Coverage / profiling
+*.out
+coverage.html
+
+# Runtime data & logs
+*.db
+*.db-shm
+*.db-wal
+logs/
+data/
+*.log
+.server.pid
+
+# Local config / secrets
+.env
+.env.local
+
+# Go workspace (local only)
+go.work
+go.work.sum
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Tooling / working notes
+.claude
+HANDOFF.md
+Nic

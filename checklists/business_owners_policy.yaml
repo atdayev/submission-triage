@@ -1,0 +1,42 @@
+name: Business Owners Policy
+policy_type: bop
+required_items:
+  - id: acord_125
+    description: "ACORD 125 Commercial Insurance Application"
+    match:
+      filename_patterns:
+        - "*ACORD*125*"
+        - "*acord*125*"
+        - "*application*"
+      content_keywords:
+        - "Commercial Insurance Application"
+  - id: acord_140
+    description: "ACORD 140 Property Section"
+    match:
+      filename_patterns:
+        - "*ACORD*140*"
+        - "*acord*140*"
+        - "*property*section*"
+      content_keywords:
+        - "Property Section"
+        - "ACORD 140"
+  - id: building_replacement_cost
+    description: "Building replacement cost estimator"
+    match:
+      filename_patterns:
+        - "*replacement*cost*"
+        - "*RCE*"
+      content_keywords:
+        - "Replacement Cost"
+  - id: loss_runs
+    description: "Loss runs for the past 3 years"
+    match:
+      filename_patterns:
+        - "*loss*run*"
+        - "*claims*history*"
+      content_keywords:
+        - "Loss Run"
+        - "Claims History"
+escalation:
+  threshold_hours: 48
+  action: email_digest

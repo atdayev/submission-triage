@@ -1,0 +1,48 @@
+From: Mike Torres <mike.torres@acme-broker.example>
+To: submissions@triage.example
+Subject: New Submission - Riverbend Cafe - BOP
+Message-ID: <02-riverbend-bop@acme-broker.example>
+Date: Mon, 19 May 2026 10:15:00 -0400
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="bnd-02"
+
+--bnd-02
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+Hi team,
+
+Submission for Riverbend Cafe - Business Owners Policy. Full packet attached.
+
+Thanks,
+Mike
+
+--bnd-02
+Content-Type: application/pdf; name="ACORD_125_RiverbendCafe.pdf"
+Content-Disposition: attachment; filename="ACORD_125_RiverbendCafe.pdf"
+Content-Transfer-Encoding: base64
+
+QUNPUkQgMTI1IENvbW1lcmNpYWwgSW5zdXJhbmNlIEFwcGxpY2F0aW9uClJpdmVyYmVuZCBDYWZlCg==
+
+--bnd-02
+Content-Type: application/pdf; name="ACORD_140_RiverbendCafe.pdf"
+Content-Disposition: attachment; filename="ACORD_140_RiverbendCafe.pdf"
+Content-Transfer-Encoding: base64
+
+QUNPUkQgMTQwIFByb3BlcnR5IFNlY3Rpb24KUml2ZXJiZW5kIENhZmUK
+
+--bnd-02
+Content-Type: application/pdf; name="replacement_cost_RiverbendCafe.pdf"
+Content-Disposition: attachment; filename="replacement_cost_RiverbendCafe.pdf"
+Content-Transfer-Encoding: base64
+
+UmVwbGFjZW1lbnQgQ29zdCBFc3RpbWF0b3IKUml2ZXJiZW5kIENhZmUK
+
+--bnd-02
+Content-Type: application/pdf; name="loss_run_3year_RiverbendCafe.pdf"
+Content-Disposition: attachment; filename="loss_run_3year_RiverbendCafe.pdf"
+Content-Transfer-Encoding: base64
+
+TG9zcyBSdW4gLSAzIHllYXJzIGNvdmVyZWQKUml2ZXJiZW5kIENhZmUK
+
+--bnd-02--

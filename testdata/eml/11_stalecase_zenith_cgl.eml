@@ -1,0 +1,29 @@
+From: Anna Wu <anna.wu@acme-broker.example>
+To: submissions@triage.example
+Subject: New Submission - Zenith Apparel - CGL
+Message-ID: <11-zenith-cgl@acme-broker.example>
+Date: Mon, 05 May 2026 09:00:00 -0400
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="bnd-11"
+
+--bnd-11
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+CGL submission for Zenith Apparel. ACORD packet attached. Loss runs and schedule of locations to follow.
+
+--bnd-11
+Content-Type: application/pdf; name="ACORD_125_ZenithApparel.pdf"
+Content-Disposition: attachment; filename="ACORD_125_ZenithApparel.pdf"
+Content-Transfer-Encoding: base64
+
+QUNPUkQgMTI1IENvbW1lcmNpYWwgSW5zdXJhbmNlIEFwcGxpY2F0aW9uClplbml0aCBBcHBhcmVsCg==
+
+--bnd-11
+Content-Type: application/pdf; name="ACORD_126_ZenithApparel.pdf"
+Content-Disposition: attachment; filename="ACORD_126_ZenithApparel.pdf"
+Content-Transfer-Encoding: base64
+
+QUNPUkQgMTI2IENvbW1lcmNpYWwgR2VuZXJhbCBMaWFiaWxpdHkgU2VjdGlvbgpaZW5pdGggQXBwYXJlbAo=
+
+--bnd-11--

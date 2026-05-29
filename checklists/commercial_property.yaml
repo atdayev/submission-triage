@@ -1,0 +1,48 @@
+name: Commercial Property
+policy_type: commercial_property
+required_items:
+  - id: acord_125
+    description: "ACORD 125 Commercial Insurance Application"
+    match:
+      filename_patterns:
+        - "*ACORD*125*"
+        - "*acord*125*"
+        - "*application*"
+      content_keywords:
+        - "Commercial Insurance Application"
+  - id: acord_140
+    description: "ACORD 140 Property Section"
+    match:
+      filename_patterns:
+        - "*ACORD*140*"
+        - "*acord*140*"
+      content_keywords:
+        - "Property Section"
+        - "ACORD 140"
+  - id: schedule_of_values
+    description: "Schedule of values for all locations"
+    match:
+      filename_patterns:
+        - "*schedule*value*"
+        - "*SOV*"
+      content_keywords:
+        - "Schedule of Values"
+  - id: roof_inspection
+    description: "Roof inspection or age statement"
+    match:
+      filename_patterns:
+        - "*roof*"
+      content_keywords:
+        - "Roof Inspection"
+        - "Roof Age"
+  - id: loss_runs
+    description: "Loss runs for the past 5 years"
+    match:
+      filename_patterns:
+        - "*loss*run*"
+        - "*claims*history*"
+      content_keywords:
+        - "Loss Run"
+escalation:
+  threshold_hours: 72
+  action: email_digest

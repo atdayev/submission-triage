@@ -1,0 +1,43 @@
+From: Lara Chen <lara.chen@acme-broker.example>
+To: submissions@triage.example
+Subject: New Submission - Pinegate Logistics - Workers Comp
+Message-ID: <03-pinegate-wc@acme-broker.example>
+Date: Mon, 19 May 2026 11:30:00 -0400
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="bnd-03"
+
+--bnd-03
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+Workers compensation submission for Pinegate Logistics. Everything attached.
+
+--bnd-03
+Content-Type: application/pdf; name="ACORD_130_PinegateLogistics.pdf"
+Content-Disposition: attachment; filename="ACORD_130_PinegateLogistics.pdf"
+Content-Transfer-Encoding: base64
+
+QUNPUkQgMTMwIFdvcmtlcnMgQ29tcGVuc2F0aW9uIEFwcGxpY2F0aW9uClBpbmVnYXRlIExvZ2lzdGljcwo=
+
+--bnd-03
+Content-Type: application/pdf; name="experience_mod_worksheet_PinegateLogistics.pdf"
+Content-Disposition: attachment; filename="experience_mod_worksheet_PinegateLogistics.pdf"
+Content-Transfer-Encoding: base64
+
+RXhwZXJpZW5jZSBNb2RpZmljYXRpb24gV29ya3NoZWV0ClBpbmVnYXRlIExvZ2lzdGljcwo=
+
+--bnd-03
+Content-Type: application/pdf; name="payroll_class_code_PinegateLogistics.pdf"
+Content-Disposition: attachment; filename="payroll_class_code_PinegateLogistics.pdf"
+Content-Transfer-Encoding: base64
+
+UGF5cm9sbCBieSBDbGFzcyBDb2RlClBpbmVnYXRlIExvZ2lzdGljcwo=
+
+--bnd-03
+Content-Type: application/pdf; name="loss_run_5year_PinegateLogistics.pdf"
+Content-Disposition: attachment; filename="loss_run_5year_PinegateLogistics.pdf"
+Content-Transfer-Encoding: base64
+
+TG9zcyBSdW4gLSA1IHllYXJzIGNvdmVyZWQKUGluZWdhdGUgTG9naXN0aWNzCg==
+
+--bnd-03--

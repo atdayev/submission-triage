@@ -1,0 +1,36 @@
+From: Diane Park <diane.park@acme-broker.example>
+To: submissions@triage.example
+Subject: New Submission - Oakview Construction - CGL
+Message-ID: <04-oakview-cgl@acme-broker.example>
+Date: Tue, 20 May 2026 09:00:00 -0400
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="bnd-04"
+
+--bnd-04
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+CGL submission for Oakview Construction. ACORDs and locations attached. Loss runs to follow.
+
+--bnd-04
+Content-Type: application/pdf; name="ACORD_125_OakviewConstruction.pdf"
+Content-Disposition: attachment; filename="ACORD_125_OakviewConstruction.pdf"
+Content-Transfer-Encoding: base64
+
+QUNPUkQgMTI1IENvbW1lcmNpYWwgSW5zdXJhbmNlIEFwcGxpY2F0aW9uCk9ha3ZpZXcgQ29uc3RydWN0aW9uCg==
+
+--bnd-04
+Content-Type: application/pdf; name="ACORD_126_OakviewConstruction.pdf"
+Content-Disposition: attachment; filename="ACORD_126_OakviewConstruction.pdf"
+Content-Transfer-Encoding: base64
+
+QUNPUkQgMTI2IENvbW1lcmNpYWwgR2VuZXJhbCBMaWFiaWxpdHkgU2VjdGlvbgpPYWt2aWV3IENvbnN0cnVjdGlvbgo=
+
+--bnd-04
+Content-Type: application/pdf; name="schedule_of_locations_OakviewConstruction.pdf"
+Content-Disposition: attachment; filename="schedule_of_locations_OakviewConstruction.pdf"
+Content-Transfer-Encoding: base64
+
+U2NoZWR1bGUgb2YgTG9jYXRpb25zCk9ha3ZpZXcgQ29uc3RydWN0aW9uCg==
+
+--bnd-04--

@@ -1,0 +1,41 @@
+name: Cyber Liability
+policy_type: cyber_liability
+required_items:
+  - id: cyber_application
+    description: "Cyber liability application"
+    match:
+      filename_patterns:
+        - "*cyber*application*"
+        - "*cyber*app*"
+      content_keywords:
+        - "Cyber Liability Application"
+  - id: security_questionnaire
+    description: "Security controls questionnaire (MFA, EDR, backups)"
+    match:
+      filename_patterns:
+        - "*security*questionnaire*"
+        - "*controls*questionnaire*"
+      content_keywords:
+        - "Security Questionnaire"
+        - "Multi-Factor Authentication"
+        - "Endpoint Detection"
+  - id: revenue_disclosure
+    description: "Annual revenue and PII record counts"
+    match:
+      filename_patterns:
+        - "*revenue*"
+        - "*PII*"
+      content_keywords:
+        - "Annual Revenue"
+        - "PII Records"
+  - id: incident_history
+    description: "Incident history for the past 3 years"
+    match:
+      filename_patterns:
+        - "*incident*history*"
+        - "*cyber*incident*"
+      content_keywords:
+        - "Incident History"
+escalation:
+  threshold_hours: 48
+  action: email_digest

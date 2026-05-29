@@ -1,0 +1,36 @@
+From: Tom Reilly <tom.reilly@acme-broker.example>
+To: submissions@triage.example
+Subject: New Submission - Bluefin Seafood - Commercial Property
+Message-ID: <05-bluefin-property@acme-broker.example>
+Date: Tue, 20 May 2026 10:30:00 -0400
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="bnd-05"
+
+--bnd-05
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+Property submission for Bluefin Seafood. ACORD packet and SOV attached. Roof report and loss runs to follow.
+
+--bnd-05
+Content-Type: application/pdf; name="ACORD_125_BluefinSeafood.pdf"
+Content-Disposition: attachment; filename="ACORD_125_BluefinSeafood.pdf"
+Content-Transfer-Encoding: base64
+
+QUNPUkQgMTI1IENvbW1lcmNpYWwgSW5zdXJhbmNlIEFwcGxpY2F0aW9uCkJsdWVmaW4gU2VhZm9vZAo=
+
+--bnd-05
+Content-Type: application/pdf; name="ACORD_140_BluefinSeafood.pdf"
+Content-Disposition: attachment; filename="ACORD_140_BluefinSeafood.pdf"
+Content-Transfer-Encoding: base64
+
+QUNPUkQgMTQwIFByb3BlcnR5IFNlY3Rpb24KQmx1ZWZpbiBTZWFmb29kCg==
+
+--bnd-05
+Content-Type: application/pdf; name="SOV_BluefinSeafood.pdf"
+Content-Disposition: attachment; filename="SOV_BluefinSeafood.pdf"
+Content-Transfer-Encoding: base64
+
+U2NoZWR1bGUgb2YgVmFsdWVzCkJsdWVmaW4gU2VhZm9vZAo=
+
+--bnd-05--

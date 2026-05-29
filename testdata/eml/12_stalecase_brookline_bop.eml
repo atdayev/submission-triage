@@ -1,0 +1,29 @@
+From: Greg Olsen <greg.olsen@acme-broker.example>
+To: submissions@triage.example
+Subject: New Submission - Brookline Hardware - BOP
+Message-ID: <12-brookline-bop@acme-broker.example>
+Date: Sun, 11 May 2026 09:00:00 -0400
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="bnd-12"
+
+--bnd-12
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+BOP submission for Brookline Hardware. ACORD packet attached. RCE and loss runs to follow.
+
+--bnd-12
+Content-Type: application/pdf; name="ACORD_125_BrooklineHardware.pdf"
+Content-Disposition: attachment; filename="ACORD_125_BrooklineHardware.pdf"
+Content-Transfer-Encoding: base64
+
+QUNPUkQgMTI1IENvbW1lcmNpYWwgSW5zdXJhbmNlIEFwcGxpY2F0aW9uCkJyb29rbGluZSBIYXJkd2FyZQo=
+
+--bnd-12
+Content-Type: application/pdf; name="ACORD_140_BrooklineHardware.pdf"
+Content-Disposition: attachment; filename="ACORD_140_BrooklineHardware.pdf"
+Content-Transfer-Encoding: base64
+
+QUNPUkQgMTQwIFByb3BlcnR5IFNlY3Rpb24KQnJvb2tsaW5lIEhhcmR3YXJlCg==
+
+--bnd-12--

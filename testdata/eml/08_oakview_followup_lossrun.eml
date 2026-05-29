@@ -1,0 +1,24 @@
+From: Diane Park <diane.park@acme-broker.example>
+To: submissions@triage.example
+Subject: Re: New Submission - Oakview Construction - CGL
+Message-ID: <08-oakview-followup@acme-broker.example>
+In-Reply-To: <04-oakview-cgl@acme-broker.example>
+References: <04-oakview-cgl@acme-broker.example>
+Date: Wed, 21 May 2026 14:00:00 -0400
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="bnd-08"
+
+--bnd-08
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+Sending the 5 year loss runs to complete the file.
+
+--bnd-08
+Content-Type: application/pdf; name="loss_run_5year_OakviewConstruction.pdf"
+Content-Disposition: attachment; filename="loss_run_5year_OakviewConstruction.pdf"
+Content-Transfer-Encoding: base64
+
+TG9zcyBSdW4gLSA1IHllYXJzIGNvdmVyZWQKT2FrdmlldyBDb25zdHJ1Y3Rpb24K
+
+--bnd-08--

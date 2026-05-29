@@ -1,0 +1,31 @@
+From: Tom Reilly <tom.reilly@acme-broker.example>
+To: submissions@triage.example
+Subject: Re: New Submission - Bluefin Seafood - Commercial Property
+Message-ID: <09-bluefin-followup@acme-broker.example>
+In-Reply-To: <05-bluefin-property@acme-broker.example>
+References: <05-bluefin-property@acme-broker.example>
+Date: Thu, 22 May 2026 09:15:00 -0400
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="bnd-09"
+
+--bnd-09
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+Roof inspection and loss runs attached.
+
+--bnd-09
+Content-Type: application/pdf; name="roof_inspection_BluefinSeafood.pdf"
+Content-Disposition: attachment; filename="roof_inspection_BluefinSeafood.pdf"
+Content-Transfer-Encoding: base64
+
+Um9vZiBJbnNwZWN0aW9uClJvb2YgQWdlOiAxMiB5ZWFycwpCbHVlZmluIFNlYWZvb2QK
+
+--bnd-09
+Content-Type: application/pdf; name="loss_run_5year_BluefinSeafood.pdf"
+Content-Disposition: attachment; filename="loss_run_5year_BluefinSeafood.pdf"
+Content-Transfer-Encoding: base64
+
+TG9zcyBSdW4gLSA1IHllYXJzIGNvdmVyZWQKQmx1ZWZpbiBTZWFmb29kCg==
+
+--bnd-09--

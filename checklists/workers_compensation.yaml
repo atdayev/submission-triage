@@ -1,0 +1,43 @@
+name: Workers Compensation
+policy_type: workers_compensation
+required_items:
+  - id: acord_130
+    description: "ACORD 130 Workers Compensation Application"
+    match:
+      filename_patterns:
+        - "*ACORD*130*"
+        - "*acord*130*"
+        - "*workers*comp*application*"
+      content_keywords:
+        - "Workers Compensation Application"
+        - "ACORD 130"
+  - id: experience_mod_worksheet
+    description: "Experience modification worksheet"
+    match:
+      filename_patterns:
+        - "*experience*mod*"
+        - "*exp*mod*worksheet*"
+        - "*emr*"
+      content_keywords:
+        - "Experience Modification"
+        - "Experience Mod Worksheet"
+  - id: payroll_by_class_code
+    description: "Payroll by class code"
+    match:
+      filename_patterns:
+        - "*payroll*class*"
+        - "*class*code*payroll*"
+      content_keywords:
+        - "Payroll by Class"
+        - "Class Code Payroll"
+  - id: loss_runs
+    description: "Loss runs for the past 5 years"
+    match:
+      filename_patterns:
+        - "*loss*run*"
+        - "*claims*history*"
+      content_keywords:
+        - "Loss Run"
+escalation:
+  threshold_hours: 72
+  action: email_digest

@@ -1,0 +1,49 @@
+From: Sarah Bennett <sarah.bennett@acme-broker.example>
+To: submissions@triage.example
+Subject: New Submission - Acme Manufacturing - CGL
+Message-ID: <01-acme-cgl@acme-broker.example>
+Date: Mon, 19 May 2026 09:00:00 -0400
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="bnd-01"
+
+--bnd-01
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+Hi team,
+
+New submission for Acme Manufacturing - Commercial General Liability.
+Attached are the ACORD 125, ACORD 126, 5 year loss runs, and schedule of locations.
+
+Thanks,
+Sarah
+
+--bnd-01
+Content-Type: application/pdf; name="ACORD_125_AcmeManufacturing.pdf"
+Content-Disposition: attachment; filename="ACORD_125_AcmeManufacturing.pdf"
+Content-Transfer-Encoding: base64
+
+QUNPUkQgMTI1IENvbW1lcmNpYWwgSW5zdXJhbmNlIEFwcGxpY2F0aW9uCkFjbWUgTWFudWZhY3R1cmluZwo=
+
+--bnd-01
+Content-Type: application/pdf; name="ACORD_126_AcmeManufacturing.pdf"
+Content-Disposition: attachment; filename="ACORD_126_AcmeManufacturing.pdf"
+Content-Transfer-Encoding: base64
+
+QUNPUkQgMTI2IENvbW1lcmNpYWwgR2VuZXJhbCBMaWFiaWxpdHkgU2VjdGlvbgpBY21lIE1hbnVmYWN0dXJpbmcK
+
+--bnd-01
+Content-Type: application/pdf; name="loss_run_5year_AcmeManufacturing.pdf"
+Content-Disposition: attachment; filename="loss_run_5year_AcmeManufacturing.pdf"
+Content-Transfer-Encoding: base64
+
+TG9zcyBSdW4gLSA1IHllYXJzIGNvdmVyZWQKQWNtZSBNYW51ZmFjdHVyaW5nCg==
+
+--bnd-01
+Content-Type: application/pdf; name="schedule_of_locations_AcmeManufacturing.pdf"
+Content-Disposition: attachment; filename="schedule_of_locations_AcmeManufacturing.pdf"
+Content-Transfer-Encoding: base64
+
+U2NoZWR1bGUgb2YgTG9jYXRpb25zCkFjbWUgTWFudWZhY3R1cmluZwo=
+
+--bnd-01--

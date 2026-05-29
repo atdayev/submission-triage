@@ -1,0 +1,25 @@
+run:
+  timeout: 5m
+
+# Default linters (errcheck, gosimple, govet, ineffassign, staticcheck, unused) stay on
+linters:
+  enable:
+    - bodyclose   # HTTP response bodies are closed
+    - errorlint   # correct error wrapping / errors.Is/As usage
+    - misspell    # typos in comments and strings
+    - unconvert   # redundant type conversions
+    - revive      # golint successor (light default rule set)
+
+linters-settings:
+  revive:
+    rules:
+      # http.HandlerFunc signatures legitimately ignore w or r.
+      - name: unused-parameter
+        disabled: true
+
+issues:
+  exclude-rules:
+    # Tests deliberately ignore some return errors in setup.
+    - path: _test\.go
+      linters:
+        - errcheck

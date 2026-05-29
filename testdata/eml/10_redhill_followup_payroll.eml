@@ -1,0 +1,24 @@
+From: Carlos Mendez <carlos.mendez@acme-broker.example>
+To: submissions@triage.example
+Subject: Re: New Submission - Redhill Roofing - Workers Comp
+Message-ID: <10-redhill-followup@acme-broker.example>
+In-Reply-To: <07-redhill-wc@acme-broker.example>
+References: <07-redhill-wc@acme-broker.example>
+Date: Thu, 22 May 2026 11:00:00 -0400
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="bnd-10"
+
+--bnd-10
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+Payroll by class code attached.
+
+--bnd-10
+Content-Type: application/pdf; name="payroll_class_code_RedhillRoofing.pdf"
+Content-Disposition: attachment; filename="payroll_class_code_RedhillRoofing.pdf"
+Content-Transfer-Encoding: base64
+
+UGF5cm9sbCBieSBDbGFzcyBDb2RlClJlZGhpbGwgUm9vZmluZwo=
+
+--bnd-10--

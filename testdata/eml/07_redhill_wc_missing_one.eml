@@ -1,0 +1,36 @@
+From: Carlos Mendez <carlos.mendez@acme-broker.example>
+To: submissions@triage.example
+Subject: New Submission - Redhill Roofing - Workers Comp
+Message-ID: <07-redhill-wc@acme-broker.example>
+Date: Wed, 21 May 2026 10:00:00 -0400
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="bnd-07"
+
+--bnd-07
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+WC submission for Redhill Roofing. ACORD 130, exp mod, and loss runs attached. Payroll by class code coming separately.
+
+--bnd-07
+Content-Type: application/pdf; name="ACORD_130_RedhillRoofing.pdf"
+Content-Disposition: attachment; filename="ACORD_130_RedhillRoofing.pdf"
+Content-Transfer-Encoding: base64
+
+QUNPUkQgMTMwIFdvcmtlcnMgQ29tcGVuc2F0aW9uIEFwcGxpY2F0aW9uClJlZGhpbGwgUm9vZmluZwo=
+
+--bnd-07
+Content-Type: application/pdf; name="experience_mod_worksheet_RedhillRoofing.pdf"
+Content-Disposition: attachment; filename="experience_mod_worksheet_RedhillRoofing.pdf"
+Content-Transfer-Encoding: base64
+
+RXhwZXJpZW5jZSBNb2RpZmljYXRpb24gV29ya3NoZWV0ClJlZGhpbGwgUm9vZmluZwo=
+
+--bnd-07
+Content-Type: application/pdf; name="loss_run_5year_RedhillRoofing.pdf"
+Content-Disposition: attachment; filename="loss_run_5year_RedhillRoofing.pdf"
+Content-Transfer-Encoding: base64
+
+TG9zcyBSdW4gLSA1IHllYXJzIGNvdmVyZWQKUmVkaGlsbCBSb29maW5nCg==
+
+--bnd-07--
