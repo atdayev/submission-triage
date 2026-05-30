@@ -289,6 +289,9 @@ func (s *SubmissionsService) ingestEmailInner(ctx context.Context, req IngestReq
 		})
 	}
 
+	// age from the email's own time, not when we processed it
+	sub.LastActionAt = inbound.ReceivedAt
+
 	if err := s.repo.Submissions.UpsertSubmission(ctx, sub); err != nil {
 		return IngestResult{}, fmt.Errorf("upsert: %w", err)
 	}

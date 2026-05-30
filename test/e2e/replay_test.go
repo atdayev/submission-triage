@@ -111,6 +111,33 @@ func TestReplayCorpus(t *testing.T) {
 			})
 		}
 	})
+
+	// stale-case fixtures are dated weeks back, so they escalate on a worker run
+	t.Run("stale_submissions_escalate", func(t *testing.T) {
+		if err := built.Service.CheckEscalations(ctx); err != nil {
+			t.Fatalf("check escalations: %v", err)
+		}
+		subs := repository.NewSubmissionRepository(built.DB, log)
+		for _, name := range []string{
+			"11_stalecase_zenith_cgl.eml",
+			"12_stalecase_brookline_bop.eml",
+		} {
+			r, ok := results[name]
+			if !ok {
+				t.Fatalf("%s: no result recorded", name)
+			}
+			got, err := subs.GetByID(ctx, r.SubmissionID)
+			if err != nil {
+				t.Fatalf("%s: get: %v", name, err)
+			}
+			if got.State != model.StateEscalated {
+				t.Errorf("%s: state = %s, want escalated", name, got.State)
+			}
+			if got.EscalatedAt == nil {
+				t.Errorf("%s: EscalatedAt not set", name)
+			}
+		}
+	})
 }
 
 func postCorpus(t *testing.T, baseURL, emlDir string) map[string]ingestResp {
