@@ -143,3 +143,39 @@ func TestApplyDefaults_FillsEscalationExtras(t *testing.T) {
 		t.Error("digest_interval_hours: should default")
 	}
 }
+
+func TestApplyDefaults_FillsIMAPandSMTP(t *testing.T) {
+	cfg := &Config{}
+	applyDefaults(cfg)
+	if cfg.IMAP.Mailbox != "INBOX" {
+		t.Errorf("imap.mailbox default: got %q", cfg.IMAP.Mailbox)
+	}
+	if cfg.IMAP.Port != "993" {
+		t.Errorf("imap.port default: got %q", cfg.IMAP.Port)
+	}
+	if cfg.IMAP.PollIntervalSeconds != 30 {
+		t.Errorf("imap.poll_interval_seconds default: got %d", cfg.IMAP.PollIntervalSeconds)
+	}
+	if cfg.SMTP.Port != "587" {
+		t.Errorf("smtp.port default: got %q", cfg.SMTP.Port)
+	}
+}
+
+func TestIMAPConfigured(t *testing.T) {
+	if (IMAPConfig{Host: "imap.gmail.com"}).Configured() {
+		t.Error("host alone should not count as configured")
+	}
+	full := IMAPConfig{Host: "imap.gmail.com", Username: "u", Password: "p"}
+	if !full.Configured() {
+		t.Error("host+username+password should be configured")
+	}
+}
+
+func TestSMTPConfigured(t *testing.T) {
+	if (SMTPConfig{Host: "smtp.gmail.com"}).Configured() {
+		t.Error("host without from_address should not count as configured")
+	}
+	if !(SMTPConfig{Host: "smtp.gmail.com", FromAddress: "ops@x"}).Configured() {
+		t.Error("host+from_address should be configured")
+	}
+}

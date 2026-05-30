@@ -23,6 +23,8 @@ type slowMail struct {
 	sent    atomic.Int32
 }
 
+func (s *slowMail) Name() string { return "fake" }
+
 func (s *slowMail) SendThreadedReply(_ context.Context, _ model.Reply) (string, error) {
 	<-s.release
 	s.sent.Add(1)

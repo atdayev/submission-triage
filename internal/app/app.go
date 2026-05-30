@@ -91,6 +91,14 @@ func Run() error {
 		service.NewEscalationWorker(built.Service, cfg.Escalation.Interval(), log).Run(rootCtx)
 	}()
 
+	if built.Poller != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			built.Poller.Run(rootCtx)
+		}()
+	}
+
 	<-rootCtx.Done()
 	log.Info("shutdown signal received")
 

@@ -16,6 +16,9 @@ type Config struct {
 	Database   DatabaseConfig   `yaml:"database"`
 	Log        LogConfig        `yaml:"log"`
 	Postmark   PostmarkConfig   `yaml:"postmark"`
+	IMAP       IMAPConfig       `yaml:"imap"`
+	SMTP       SMTPConfig       `yaml:"smtp"`
+	Outbound   OutboundConfig   `yaml:"outbound"`
 	Anthropic  AnthropicConfig  `yaml:"anthropic"`
 	Checklists ChecklistsConfig `yaml:"checklists"`
 	Escalation EscalationConfig `yaml:"escalation"`
@@ -52,6 +55,35 @@ type PostmarkConfig struct {
 	FromName               string `yaml:"from_name"`
 	WebhookSecret          string `yaml:"webhook_secret"`
 	WebhookSignatureSecret string `yaml:"webhook_signature_secret"`
+}
+
+// IMAPConfig drives the optional inbound poller. It activates only when host,
+// username, and password are all set.
+type IMAPConfig struct {
+	Host                string `yaml:"host"`
+	Port                string `yaml:"port"`
+	Username            string `yaml:"username"`
+	Password            string `yaml:"password"`
+	Mailbox             string `yaml:"mailbox"`
+	PollIntervalSeconds int    `yaml:"poll_interval_seconds"`
+	MaxMessageMB        int    `yaml:"max_message_mb"`
+}
+
+// SMTPConfig drives the optional SMTP outbound sender (Gmail App Password,
+// Microsoft 365, or any SMTP server).
+type SMTPConfig struct {
+	Host        string `yaml:"host"`
+	Port        string `yaml:"port"`
+	Username    string `yaml:"username"`
+	Password    string `yaml:"password"`
+	FromAddress string `yaml:"from_address"`
+	FromName    string `yaml:"from_name"`
+}
+
+// OutboundConfig selects the reply channel. Provider is "postmark", "smtp",
+// "log", or "" for auto (smtp if configured, else postmark, else log).
+type OutboundConfig struct {
+	Provider string `yaml:"provider"`
 }
 
 type AnthropicConfig struct {
@@ -135,6 +167,26 @@ func (h HTTPConfig) ShutdownTimeout() time.Duration {
 }
 
 func (a AnthropicConfig) Timeout() time.Duration { return time.Duration(a.TimeoutSec) * time.Second }
+
+// Configured reports whether enough is set to start the IMAP poller.
+func (i IMAPConfig) Configured() bool {
+	return i.Host != "" && i.Username != "" && i.Password != ""
+}
+
+func (i IMAPConfig) PollInterval() time.Duration {
+	return time.Duration(i.PollIntervalSeconds) * time.Second
+}
+
+// MaxMessageBytes is the size above which a message is skipped instead of
+// pulled into memory. Zero means no limit.
+func (i IMAPConfig) MaxMessageBytes() int64 {
+	return int64(i.MaxMessageMB) << 20
+}
+
+// Configured reports whether enough is set to use the SMTP sender.
+func (s SMTPConfig) Configured() bool {
+	return s.Host != "" && s.FromAddress != ""
+}
 
 func (e EscalationConfig) Interval() time.Duration {
 	return time.Duration(e.IntervalMinutes) * time.Minute
@@ -237,5 +289,24 @@ func applyDefaults(c *Config) {
 	}
 	if c.Postmark.FromName == "" {
 		c.Postmark.FromName = "Submission Triage"
+	}
+
+	if c.IMAP.Mailbox == "" {
+		c.IMAP.Mailbox = "INBOX"
+	}
+	if c.IMAP.Port == "" {
+		c.IMAP.Port = "993"
+	}
+	if c.IMAP.PollIntervalSeconds == 0 {
+		c.IMAP.PollIntervalSeconds = 30
+	}
+	if c.IMAP.MaxMessageMB == 0 {
+		c.IMAP.MaxMessageMB = 32
+	}
+	if c.SMTP.Port == "" {
+		c.SMTP.Port = "587"
+	}
+	if c.SMTP.FromName == "" {
+		c.SMTP.FromName = c.Postmark.FromName
 	}
 }

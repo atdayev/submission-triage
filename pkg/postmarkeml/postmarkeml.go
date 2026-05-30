@@ -47,14 +47,19 @@ type Payload struct {
 }
 
 func FromFile(path string) (Payload, error) {
-	var p Payload
 	f, err := os.Open(path)
 	if err != nil {
-		return p, err
+		return Payload{}, err
 	}
 	defer f.Close()
+	return FromReader(f)
+}
 
-	msg, err := mail.ReadMessage(f)
+// FromReader parses an RFC822 message (e.g. a raw message fetched over IMAP)
+// into the same Payload shape as the Postmark webhook produces.
+func FromReader(r io.Reader) (Payload, error) {
+	var p Payload
+	msg, err := mail.ReadMessage(r)
 	if err != nil {
 		return p, fmt.Errorf("parse eml: %w", err)
 	}

@@ -21,6 +21,8 @@ type blockingMail struct {
 	release chan struct{}
 }
 
+func (b *blockingMail) Name() string { return "fake" }
+
 func (b *blockingMail) SendThreadedReply(_ context.Context, _ model.Reply) (string, error) {
 	<-b.release
 	return "ok", nil

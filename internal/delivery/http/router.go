@@ -21,7 +21,13 @@ func NewRouter(cfg *config.Config, svc *service.SubmissionsService, db *sql.DB, 
 	health := handler.NewHealthHandler(db, cfg.Postmark, log)
 
 	r.Get("/health", health.Handle)
-	r.Post("/webhooks/postmark", webhook.Handle)
+
+	// mount only with a secret/signature set; no unauthenticated public ingest
+	if cfg.Postmark.WebhookSecret != "" || cfg.Postmark.WebhookSignatureSecret != "" {
+		r.Post("/webhooks/postmark", webhook.Handle)
+	} else {
+		log.Warn("postmark webhook secret not set; /webhooks/postmark route disabled")
+	}
 
 	return r
 }

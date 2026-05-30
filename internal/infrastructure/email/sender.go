@@ -26,6 +26,8 @@ const (
 
 type Sender interface {
 	SendThreadedReply(ctx context.Context, r model.Reply) (providerMessageID string, err error)
+	// Name reports the outbound channel, recorded as "via" on reply.sent audits.
+	Name() string
 }
 
 type PostmarkSender struct {
@@ -70,6 +72,8 @@ func NewPostmarkSender(cfg config.PostmarkConfig, retryAttempts int, retryBase t
 func NewLogSender(log *logrus.Entry) *LogSender {
 	return &LogSender{log: log}
 }
+
+func (s *PostmarkSender) Name() string { return "postmark" }
 
 func (s *PostmarkSender) SendThreadedReply(ctx context.Context, r model.Reply) (string, error) {
 	if s.cfg.ServerToken == "" {
@@ -158,6 +162,8 @@ func (s *PostmarkSender) postOnce(ctx context.Context, payload []byte) (string, 
 	}
 	return parsed.MessageID, nil
 }
+
+func (s *LogSender) Name() string { return "log" }
 
 func (s *LogSender) SendThreadedReply(_ context.Context, r model.Reply) (string, error) {
 	s.log.WithFields(logrus.Fields{

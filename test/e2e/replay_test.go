@@ -27,6 +27,8 @@ import (
 	"github.com/atdayev/submission-triage/pkg/telemetry"
 )
 
+const e2eWebhookSecret = "e2e-secret"
+
 type ingestResp struct {
 	SubmissionID string `json:"submission_id"`
 	State        string `json:"state"`
@@ -57,7 +59,7 @@ func TestReplayCorpus(t *testing.T) {
 		Service:    config.ServiceConfig{Name: "e2e"},
 		HTTP:       config.HTTPConfig{Port: 0},
 		Database:   config.DatabaseConfig{Path: filepath.Join(t.TempDir(), "e2e.db")},
-		Postmark:   config.PostmarkConfig{FromAddress: "test@triage.example", FromName: "Test"},
+		Postmark:   config.PostmarkConfig{FromAddress: "test@triage.example", FromName: "Test", WebhookSecret: e2eWebhookSecret},
 		Checklists: config.ChecklistsConfig{Directory: filepath.Join(repoRoot, "checklists")},
 		Escalation: config.EscalationConfig{IntervalMinutes: 60, ThresholdHours: 72},
 		Retry:      config.RetryConfig{Attempts: 1, BaseDelayMs: 1},
@@ -153,7 +155,13 @@ func postCorpus(t *testing.T, baseURL, emlDir string) map[string]ingestResp {
 		}
 		raw, _ := json.Marshal(payload)
 
-		resp, err := client.Post(baseURL+"/webhooks/postmark", "application/json", bytes.NewReader(raw))
+		req, err := http.NewRequest(http.MethodPost, baseURL+"/webhooks/postmark", bytes.NewReader(raw))
+		if err != nil {
+			t.Fatalf("%s: new request: %v", name, err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Webhook-Secret", e2eWebhookSecret)
+		resp, err := client.Do(req)
 		if err != nil {
 			t.Fatalf("%s: post: %v", name, err)
 		}

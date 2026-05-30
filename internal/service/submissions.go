@@ -98,6 +98,7 @@ type IngestRequest struct {
 	BodyText    string
 	ReceivedAt  time.Time
 	Attachments []model.Attachment
+	Source      string // inbound channel: "postmark" | "imap"
 }
 
 type IngestResult struct {
@@ -188,6 +189,7 @@ func (s *SubmissionsService) ingestEmailInner(ctx context.Context, req IngestReq
 			if e.DeterministicID == emailID {
 				s.audit(ctx, sub.ID, model.EventEmailDuplicate, map[string]any{
 					"deterministic_id": emailID,
+					"source":           req.Source,
 				})
 				return IngestResult{
 					SubmissionID: sub.ID,
@@ -236,6 +238,7 @@ func (s *SubmissionsService) ingestEmailInner(ctx context.Context, req IngestReq
 		"deterministic_id": emailID,
 		"message_id":       req.MessageID,
 		"attachment_count": len(req.Attachments),
+		"source":           req.Source,
 	})
 
 	checklistDef, hasChecklist := s.checklists.Get(sub.PolicyType)
@@ -375,6 +378,7 @@ func (s *SubmissionsService) sendAndRecordReply(ctx context.Context, sub *model.
 		"provider_msg_id": providerMsgID,
 		"to":              reply.ToAddress,
 		"subject":         reply.Subject,
+		"via":             s.mail.Name(),
 	})
 }
 

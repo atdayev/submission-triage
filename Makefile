@@ -4,6 +4,10 @@ BIN_DIR := bin
 SERVER_BIN := $(BIN_DIR)/server
 REPLAY_BIN := $(BIN_DIR)/replay
 
+# The webhook route is gated on a secret; the demo sets a local one so the
+# replay tool is allowed through.
+DEMO_WEBHOOK_SECRET ?= demo-local-secret
+
 build:
 	go build -o $(SERVER_BIN) ./cmd/server
 	go build -o $(REPLAY_BIN) ./cmd/replay
@@ -19,9 +23,9 @@ run: build
 
 demo: build
 	@mkdir -p data logs
-	$(SERVER_BIN) & echo $$! > .server.pid
+	POSTMARK_WEBHOOK_SECRET=$(DEMO_WEBHOOK_SECRET) $(SERVER_BIN) & echo $$! > .server.pid
 	@sleep 2
-	$(REPLAY_BIN) -dir ./testdata/eml -url http://localhost:8080/webhooks/postmark
+	$(REPLAY_BIN) -dir ./testdata/eml -url http://localhost:8080/webhooks/postmark -secret $(DEMO_WEBHOOK_SECRET)
 	@tail -f logs/submission-triage.log || true
 	@kill `cat .server.pid` 2>/dev/null || true
 	@rm -f .server.pid

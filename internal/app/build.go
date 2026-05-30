@@ -5,12 +5,14 @@ import (
 	"database/sql"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/sirupsen/logrus"
 
 	"github.com/atdayev/submission-triage/internal/config"
 	"github.com/atdayev/submission-triage/internal/database"
 	deliveryhttp "github.com/atdayev/submission-triage/internal/delivery/http"
+	"github.com/atdayev/submission-triage/internal/delivery/imap"
 	"github.com/atdayev/submission-triage/internal/infrastructure/checklist"
 	"github.com/atdayev/submission-triage/internal/infrastructure/classifier"
 	"github.com/atdayev/submission-triage/internal/infrastructure/email"
@@ -25,6 +27,7 @@ type BuiltApp struct {
 	DB      *sql.DB
 	Service *service.SubmissionsService
 	Router  http.Handler
+	Poller  *imap.Poller // nil unless IMAP is configured
 }
 
 func Build(ctx context.Context, cfg *config.Config, log *logrus.Entry, migrationsDir string, metrics *telemetry.Metrics) (*BuiltApp, error) {
@@ -51,13 +54,12 @@ func Build(ctx context.Context, cfg *config.Config, log *logrus.Entry, migration
 	}
 	clf := classifier.NewHeuristicLLMClassifier(llmClient)
 
-	var sender email.Sender
-	if cfg.Postmark.ServerToken != "" {
-		sender = email.NewPostmarkSender(cfg.Postmark, cfg.Retry.Attempts, cfg.Retry.BaseDelay(), log)
-	} else {
-		log.Warn("postmark server token not set; falling back to log-only sender")
-		sender = email.NewLogSender(log)
+	sender, err := chooseSender(cfg, log)
+	if err != nil {
+		_ = db.Close()
+		return nil, err
 	}
+	log.WithField("provider", sender.Name()).Info("outbound mail sender selected")
 
 	pdfExt := extractor.NewPDF()
 	csvExt := extractor.NewCSV()
@@ -84,9 +86,46 @@ func Build(ctx context.Context, cfg *config.Config, log *logrus.Entry, migration
 
 	router := deliveryhttp.NewRouter(cfg, svc, db, log)
 
+	var poller *imap.Poller
+	if cfg.IMAP.Configured() {
+		poller = imap.NewPoller(cfg.IMAP, svc, log)
+	}
+
+	webhookOn := cfg.Postmark.WebhookSecret != "" || cfg.Postmark.WebhookSignatureSecret != ""
+	if !webhookOn && poller == nil {
+		log.Warn("no inbound channel configured (no webhook secret, no IMAP); the service will not ingest mail")
+	}
+
 	return &BuiltApp{
 		DB:      db,
 		Service: svc,
 		Router:  router,
+		Poller:  poller,
 	}, nil
+}
+
+// chooseSender picks the outbound channel: an explicit outbound.provider wins;
+// empty auto-selects SMTP, then Postmark, then the log sender.
+func chooseSender(cfg *config.Config, log *logrus.Entry) (email.Sender, error) {
+	attempts, base := cfg.Retry.Attempts, cfg.Retry.BaseDelay()
+	switch strings.ToLower(cfg.Outbound.Provider) {
+	case "smtp":
+		return email.NewSMTPSender(cfg.SMTP, attempts, base, log), nil
+	case "postmark":
+		return email.NewPostmarkSender(cfg.Postmark, attempts, base, log), nil
+	case "log":
+		return email.NewLogSender(log), nil
+	case "":
+		switch {
+		case cfg.SMTP.Configured():
+			return email.NewSMTPSender(cfg.SMTP, attempts, base, log), nil
+		case cfg.Postmark.ServerToken != "":
+			return email.NewPostmarkSender(cfg.Postmark, attempts, base, log), nil
+		default:
+			log.Warn("no outbound provider configured; falling back to log-only sender")
+			return email.NewLogSender(log), nil
+		}
+	default:
+		return nil, fmt.Errorf("unknown outbound provider %q (want postmark|smtp|log)", cfg.Outbound.Provider)
+	}
 }

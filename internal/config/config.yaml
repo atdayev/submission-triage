@@ -24,6 +24,26 @@ postmark:
   webhook_secret: ${POSTMARK_WEBHOOK_SECRET}
   webhook_signature_secret: ${POSTMARK_WEBHOOK_SIGNATURE_SECRET}
 
+imap:
+  host: ${IMAP_HOST}
+  port: ${IMAP_PORT}
+  username: ${IMAP_USERNAME}
+  password: ${IMAP_PASSWORD}
+  mailbox: ${IMAP_MAILBOX}
+  poll_interval_seconds: ${IMAP_POLL_INTERVAL_SECONDS}
+  max_message_mb: ${IMAP_MAX_MESSAGE_MB}
+
+smtp:
+  host: ${SMTP_HOST}
+  port: ${SMTP_PORT}
+  username: ${SMTP_USERNAME}
+  password: ${SMTP_PASSWORD}
+  from_address: ${SMTP_FROM_ADDRESS}
+  from_name: ${SMTP_FROM_NAME}
+
+outbound:
+  provider: ${OUTBOUND_PROVIDER}
+
 anthropic:
   api_key: ${ANTHROPIC_API_KEY}
   model: ${ANTHROPIC_MODEL}

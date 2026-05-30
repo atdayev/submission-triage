@@ -20,6 +20,7 @@ import (
 func main() {
 	dir := flag.String("dir", "./testdata/eml", "directory of .eml files to replay")
 	url := flag.String("url", "http://localhost:8080/webhooks/postmark", "webhook URL")
+	secret := flag.String("secret", os.Getenv("POSTMARK_WEBHOOK_SECRET"), "X-Webhook-Secret header; defaults to $POSTMARK_WEBHOOK_SECRET")
 	flag.Parse()
 
 	entries, err := os.ReadDir(*dir)
@@ -53,6 +54,9 @@ func main() {
 			continue
 		}
 		req.Header.Set("Content-Type", "application/json")
+		if *secret != "" {
+			req.Header.Set("X-Webhook-Secret", *secret)
+		}
 
 		resp, err := client.Do(req)
 		if err != nil {

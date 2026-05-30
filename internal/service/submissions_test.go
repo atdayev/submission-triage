@@ -23,6 +23,8 @@ type fakeMail struct {
 	shouldFail bool
 }
 
+func (f *fakeMail) Name() string { return "fake" }
+
 func (f *fakeMail) SendThreadedReply(_ context.Context, r model.Reply) (string, error) {
 	if f.shouldFail {
 		return "", context.DeadlineExceeded

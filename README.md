@@ -25,7 +25,8 @@ loop is proving itself.
 
 ## What it does
 
-- Watches an inbox via Postmark inbound webhook.
+- Watches an inbox — poll any IMAP mailbox (Gmail App Password, Microsoft
+  365, generic) or receive a Postmark inbound webhook.
 - Parses email + attachments (PDF, DOCX, XLSX, CSV, plain).
 - Classifies each attachment against a YAML-defined checklist.
 - Extracts structured fields from attachments via Anthropic tool-use
@@ -40,6 +41,46 @@ loop is proving itself.
 - Writes a structured audit entry for every state change, every external
   call, and every LLM call (prompt hash, latency, token usage, estimated
   cost in USD).
+
+## Mail channels
+
+Inbound and outbound are independent and either can be Postmark or your own
+mailbox. Pick the on-ramp that fits.
+
+**IMAP + SMTP (five-minute on-ramp).** Point the tool at an existing mailbox.
+No domain, no DNS, no provider signup — a Gmail App Password is enough. The
+poller checks the inbox every `IMAP_POLL_INTERVAL_SECONDS`, runs each new
+unread message through the pipeline, replies over SMTP from the same mailbox
+(threaded via `Message-ID` / `In-Reply-To` / `References`), then marks the
+message read.
+
+```bash
+IMAP_HOST=imap.gmail.com  IMAP_USERNAME=you@gmail.com  IMAP_PASSWORD=<app-password>
+SMTP_HOST=smtp.gmail.com  SMTP_USERNAME=you@gmail.com  SMTP_PASSWORD=<app-password>
+SMTP_FROM_ADDRESS=you@gmail.com
+```
+
+**Postmark (production).** Set `POSTMARK_SERVER_TOKEN` and a
+`POSTMARK_WEBHOOK_SECRET`; the `/webhooks/postmark` route registers itself and
+ingests Postmark's inbound payloads. The webhook route is mounted **only** when
+a secret (or HMAC signature secret) is set — there is no unauthenticated public
+ingest endpoint.
+
+**Channel selection** is by configuration at startup:
+
+- Inbound: the IMAP poller starts when `IMAP_HOST`/`USERNAME`/`PASSWORD` are
+  set; the webhook mounts when a webhook secret is set. Both can run at once.
+- Outbound: `OUTBOUND_PROVIDER` = `postmark` | `smtp` | `log`, or empty for
+  auto (SMTP if configured, else Postmark if a token is set, else log-only).
+
+Idempotency is channel-agnostic — the deterministic email ID is
+`SHA256(Message-ID + body + sorted attachment hashes)`, so the same message
+arriving via both channels dedupes. Every audit entry records the channel it
+used (`source: postmark|imap` on inbound, `via: postmark|smtp|log` on
+outbound) so actions stay unambiguous when both modes run together.
+
+> Auth today is password / App Password (IMAP/SMTP over TLS). OAuth2 (XOAUTH2)
+> for Gmail / 365 is future work.
 
 ## 30-second demo
 
@@ -80,7 +121,7 @@ pkg/ ── logger, apperror, utils, retry, glob, postmarkeml, telemetry
 | Domain | [internal/model/](internal/model/) | entities, state machine, pure checklist evaluation | stdlib only |
 | Repository | [internal/repository/](internal/repository/) | storage contracts + SQLite impl | model, database |
 | Service | [internal/service/](internal/service/) | use cases, idempotency, audit, retries | repository (interfaces), infrastructure (interfaces) |
-| Delivery | [internal/delivery/](internal/delivery/) | HTTP handlers + workers | service, pkg/* |
+| Delivery | [internal/delivery/](internal/delivery/) | HTTP handlers, IMAP poller, shared payload→ingest mapping | service, pkg/* |
 | Infrastructure | [internal/infrastructure/](internal/infrastructure/) | adapters for Postmark, Anthropic, PDF, DOCX, XLSX, CSV, checklist YAML | model, pkg/* |
 | App | [internal/app/app.go](internal/app/app.go) | composition root, graceful shutdown | everything |
 | Cmd | [cmd/server/main.go](cmd/server/main.go) | entry point | app only |
@@ -222,6 +263,7 @@ These are explicit non-goals for v1 — not "we forgot."
 - Producer scorecard rollups (missing-doc rates by producer)
 - Carrier-specific checklist overlays
 - Slack escalation channel as an alternative to email digests
+- OAuth2 (XOAUTH2) for Gmail / Microsoft 365 inbound and outbound
 
 ## License
 

@@ -4,19 +4,17 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/sirupsen/logrus"
 
 	"github.com/atdayev/submission-triage/internal/config"
-	"github.com/atdayev/submission-triage/internal/model"
+	"github.com/atdayev/submission-triage/internal/delivery/emailingest"
 	"github.com/atdayev/submission-triage/internal/service"
 	"github.com/atdayev/submission-triage/pkg/apperror"
 	"github.com/atdayev/submission-triage/pkg/logger"
@@ -75,7 +73,7 @@ func (h *WebhookHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := h.svc.IngestEmail(ctx, translate(payload))
+	result, err := h.svc.IngestEmail(ctx, emailingest.Translate(payload, "postmark"))
 	if err != nil {
 		log.WithError(err).Error("ingest failed")
 		utils.WriteJSONError(w, r, http.StatusInternalServerError,
@@ -125,80 +123,4 @@ func verifyHMAC(secret string, body []byte, provided string) bool {
 	mac.Write(body)
 	expected := hex.EncodeToString(mac.Sum(nil))
 	return subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) == 1
-}
-
-func translate(p postmarkeml.Payload) service.IngestRequest {
-	var inReplyTo string
-	var references []string
-	for _, hdr := range p.Headers {
-		switch strings.ToLower(hdr.Name) {
-		case "in-reply-to":
-			inReplyTo = strings.TrimSpace(hdr.Value)
-		case "references":
-			for _, v := range strings.Fields(hdr.Value) {
-				references = append(references, strings.TrimSpace(v))
-			}
-		}
-	}
-
-	to := make([]string, 0, len(p.ToFull))
-	for _, t := range p.ToFull {
-		to = append(to, t.Email)
-	}
-	if len(to) == 0 && p.To != "" {
-		to = []string{p.To}
-	}
-
-	receivedAt := time.Now().UTC()
-	if t, err := time.Parse(time.RFC1123Z, p.Date); err == nil {
-		receivedAt = t.UTC()
-	}
-
-	atts := make([]model.Attachment, 0, len(p.Attachments))
-	for _, a := range p.Attachments {
-		raw, err := base64.StdEncoding.DecodeString(a.Content)
-		if err != nil {
-			continue
-		}
-		sum := sha256.Sum256(raw)
-		atts = append(atts, model.Attachment{
-			Filename:    a.Name,
-			ContentType: a.ContentType,
-			Size:        len(raw),
-			SHA256:      hex.EncodeToString(sum[:]),
-			Content:     raw,
-		})
-	}
-
-	fromAddr := p.FromFull.Email
-	if fromAddr == "" {
-		fromAddr = p.From
-	}
-
-	return service.IngestRequest{
-		MessageID:   trimAngle(p.MessageID),
-		InReplyTo:   trimAngle(inReplyTo),
-		References:  trimAngles(references),
-		FromAddress: fromAddr,
-		FromName:    p.FromFull.Name,
-		ToAddresses: to,
-		Subject:     p.Subject,
-		BodyText:    p.TextBody,
-		ReceivedAt:  receivedAt,
-		Attachments: atts,
-	}
-}
-
-func trimAngle(s string) string {
-	return strings.Trim(s, "<>")
-}
-
-func trimAngles(in []string) []string {
-	out := make([]string, 0, len(in))
-	for _, v := range in {
-		if v = trimAngle(v); v != "" {
-			out = append(out, v)
-		}
-	}
-	return out
 }
