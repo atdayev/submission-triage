@@ -8,11 +8,7 @@ import (
 	"testing"
 )
 
-// bigStringReader emits a JSON-valued document whose string value is huge:
-//
-//	{"x":"aaaaaaaaaaaa...
-//
-// Without termination — long enough to force MaxBytesReader to trip.
+// bigStringReader emits an unterminated, huge JSON string to trip MaxBytesReader.
 type bigStringReader struct {
 	wrote  int64
 	target int64

@@ -11,9 +11,7 @@ import (
 	repomocks "github.com/atdayev/submission-triage/internal/repository/mocks"
 )
 
-// Asserts the structured payload shape of EventLLMCall — the spec lists
-// prompt hash, latency, token usage, and estimated cost as first-class
-// audit attributes.
+// asserts the EventLLMCall payload carries prompt hash, latency, tokens, and cost
 func TestIngestEmail_LLMCallAuditPayload_Shape(t *testing.T) {
 	subs := repomocks.NewSubmissionRepository(t)
 	aud := repomocks.NewAuditRepository(t)

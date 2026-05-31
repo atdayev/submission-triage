@@ -171,9 +171,7 @@ func TestSubmissionRepo_Documents_ExtractedFieldsRoundTrip(t *testing.T) {
 	}
 }
 
-// Legacy rows had missing_items stored as ["a","b"]; the new shape is
-// [{id,...}]. The loader must accept both so an existing DB doesn't break
-// on first read after the model change.
+// legacy rows stored missing_items as ["a","b"]; the loader must accept both shapes.
 func TestSubmissionRepo_DecodeMissingItems_LegacyStringArray(t *testing.T) {
 	db, subs, _ := setupDB(t)
 	ctx := context.Background()

@@ -13,6 +13,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/joho/godotenv"
+
 	"github.com/atdayev/submission-triage/internal/config"
 	"github.com/atdayev/submission-triage/internal/service"
 	"github.com/atdayev/submission-triage/pkg/logger"
@@ -20,11 +22,12 @@ import (
 )
 
 func Run() error {
+	_ = godotenv.Load() // best-effort: .env into process env if present, never overrides existing vars
+
 	migrateOnly := flag.Bool("migrate-only", false, "run migrations and exit")
-	cfgPath := flag.String("config", config.DefaultPath(), "path to config.yaml")
 	flag.Parse()
 
-	cfg, err := config.Load(*cfgPath)
+	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}

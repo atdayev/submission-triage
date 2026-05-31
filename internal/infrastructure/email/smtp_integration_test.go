@@ -15,9 +15,7 @@ import (
 	"github.com/atdayev/submission-triage/internal/model"
 )
 
-// This test runs the real realSMTPSend against a minimal in-process SMTP
-// server, exercising the EHLO/AUTH/MAIL/RCPT/DATA sequence. net/smtp allows
-// PLAIN auth over plaintext to 127.0.0.1, so no TLS certs are needed.
+// runs realSMTPSend against a minimal in-process SMTP server (EHLO/AUTH/MAIL/RCPT/DATA).
 
 type receivedMail struct {
 	authed   bool

@@ -7,10 +7,7 @@ import (
 	"time"
 )
 
-// retry.Do doubles the delay after each failed attempt. With baseDelay=10ms
-// and attempts=4 the unjittered sleeps are 10ms + 20ms + 40ms = 70ms. We
-// stub jitter to identity so the assertion isn't flaky against the ±20%
-// randomization.
+// base 10ms over 4 attempts, jitter stubbed to identity → sleeps sum to 70ms.
 func TestDo_BackoffDoubles(t *testing.T) {
 	origJitter := jitter
 	jitter = func(d time.Duration) time.Duration { return d }

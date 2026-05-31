@@ -94,9 +94,7 @@ func TestDOCX_NoDocumentXML_ReturnsEmpty(t *testing.T) {
 }
 
 func TestDOCX_PartTooLarge_RejectedBySizeGuard(t *testing.T) {
-	// Compose a document.xml whose uncompressed size exceeds the cap.
-	// We use a long repeated string of text inside one <w:t> node so the
-	// zip's uncompressed size is large but the compressed size is small.
+	// document.xml whose uncompressed size exceeds the cap (small compressed, large inflated)
 	huge := strings.Repeat("X", maxDocxPartBytes+1024)
 	var buf bytes.Buffer
 	zw := zip.NewWriter(&buf)

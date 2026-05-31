@@ -14,10 +14,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/joho/godotenv"
+
 	"github.com/atdayev/submission-triage/pkg/postmarkeml"
 )
 
 func main() {
+	_ = godotenv.Load() // best-effort: .env into process env if present
+
 	dir := flag.String("dir", "./testdata/eml", "directory of .eml files to replay")
 	url := flag.String("url", "http://localhost:8080/webhooks/postmark", "webhook URL")
 	secret := flag.String("secret", os.Getenv("POSTMARK_WEBHOOK_SECRET"), "X-Webhook-Secret header; defaults to $POSTMARK_WEBHOOK_SECRET")

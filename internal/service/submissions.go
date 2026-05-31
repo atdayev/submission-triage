@@ -77,7 +77,13 @@ type SubmissionsService struct {
 	replyJobs  chan replyJob
 	replyWG    sync.WaitGroup // worker lifecycle
 	inFlightWG sync.WaitGroup // per-enqueued-job
+
+	replyCtx    context.Context // reply lifetime; canceled at Shutdown
+	replyCancel context.CancelFunc
+	drainGrace  time.Duration
 }
+
+const defaultReplyDrainGrace = 10 * time.Second
 
 type replyJob struct {
 	ctx           context.Context
@@ -135,11 +141,26 @@ func NewSubmissionsService(d Dependencies) *SubmissionsService {
 		log:        d.Log,
 		replyJobs:  make(chan replyJob, queue),
 	}
+	s.replyCtx, s.replyCancel = context.WithCancel(context.Background())
+	s.drainGrace = d.Config.HTTP.ShutdownTimeout()
+	if s.drainGrace <= 0 {
+		s.drainGrace = defaultReplyDrainGrace
+	}
 	for i := 0; i < workers; i++ {
 		s.replyWG.Add(1)
 		go s.replyWorker()
 	}
 	return s
+}
+
+// replyJobContext detaches a reply from the request lifecycle but keeps it
+// cancelable at shutdown, carrying over request-scoped logging values.
+func (s *SubmissionsService) replyJobContext(reqCtx context.Context) context.Context {
+	jobCtx := logger.ContextWithLogger(s.replyCtx, logger.GetLoggerFromContext(reqCtx))
+	if rid := logger.RequestIDFromContext(reqCtx); rid != "" {
+		jobCtx = logger.ContextWithRequestID(jobCtx, rid)
+	}
+	return jobCtx
 }
 
 func (s *SubmissionsService) replyWorker() {
@@ -305,7 +326,7 @@ func (s *SubmissionsService) ingestEmailInner(ctx context.Context, req IngestReq
 		MissingItems: missing,
 	}
 	job := replyJob{
-		ctx:           context.WithoutCancel(ctx),
+		ctx:           s.replyJobContext(ctx),
 		sub:           *sub,
 		missing:       missing,
 		inbound:       inbound,
@@ -330,9 +351,22 @@ func (s *SubmissionsService) ingestEmailInner(ctx context.Context, req IngestReq
 // Wait blocks until queued replies finish. Re-entrant; doesn't stop the pool.
 func (s *SubmissionsService) Wait() { s.inFlightWG.Wait() }
 
-// Shutdown drains queued replies, then stops the workers. Call once.
+// Shutdown drains queued replies, then stops the workers. Call once. Past the
+// grace window, in-flight sends are canceled so the process still exits.
 func (s *SubmissionsService) Shutdown() {
-	s.inFlightWG.Wait()
+	defer s.replyCancel()
+	drained := make(chan struct{})
+	go func() {
+		s.inFlightWG.Wait()
+		close(drained)
+	}()
+	select {
+	case <-drained:
+	case <-time.After(s.drainGrace):
+		s.log.Warn("reply drain exceeded grace; canceling in-flight sends")
+		s.replyCancel()
+		s.inFlightWG.Wait()
+	}
 	close(s.replyJobs)
 	s.replyWG.Wait()
 }

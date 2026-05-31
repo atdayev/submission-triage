@@ -1,10 +1,10 @@
 package config
 
 import (
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/caarlos0/env/v11"
 )
 
 func TestValidate_RejectsMissingPort(t *testing.T) {
@@ -48,9 +48,19 @@ func TestValidate_AcceptsMinimalConfig(t *testing.T) {
 	}
 }
 
-func TestApplyDefaults_FillsMissing(t *testing.T) {
-	cfg := &Config{}
-	applyDefaults(cfg)
+// parseEnv parses Config from an explicit env map so defaults are deterministic.
+func parseEnv(t *testing.T, vars map[string]string) *Config {
+	t.Helper()
+	var cfg Config
+	if err := env.ParseWithOptions(&cfg, env.Options{Environment: vars}); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	applyDerivedDefaults(&cfg)
+	return &cfg
+}
+
+func TestParse_AppliesTagDefaults(t *testing.T) {
+	cfg := parseEnv(t, map[string]string{})
 
 	if cfg.Service.Name != "submission-triage" {
 		t.Errorf("service.name: %q", cfg.Service.Name)
@@ -67,48 +77,66 @@ func TestApplyDefaults_FillsMissing(t *testing.T) {
 	if cfg.Escalation.ThresholdHours != 72 {
 		t.Errorf("escalation.threshold_hours: %d", cfg.Escalation.ThresholdHours)
 	}
+	if cfg.Escalation.AutoCloseAfterHours != 336 {
+		t.Errorf("escalation.auto_close_after_hours: %d", cfg.Escalation.AutoCloseAfterHours)
+	}
 	if cfg.Retry.Attempts != 3 {
 		t.Errorf("retry.attempts: %d", cfg.Retry.Attempts)
 	}
+	if cfg.IMAP.Mailbox != "INBOX" {
+		t.Errorf("imap.mailbox default: got %q", cfg.IMAP.Mailbox)
+	}
+	if cfg.IMAP.Port != "993" {
+		t.Errorf("imap.port default: got %q", cfg.IMAP.Port)
+	}
+	if cfg.IMAP.PollIntervalSeconds != 30 {
+		t.Errorf("imap.poll_interval_seconds default: got %d", cfg.IMAP.PollIntervalSeconds)
+	}
+	if cfg.IMAP.MaxMessageMB != 32 {
+		t.Errorf("imap.max_message_mb default: got %d", cfg.IMAP.MaxMessageMB)
+	}
+	if cfg.SMTP.Port != "587" {
+		t.Errorf("smtp.port default: got %q", cfg.SMTP.Port)
+	}
 }
 
-func TestLoad_ExpandsEnvAndAppliesDefaults(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config.yaml")
-	contents := `service:
-  name: submission-triage
-http:
-  port: ${TEST_PORT}
-database:
-  path: ${TEST_DB_PATH}
-checklists:
-  directory: ./checklists
-`
-	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("TEST_PORT", "9090")
-	t.Setenv("TEST_DB_PATH", "./data/test.db")
+func TestParse_ReadsEnvOverrides(t *testing.T) {
+	cfg := parseEnv(t, map[string]string{
+		"HTTP_PORT":         "9090",
+		"DB_PATH":           "./data/test.db",
+		"IMAP_HOST":         "imap.gmail.com",
+		"IMAP_PORT":         "1993",
+		"OUTBOUND_PROVIDER": "smtp",
+	})
 
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
 	if cfg.HTTP.Port != 9090 {
 		t.Errorf("port: got %d, want 9090", cfg.HTTP.Port)
 	}
 	if cfg.Database.Path != "./data/test.db" {
 		t.Errorf("db.path: got %q", cfg.Database.Path)
 	}
-	if cfg.Anthropic.Model == "" {
-		t.Error("anthropic.model: defaults not applied")
+	if cfg.IMAP.Port != "1993" {
+		t.Errorf("imap.port override: got %q", cfg.IMAP.Port)
+	}
+	if cfg.Outbound.Provider != "smtp" {
+		t.Errorf("outbound.provider: got %q", cfg.Outbound.Provider)
 	}
 }
 
-func TestLoad_FileNotFound(t *testing.T) {
-	_, err := Load(filepath.Join(t.TempDir(), "missing.yaml"))
-	if err == nil {
-		t.Fatal("expected error for missing file")
+func TestParse_DerivesSMTPFromName(t *testing.T) {
+	// SMTP from-name unset falls back to the Postmark from-name.
+	cfg := parseEnv(t, map[string]string{"POSTMARK_FROM_NAME": "Acme Triage"})
+	if cfg.SMTP.FromName != "Acme Triage" {
+		t.Errorf("smtp.from_name derived: got %q", cfg.SMTP.FromName)
+	}
+
+	// An explicit SMTP from-name wins.
+	cfg = parseEnv(t, map[string]string{
+		"POSTMARK_FROM_NAME": "Acme Triage",
+		"SMTP_FROM_NAME":     "Acme Sender",
+	})
+	if cfg.SMTP.FromName != "Acme Sender" {
+		t.Errorf("smtp.from_name explicit: got %q", cfg.SMTP.FromName)
 	}
 }
 
@@ -130,34 +158,6 @@ func TestEscalationConfig_DurationConversions(t *testing.T) {
 	}
 	if e.DigestInterval().Hours() != 24 {
 		t.Errorf("DigestInterval: got %v", e.DigestInterval())
-	}
-}
-
-func TestApplyDefaults_FillsEscalationExtras(t *testing.T) {
-	cfg := &Config{}
-	applyDefaults(cfg)
-	if cfg.Escalation.AutoCloseAfterHours == 0 {
-		t.Error("auto_close_after_hours: should default")
-	}
-	if cfg.Escalation.DigestIntervalHours == 0 {
-		t.Error("digest_interval_hours: should default")
-	}
-}
-
-func TestApplyDefaults_FillsIMAPandSMTP(t *testing.T) {
-	cfg := &Config{}
-	applyDefaults(cfg)
-	if cfg.IMAP.Mailbox != "INBOX" {
-		t.Errorf("imap.mailbox default: got %q", cfg.IMAP.Mailbox)
-	}
-	if cfg.IMAP.Port != "993" {
-		t.Errorf("imap.port default: got %q", cfg.IMAP.Port)
-	}
-	if cfg.IMAP.PollIntervalSeconds != 30 {
-		t.Errorf("imap.poll_interval_seconds default: got %d", cfg.IMAP.PollIntervalSeconds)
-	}
-	if cfg.SMTP.Port != "587" {
-		t.Errorf("smtp.port default: got %q", cfg.SMTP.Port)
 	}
 }
 

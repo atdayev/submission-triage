@@ -12,10 +12,8 @@ import (
 	repomocks "github.com/atdayev/submission-triage/internal/repository/mocks"
 )
 
-// Without singleflight, N concurrent webhooks for the same email each fall
-// through FindByEmailReference → NotFound, each call createSubmission with
-// a fresh UUID, and we'd persist N orphan submission rows. With the gate,
-// only the first call executes; the rest receive the same IngestResult.
+// without singleflight, concurrent webhooks for one email create N orphan rows;
+// the gate collapses them so only the first executes.
 func TestIngestEmail_ConcurrentSameEmail_SingleSubmission(t *testing.T) {
 	subs := repomocks.NewSubmissionRepository(t)
 	aud := repomocks.NewAuditRepository(t)

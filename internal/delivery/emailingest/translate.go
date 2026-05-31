@@ -1,6 +1,4 @@
-// Package emailingest maps a parsed email payload onto the service's
-// channel-agnostic IngestRequest. Both the Postmark webhook and the IMAP
-// poller funnel through it, so the wire-format mapping lives in one place.
+// Package emailingest maps a parsed email payload onto the channel-agnostic IngestRequest.
 package emailingest
 
 import (

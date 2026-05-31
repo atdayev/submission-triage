@@ -12,11 +12,7 @@ import (
 
 const goodMigration = `CREATE TABLE good (id INTEGER PRIMARY KEY);`
 
-// 0002_bad starts with a valid CREATE TABLE then runs a syntax error.
-// In a non-transactional implementation, the first statement would commit
-// before the second fails, leaving the bad_first table behind permanently.
-// Our applyMigration wraps the whole body in a tx, so the rollback should
-// leave the database with only the good table.
+// 0002_bad commits a valid CREATE then hits invalid SQL; the whole file must roll back.
 const badMigration = `CREATE TABLE bad_first (id INTEGER PRIMARY KEY);
 THIS IS DELIBERATELY NOT VALID SQL;`
 

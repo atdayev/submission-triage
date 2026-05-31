@@ -42,9 +42,7 @@ func TestHMAC_ValidSignature_Accepted(t *testing.T) {
 
 	h.Handle(rec, req)
 
-	// Auth passes; we'd panic on h.svc.IngestEmail (svc is nil) so we
-	// reach the JSON decode path successfully and panic when ingesting.
-	// What we care about: NOT 401.
+	// only care that auth passed: not 401
 	if rec.Code == http.StatusUnauthorized {
 		t.Fatalf("expected auth to pass, got 401: %s", rec.Body.String())
 	}

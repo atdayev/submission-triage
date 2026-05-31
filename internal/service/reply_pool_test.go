@@ -15,8 +15,7 @@ import (
 	repomocks "github.com/atdayev/submission-triage/internal/repository/mocks"
 )
 
-// blockingMail blocks SendThreadedReply on a release channel — useful for
-// saturating the worker pool deterministically.
+// blockingMail blocks the send on a release channel to saturate the pool.
 type blockingMail struct {
 	release chan struct{}
 }
@@ -130,7 +129,7 @@ func TestReplyPool_ShutdownDrains(t *testing.T) {
 		}
 	}
 
-	// Release sends, then Shutdown — must return after all 3 process.
+	// release sends; Shutdown should return once all 3 process
 	close(mail.release)
 	done := make(chan struct{})
 	go func() {

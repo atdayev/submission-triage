@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sync"
+	"time"
 
 	goimap "github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
@@ -12,38 +14,54 @@ import (
 	"github.com/atdayev/submission-triage/internal/config"
 )
 
+const imapDialTimeout = 20 * time.Second
+
 // fullMessage is BODY.PEEK[]: the whole message, PEEK so the server leaves \Seen alone
 var fullMessage = &goimap.FetchItemBodySection{Peek: true}
 
 // dialClient opens the transport; a var so tests can swap in a plaintext dial.
 var dialClient = func(addr string) (*imapclient.Client, error) {
-	return imapclient.DialTLS(addr, nil)
+	return imapclient.DialTLS(addr, &imapclient.Options{
+		Dialer: &net.Dialer{Timeout: imapDialTimeout},
+	})
 }
 
 type imapMailbox struct {
 	c        *imapclient.Client
 	maxBytes int64
 	log      *logrus.Entry
+	stop     chan struct{}
+	stopOnce sync.Once
 }
 
 // dialIMAP returns a connect-per-tick factory: each poll opens a fresh
 // logged-in, mailbox-selected connection.
 func dialIMAP(cfg config.IMAPConfig, log *logrus.Entry) func(ctx context.Context) (mailbox, error) {
-	return func(_ context.Context) (mailbox, error) {
+	return func(ctx context.Context) (mailbox, error) {
 		c, err := dialClient(net.JoinHostPort(cfg.Host, cfg.Port))
 		if err != nil {
 			return nil, fmt.Errorf("imap dial: %w", err)
 		}
+		mb := &imapMailbox{c: c, maxBytes: cfg.MaxMessageBytes(), log: log, stop: make(chan struct{})}
+		// close the connection on ctx cancel so an in-flight command unblocks at shutdown
+		go mb.closeOnCancel(ctx)
 		if err := c.Login(cfg.Username, cfg.Password).Wait(); err != nil {
-			_ = c.Close()
+			_ = mb.Close()
 			return nil, fmt.Errorf("imap login: %w", err)
 		}
 		if _, err := c.Select(cfg.Mailbox, nil).Wait(); err != nil {
-			_ = c.Logout().Wait()
-			_ = c.Close()
+			_ = mb.Close()
 			return nil, fmt.Errorf("imap select %q: %w", cfg.Mailbox, err)
 		}
-		return &imapMailbox{c: c, maxBytes: cfg.MaxMessageBytes(), log: log}, nil
+		return mb, nil
+	}
+}
+
+func (m *imapMailbox) closeOnCancel(ctx context.Context) {
+	select {
+	case <-ctx.Done():
+		_ = m.c.Close()
+	case <-m.stop:
 	}
 }
 
@@ -65,8 +83,7 @@ func (m *imapMailbox) FetchUnseen(ctx context.Context, limit int) ([]rawMessage,
 		uids = uids[:limit]
 	}
 
-	// Probe sizes first so an oversized message never gets its full body pulled
-	// into memory; over-cap ones are skipped (left unread for a human to spot).
+	// probe sizes first so an oversized body is never pulled into memory; over-cap is skipped
 	uids = m.underCap(uids)
 	if len(uids) == 0 {
 		return nil, nil
@@ -129,6 +146,7 @@ func (m *imapMailbox) MarkSeen(_ context.Context, uid uint32) error {
 }
 
 func (m *imapMailbox) Close() error {
+	m.stopOnce.Do(func() { close(m.stop) })
 	_ = m.c.Logout().Wait()
 	return m.c.Close()
 }

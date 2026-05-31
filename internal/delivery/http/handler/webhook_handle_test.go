@@ -62,8 +62,7 @@ func TestHandle_AcceptsSecretViaHeader_ThenFailsOnBodyParse(t *testing.T) {
 }
 
 func TestHandle_RejectsSecretViaQueryString(t *testing.T) {
-	// Query-string secrets leak into proxy/CDN access logs. The handler
-	// no longer accepts them — header is the only path.
+	// query-string secrets leak into proxy/CDN logs; header is the only accepted path
 	h := newHandlerWithSecret("topsecret")
 	req := httptest.NewRequest(http.MethodPost, "/webhooks/postmark?secret=topsecret", bytes.NewBufferString(`{}`))
 	rec := httptest.NewRecorder()

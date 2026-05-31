@@ -15,9 +15,7 @@ import (
 	repomocks "github.com/atdayev/submission-triage/internal/repository/mocks"
 )
 
-// slowMail blocks SendThreadedReply on a release channel so the test can
-// orchestrate "request context canceled before send completes" without
-// relying on wall-clock timing.
+// slowMail blocks the send on a release channel so the test controls its timing.
 type slowMail struct {
 	release chan struct{}
 	sent    atomic.Int32
@@ -31,10 +29,7 @@ func (s *slowMail) SendThreadedReply(_ context.Context, _ model.Reply) (string, 
 	return "msg-slow", nil
 }
 
-// If sendAndRecordReply ran on the inbound ctx instead of a detached one, the
-// cancelation propagated below would short-circuit the send before release.
-// We assert the send DID complete after release, proving context.WithoutCancel
-// is in place and Wait() actually joins the in-flight goroutine.
+// canceling the inbound ctx must not stop the detached reply send.
 func TestIngestEmail_ReplyGoroutineSurvivesCtxCancel(t *testing.T) {
 	subs := repomocks.NewSubmissionRepository(t)
 	aud := repomocks.NewAuditRepository(t)
@@ -101,5 +96,79 @@ func TestIngestEmail_ReplyGoroutineSurvivesCtxCancel(t *testing.T) {
 	}
 	if !replySentSeen.Load() {
 		t.Fatal("EventReplySent audit not written — goroutine bailed out instead of recording")
+	}
+}
+
+// ctxBlockingMail blocks the send until its context is canceled.
+type ctxBlockingMail struct {
+	started  chan struct{}
+	canceled atomic.Bool
+}
+
+func (m *ctxBlockingMail) Name() string { return "fake" }
+
+func (m *ctxBlockingMail) SendThreadedReply(ctx context.Context, _ model.Reply) (string, error) {
+	close(m.started)
+	<-ctx.Done()
+	m.canceled.Store(true)
+	return "", ctx.Err()
+}
+
+// Shutdown must return within the grace window even when a send is stuck.
+func TestShutdown_BoundedWhenSendStuck(t *testing.T) {
+	subs := repomocks.NewSubmissionRepository(t)
+	aud := repomocks.NewAuditRepository(t)
+	mail := &ctxBlockingMail{started: make(chan struct{})}
+	cl := smallChecklist()
+
+	subs.On("FindByEmailReference", mock.Anything, mock.Anything).Return(nil, false, model.ErrSubmissionNotFound)
+	subs.On("UpsertSubmission", mock.Anything, mock.Anything).Return(nil)
+	subs.On("UpsertEmail", mock.Anything, mock.Anything).Return(nil).Maybe()
+	aud.On("Append", mock.Anything, mock.Anything).Return(nil)
+
+	log := logrus.NewEntry(logrus.New())
+	svc := NewSubmissionsService(Dependencies{
+		Config: &config.Config{
+			Escalation: config.EscalationConfig{ThresholdHours: 72},
+			HTTP:       config.HTTPConfig{ShutdownTimeoutSec: 1}, // 1s drain grace
+		},
+		Repository:     &repository.Repository{Submissions: subs, Audit: aud},
+		EmailSender:    mail,
+		Classifier:     &filenameClassifier{checklist: cl},
+		ChecklistStore: &fakeStore{cl: cl},
+		TextExtractors: map[string]TextExtractor{"application/pdf": fakeExtractor{}},
+		Log:            log,
+	})
+
+	if _, err := svc.IngestEmail(context.Background(), IngestRequest{
+		MessageID:   "msg-stuck",
+		FromAddress: "broker@example.com",
+		Subject:     "New Submission - CGL",
+		Attachments: []model.Attachment{
+			{Filename: "ACORD_125.pdf", ContentType: "application/pdf"},
+			{Filename: "ACORD_126.pdf", ContentType: "application/pdf"},
+		},
+	}); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+
+	<-mail.started // ensure the send is in flight before we shut down
+
+	start := time.Now()
+	done := make(chan struct{})
+	go func() {
+		svc.Shutdown()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Shutdown hung past the grace window")
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("Shutdown took %v; should bail near the 1s grace", elapsed)
+	}
+	if !mail.canceled.Load() {
+		t.Fatal("in-flight send was not canceled at shutdown")
 	}
 }

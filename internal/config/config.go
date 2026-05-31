@@ -3,144 +3,136 @@ package config
 import (
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"time"
 
-	"gopkg.in/yaml.v2"
+	"github.com/caarlos0/env/v11"
 )
 
 type Config struct {
-	Service    ServiceConfig    `yaml:"service"`
-	HTTP       HTTPConfig       `yaml:"http"`
-	Database   DatabaseConfig   `yaml:"database"`
-	Log        LogConfig        `yaml:"log"`
-	Postmark   PostmarkConfig   `yaml:"postmark"`
-	IMAP       IMAPConfig       `yaml:"imap"`
-	SMTP       SMTPConfig       `yaml:"smtp"`
-	Outbound   OutboundConfig   `yaml:"outbound"`
-	Anthropic  AnthropicConfig  `yaml:"anthropic"`
-	Checklists ChecklistsConfig `yaml:"checklists"`
-	Escalation EscalationConfig `yaml:"escalation"`
-	Retry      RetryConfig      `yaml:"retry"`
-	Reply      ReplyConfig      `yaml:"reply"`
+	Service    ServiceConfig
+	HTTP       HTTPConfig
+	Database   DatabaseConfig
+	Log        LogConfig
+	Postmark   PostmarkConfig
+	IMAP       IMAPConfig
+	SMTP       SMTPConfig
+	Outbound   OutboundConfig
+	Anthropic  AnthropicConfig
+	Checklists ChecklistsConfig
+	Escalation EscalationConfig
+	Retry      RetryConfig
+	Reply      ReplyConfig
 }
 
 type ServiceConfig struct {
-	Name string `yaml:"name"`
+	Name string `env:"SERVICE_NAME" envDefault:"submission-triage"`
 }
 
 type HTTPConfig struct {
-	Port               int `yaml:"port"`
-	ReadTimeoutSec     int `yaml:"read_timeout_seconds"`
-	WriteTimeoutSec    int `yaml:"write_timeout_seconds"`
-	ShutdownTimeoutSec int `yaml:"shutdown_timeout_seconds"`
+	Port               int `env:"HTTP_PORT" envDefault:"8080"`
+	ReadTimeoutSec     int `env:"HTTP_READ_TIMEOUT_SECONDS" envDefault:"15"`
+	WriteTimeoutSec    int `env:"HTTP_WRITE_TIMEOUT_SECONDS" envDefault:"30"`
+	ShutdownTimeoutSec int `env:"HTTP_SHUTDOWN_TIMEOUT_SECONDS" envDefault:"10"`
 }
 
 type DatabaseConfig struct {
-	Path string `yaml:"path"`
+	Path string `env:"DB_PATH" envDefault:"./data/submission-triage.db"`
 }
 
 type LogConfig struct {
-	Level         string `yaml:"level"`
-	Format        string `yaml:"format"`
-	Directory     string `yaml:"directory"`
-	MaxAgeDays    int    `yaml:"max_age_days"`
-	RotationHours int    `yaml:"rotation_hours"`
+	Level         string `env:"LOG_LEVEL" envDefault:"info"`
+	Format        string `env:"LOG_FORMAT" envDefault:"json"`
+	Directory     string `env:"LOG_DIR"`
+	MaxAgeDays    int    `env:"LOG_MAX_AGE_DAYS" envDefault:"14"`
+	RotationHours int    `env:"LOG_ROTATION_HOURS" envDefault:"24"`
 }
 
 type PostmarkConfig struct {
-	ServerToken            string `yaml:"server_token"`
-	FromAddress            string `yaml:"from_address"`
-	FromName               string `yaml:"from_name"`
-	WebhookSecret          string `yaml:"webhook_secret"`
-	WebhookSignatureSecret string `yaml:"webhook_signature_secret"`
+	ServerToken            string `env:"POSTMARK_SERVER_TOKEN"`
+	FromAddress            string `env:"POSTMARK_FROM_ADDRESS" envDefault:"submissions@example.com"`
+	FromName               string `env:"POSTMARK_FROM_NAME" envDefault:"Submission Triage"`
+	WebhookSecret          string `env:"POSTMARK_WEBHOOK_SECRET"`
+	WebhookSignatureSecret string `env:"POSTMARK_WEBHOOK_SIGNATURE_SECRET"`
 }
 
 // IMAPConfig drives the optional inbound poller. It activates only when host,
 // username, and password are all set.
 type IMAPConfig struct {
-	Host                string `yaml:"host"`
-	Port                string `yaml:"port"`
-	Username            string `yaml:"username"`
-	Password            string `yaml:"password"`
-	Mailbox             string `yaml:"mailbox"`
-	PollIntervalSeconds int    `yaml:"poll_interval_seconds"`
-	MaxMessageMB        int    `yaml:"max_message_mb"`
+	Host                string `env:"IMAP_HOST"`
+	Port                string `env:"IMAP_PORT" envDefault:"993"`
+	Username            string `env:"IMAP_USERNAME"`
+	Password            string `env:"IMAP_PASSWORD"`
+	Mailbox             string `env:"IMAP_MAILBOX" envDefault:"INBOX"`
+	PollIntervalSeconds int    `env:"IMAP_POLL_INTERVAL_SECONDS" envDefault:"30"`
+	MaxMessageMB        int    `env:"IMAP_MAX_MESSAGE_MB" envDefault:"32"`
 }
 
 // SMTPConfig drives the optional SMTP outbound sender (Gmail App Password,
 // Microsoft 365, or any SMTP server).
 type SMTPConfig struct {
-	Host        string `yaml:"host"`
-	Port        string `yaml:"port"`
-	Username    string `yaml:"username"`
-	Password    string `yaml:"password"`
-	FromAddress string `yaml:"from_address"`
-	FromName    string `yaml:"from_name"`
+	Host        string `env:"SMTP_HOST"`
+	Port        string `env:"SMTP_PORT" envDefault:"587"`
+	Username    string `env:"SMTP_USERNAME"`
+	Password    string `env:"SMTP_PASSWORD"`
+	FromAddress string `env:"SMTP_FROM_ADDRESS"`
+	FromName    string `env:"SMTP_FROM_NAME"`
 }
 
 // OutboundConfig selects the reply channel. Provider is "postmark", "smtp",
 // "log", or "" for auto (smtp if configured, else postmark, else log).
 type OutboundConfig struct {
-	Provider string `yaml:"provider"`
+	Provider string `env:"OUTBOUND_PROVIDER"`
 }
 
 type AnthropicConfig struct {
-	APIKey     string `yaml:"api_key"`
-	Model      string `yaml:"model"`
-	TimeoutSec int    `yaml:"timeout_seconds"`
-	MaxTokens  int    `yaml:"max_tokens"`
+	APIKey     string `env:"ANTHROPIC_API_KEY"`
+	Model      string `env:"ANTHROPIC_MODEL" envDefault:"claude-haiku-4-5"`
+	TimeoutSec int    `env:"ANTHROPIC_TIMEOUT_SECONDS" envDefault:"30"`
+	MaxTokens  int    `env:"ANTHROPIC_MAX_TOKENS" envDefault:"2048"`
 }
 
 type ChecklistsConfig struct {
-	Directory string `yaml:"directory"`
+	Directory string `env:"CHECKLISTS_DIR" envDefault:"./checklists"`
 }
 
 type EscalationConfig struct {
-	IntervalMinutes     int    `yaml:"interval_minutes"`
-	ThresholdHours      int    `yaml:"threshold_hours"`
-	AutoCloseAfterHours int    `yaml:"auto_close_after_hours"`
-	DigestIntervalHours int    `yaml:"digest_interval_hours"`
-	DigestRecipient     string `yaml:"digest_recipient"`
+	IntervalMinutes     int    `env:"ESCALATION_INTERVAL_MINUTES" envDefault:"15"`
+	ThresholdHours      int    `env:"ESCALATION_THRESHOLD_HOURS" envDefault:"72"`
+	AutoCloseAfterHours int    `env:"ESCALATION_AUTO_CLOSE_AFTER_HOURS" envDefault:"336"`
+	DigestIntervalHours int    `env:"ESCALATION_DIGEST_INTERVAL_HOURS" envDefault:"24"`
+	DigestRecipient     string `env:"ESCALATION_DIGEST_RECIPIENT"`
 }
 
 type RetryConfig struct {
-	Attempts    int `yaml:"attempts"`
-	BaseDelayMs int `yaml:"base_delay_ms"`
+	Attempts    int `env:"RETRY_ATTEMPTS" envDefault:"3"`
+	BaseDelayMs int `env:"RETRY_BASE_DELAY_MS" envDefault:"500"`
 }
 
 type ReplyConfig struct {
-	Workers   int `yaml:"workers"`
-	QueueSize int `yaml:"queue_size"`
+	Workers   int `env:"REPLY_WORKERS" envDefault:"4"`
+	QueueSize int `env:"REPLY_QUEUE_SIZE" envDefault:"64"`
 }
 
-func DefaultPath() string {
-	if p := os.Getenv("SUBMISSION_TRIAGE_CONFIG"); p != "" {
-		return p
-	}
-	return filepath.Join("internal", "config", "config.yaml")
-}
-
-func Load(path string) (*Config, error) {
-	if path == "" {
-		path = DefaultPath()
-	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read config %s: %w", path, err)
-	}
-	expanded := os.ExpandEnv(string(raw))
-
+// Load reads configuration from the process environment (populated from .env at
+// startup). Defaults live in the envDefault struct tags.
+func Load() (*Config, error) {
 	var cfg Config
-	if err := yaml.Unmarshal([]byte(expanded), &cfg); err != nil {
-		return nil, fmt.Errorf("unmarshal config: %w", err)
+	if err := env.Parse(&cfg); err != nil {
+		return nil, fmt.Errorf("parse config from environment: %w", err)
 	}
-	applyDefaults(&cfg)
+	applyDerivedDefaults(&cfg)
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+// applyDerivedDefaults fills values that depend on another field, which a
+// static envDefault tag cannot express.
+func applyDerivedDefaults(c *Config) {
+	if c.SMTP.FromName == "" {
+		c.SMTP.FromName = c.Postmark.FromName
+	}
 }
 
 func (c *Config) Validate() error {
@@ -206,107 +198,4 @@ func (e EscalationConfig) DigestInterval() time.Duration {
 
 func (r RetryConfig) BaseDelay() time.Duration {
 	return time.Duration(r.BaseDelayMs) * time.Millisecond
-}
-
-func applyDefaults(c *Config) {
-	if c.Service.Name == "" {
-		c.Service.Name = "submission-triage"
-	}
-
-	if c.HTTP.Port == 0 {
-		c.HTTP.Port = 8080
-	}
-	if c.HTTP.ReadTimeoutSec == 0 {
-		c.HTTP.ReadTimeoutSec = 15
-	}
-	if c.HTTP.WriteTimeoutSec == 0 {
-		c.HTTP.WriteTimeoutSec = 30
-	}
-	if c.HTTP.ShutdownTimeoutSec == 0 {
-		c.HTTP.ShutdownTimeoutSec = 10
-	}
-
-	if c.Database.Path == "" {
-		c.Database.Path = "./data/submission-triage.db"
-	}
-
-	if c.Log.Level == "" {
-		c.Log.Level = "info"
-	}
-	if c.Log.Format == "" {
-		c.Log.Format = "json"
-	}
-	if c.Log.MaxAgeDays == 0 {
-		c.Log.MaxAgeDays = 14
-	}
-	if c.Log.RotationHours == 0 {
-		c.Log.RotationHours = 24
-	}
-
-	if c.Anthropic.Model == "" {
-		c.Anthropic.Model = "claude-haiku-4-5"
-	}
-	if c.Anthropic.TimeoutSec == 0 {
-		c.Anthropic.TimeoutSec = 30
-	}
-	if c.Anthropic.MaxTokens == 0 {
-		c.Anthropic.MaxTokens = 2048
-	}
-
-	if c.Checklists.Directory == "" {
-		c.Checklists.Directory = "./checklists"
-	}
-
-	if c.Escalation.IntervalMinutes == 0 {
-		c.Escalation.IntervalMinutes = 15
-	}
-	if c.Escalation.ThresholdHours == 0 {
-		c.Escalation.ThresholdHours = 72
-	}
-	if c.Escalation.AutoCloseAfterHours == 0 {
-		c.Escalation.AutoCloseAfterHours = 24 * 14
-	}
-	if c.Escalation.DigestIntervalHours == 0 {
-		c.Escalation.DigestIntervalHours = 24
-	}
-
-	if c.Retry.Attempts == 0 {
-		c.Retry.Attempts = 3
-	}
-	if c.Retry.BaseDelayMs == 0 {
-		c.Retry.BaseDelayMs = 500
-	}
-
-	if c.Reply.Workers == 0 {
-		c.Reply.Workers = 4
-	}
-	if c.Reply.QueueSize == 0 {
-		c.Reply.QueueSize = 64
-	}
-
-	if c.Postmark.FromAddress == "" {
-		c.Postmark.FromAddress = "submissions@example.com"
-	}
-	if c.Postmark.FromName == "" {
-		c.Postmark.FromName = "Submission Triage"
-	}
-
-	if c.IMAP.Mailbox == "" {
-		c.IMAP.Mailbox = "INBOX"
-	}
-	if c.IMAP.Port == "" {
-		c.IMAP.Port = "993"
-	}
-	if c.IMAP.PollIntervalSeconds == 0 {
-		c.IMAP.PollIntervalSeconds = 30
-	}
-	if c.IMAP.MaxMessageMB == 0 {
-		c.IMAP.MaxMessageMB = 32
-	}
-	if c.SMTP.Port == "" {
-		c.SMTP.Port = "587"
-	}
-	if c.SMTP.FromName == "" {
-		c.SMTP.FromName = c.Postmark.FromName
-	}
 }

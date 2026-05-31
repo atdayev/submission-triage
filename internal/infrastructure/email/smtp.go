@@ -20,6 +20,7 @@ import (
 )
 
 const smtpDialTimeout = 20 * time.Second
+const smtpOpTimeout = 30 * time.Second // whole-exchange deadline; net/smtp has no context
 
 // smtpSendFn performs the network send; swapped out in tests.
 type smtpSendFn func(ctx context.Context, cfg config.SMTPConfig, from string, to []string, msg []byte) error
@@ -112,18 +113,31 @@ func realSMTPSend(ctx context.Context, cfg config.SMTPConfig, from string, to []
 	tlsCfg := &tls.Config{ServerName: cfg.Host}
 
 	d := &net.Dialer{Timeout: smtpDialTimeout}
-	conn, err := d.DialContext(ctx, "tcp", addr)
+	rawConn, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return err
 	}
+	// deadline caps a stalled exchange; close-on-cancel unblocks an in-flight call at shutdown
+	_ = rawConn.SetDeadline(time.Now().Add(smtpOpTimeout))
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = rawConn.Close()
+		case <-stop:
+		}
+	}()
+
 	// 465 is implicit TLS; other ports upgrade via STARTTLS below
+	var conn net.Conn = rawConn
 	if cfg.Port == "465" {
-		conn = tls.Client(conn, tlsCfg)
+		conn = tls.Client(rawConn, tlsCfg)
 	}
 
 	client, err := smtp.NewClient(conn, cfg.Host)
 	if err != nil {
-		_ = conn.Close()
+		_ = rawConn.Close()
 		return err
 	}
 	defer client.Close()

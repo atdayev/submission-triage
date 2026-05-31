@@ -15,9 +15,7 @@ import (
 	"github.com/atdayev/submission-triage/internal/config"
 )
 
-// These tests run the real imapMailbox adapter (dial, login, select, UID
-// search, BODY.PEEK[] fetch, FindBodySection, UID store) against an in-process
-// go-imap server.
+// These tests exercise the real imapMailbox adapter against an in-process go-imap server.
 
 const (
 	testUser = "alice@example.com"
@@ -32,8 +30,7 @@ const secondEML = "From: Bob <bob@example.com>\r\n" +
 	"\r\n" +
 	"Second submission body.\r\n"
 
-// startMemServer brings up an in-process IMAP server whose INBOX is seeded
-// (over the wire) with the given raw messages, all unseen. Returns its address.
+// startMemServer seeds an in-process IMAP INBOX with the given unseen messages.
 func startMemServer(t *testing.T, msgs ...string) string {
 	t.Helper()
 	mem := imapmemserver.New()
@@ -215,6 +212,25 @@ func TestIntegration_DialFailsOnBadCredentials(t *testing.T) {
 	cfg.Password = "wrong"
 	if _, err := dialIMAP(cfg, testLog())(context.Background()); err == nil {
 		t.Fatal("expected login failure with wrong password")
+	}
+}
+
+func TestIntegration_CancelClosesConnection(t *testing.T) {
+	addr := startMemServer(t, validEML)
+	useInsecureDial(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	mb, err := dialIMAP(cfgFor(addr), testLog())(ctx)
+	if err != nil {
+		t.Fatalf("dialIMAP: %v", err)
+	}
+	defer mb.Close()
+
+	cancel() // shutdown: the watcher must close the connection so commands unblock
+	select {
+	case <-mb.(*imapMailbox).c.Closed():
+	case <-time.After(2 * time.Second):
+		t.Fatal("connection not closed after ctx cancel; in-flight commands could hang at shutdown")
 	}
 }
 

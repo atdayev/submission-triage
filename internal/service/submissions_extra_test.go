@@ -507,8 +507,7 @@ func TestCleanThreadRefs_DedupesAndTrims(t *testing.T) {
 	}
 }
 
-// contains is a tiny case-insensitive substring helper so test bodies don't
-// need to import strings just for assertions.
+// contains is a case-insensitive substring helper for assertions.
 func contains(haystack, needle string) bool {
 	for i := 0; i+len(needle) <= len(haystack); i++ {
 		match := true

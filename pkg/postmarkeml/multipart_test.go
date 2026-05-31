@@ -169,14 +169,11 @@ func deeplyNestedEML(depth int) string {
 }
 
 func TestFromFile_DepthCap_DoesNotCrash(t *testing.T) {
-	// Beyond cap: deeply-nested mail should return without panicking and
-	// without consuming the payload (it lives below the cap).
+	// beyond cap: deeply-nested mail must return without panicking
 	p, err := FromFile(writeTemp(t, deeplyNestedEML(50)))
 	if err != nil {
 		t.Fatalf("FromFile: %v", err)
 	}
-	// Either the payload was reached (cap permitted it) or it wasn't.
-	// What matters is that we got a Payload back without panicking.
 	_ = p
 }
 
@@ -192,9 +189,7 @@ func TestFromFile_DepthBelowCap_StillExtractsPayload(t *testing.T) {
 }
 
 func TestFromFile_OneBadPart_OthersStillRecovered(t *testing.T) {
-	// First part has a malformed Content-Transfer-Encoding that would
-	// historically have aborted the whole walk. Subsequent text/plain
-	// part should still be recovered.
+	// first part has a malformed CTE; the later text/plain part must still be recovered
 	mixed := `From: a@x
 To: b@x
 Subject: tolerant
@@ -226,8 +221,7 @@ recovered text body
 }
 
 func TestFromFile_FirstTextPlainWins(t *testing.T) {
-	// Two text/plain parts: assert the first one wins (the spec says
-	// recursion + first-text behavior).
+	// two text/plain parts: the first one wins
 	twoText := `From: a@x
 To: b@x
 Subject: two

@@ -175,9 +175,7 @@ func TestEvaluateChecklist_RequiresField_DocNotClassifiedIsStillMissing(t *testi
 		Description:   "Loss runs",
 		RequiresField: &RequiresField{Name: "years_covered", Type: FieldTypeNumber, MinValue: &minVal},
 	}}}
-	// Document present but classified as something else — checklist item
-	// should still be missing for "document not provided" reasons, not
-	// for a field reason.
+	// document classified as something else: still missing as not-provided, not a field reason
 	docs := []Document{{ClassifiedAs: "other", ExtractedFields: map[string]any{"years_covered": 10.0}}}
 	missing := EvaluateChecklist(Submission{Documents: docs}, cl)
 	if len(missing) != 1 {

@@ -132,8 +132,7 @@ func walkParts(r io.Reader, boundary string, text *string, atts *[]Attachment, d
 		disp, _, _ := mime.ParseMediaType(part.Header.Get("Content-Disposition"))
 
 		if strings.HasPrefix(partType, "multipart/") {
-			// Per-part nested walk failures (including depth overflow)
-			// don't abort the outer walk — recover what we can.
+			// nested-walk failures don't abort the outer walk; recover what we can
 			_ = walkParts(part, partParams["boundary"], text, atts, depth+1)
 			continue
 		}
