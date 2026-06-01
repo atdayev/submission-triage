@@ -55,7 +55,6 @@ func parseEnv(t *testing.T, vars map[string]string) *Config {
 	if err := env.ParseWithOptions(&cfg, env.Options{Environment: vars}); err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	applyDerivedDefaults(&cfg)
 	return &cfg
 }
 
@@ -123,18 +122,15 @@ func TestParse_ReadsEnvOverrides(t *testing.T) {
 	}
 }
 
-func TestParse_DerivesSMTPFromName(t *testing.T) {
-	// SMTP from-name unset falls back to the Postmark from-name.
-	cfg := parseEnv(t, map[string]string{"POSTMARK_FROM_NAME": "Acme Triage"})
-	if cfg.SMTP.FromName != "Acme Triage" {
-		t.Errorf("smtp.from_name derived: got %q", cfg.SMTP.FromName)
+func TestParse_SMTPFromName(t *testing.T) {
+	// Defaults when unset.
+	cfg := parseEnv(t, map[string]string{})
+	if cfg.SMTP.FromName != "Submission Triage" {
+		t.Errorf("smtp.from_name default: got %q", cfg.SMTP.FromName)
 	}
 
 	// An explicit SMTP from-name wins.
-	cfg = parseEnv(t, map[string]string{
-		"POSTMARK_FROM_NAME": "Acme Triage",
-		"SMTP_FROM_NAME":     "Acme Sender",
-	})
+	cfg = parseEnv(t, map[string]string{"SMTP_FROM_NAME": "Acme Sender"})
 	if cfg.SMTP.FromName != "Acme Sender" {
 		t.Errorf("smtp.from_name explicit: got %q", cfg.SMTP.FromName)
 	}

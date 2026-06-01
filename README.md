@@ -7,8 +7,8 @@ single binary.
 
 ## What it does
 
-- Watches an inbox: poll any IMAP mailbox (Gmail App Password, Microsoft 365,
-  generic) or receive a Postmark inbound webhook.
+- Watches an inbox: polls any IMAP mailbox (Gmail App Password, Microsoft 365,
+  generic).
 - Parses email + attachments (PDF, DOCX, XLSX, CSV, plain).
 - Classifies each attachment against a YAML checklist; consults the Anthropic
   API only when filename/keyword heuristics are inconclusive.
@@ -24,12 +24,10 @@ single binary.
 
 ## Mail channels
 
-Inbound and outbound are independent; either can be Postmark or your own mailbox.
-
-**IMAP + SMTP (five-minute on-ramp).** Point the tool at an existing mailbox —
-no domain, DNS, or provider signup; a Gmail App Password works. The poller reads
-unread mail every `IMAP_POLL_INTERVAL_SECONDS`, runs it through the pipeline,
-replies over SMTP from the same mailbox, then marks it read.
+Point the tool at an existing mailbox — no domain, DNS, or provider signup; a
+Gmail App Password works. The poller reads unread mail every
+`IMAP_POLL_INTERVAL_SECONDS`, runs it through the pipeline, replies over SMTP
+from the same mailbox, then marks it read.
 
 ```bash
 IMAP_HOST=imap.gmail.com  IMAP_USERNAME=you@gmail.com  IMAP_PASSWORD=<app-password>
@@ -37,15 +35,10 @@ SMTP_HOST=smtp.gmail.com  SMTP_USERNAME=you@gmail.com  SMTP_PASSWORD=<app-passwo
 SMTP_FROM_ADDRESS=you@gmail.com
 ```
 
-**Postmark (production).** Set `POSTMARK_SERVER_TOKEN` and
-`POSTMARK_WEBHOOK_SECRET`; the `/webhooks/postmark` route mounts only when a
-secret (or HMAC signature) is set, so there is no unauthenticated ingest.
-
-Channel selection is by configuration: the poller starts when IMAP creds are
-set, the webhook mounts when a secret is set (both can run at once), and
-`OUTBOUND_PROVIDER` is `postmark` | `smtp` | `log` (empty = auto). Dedup is
-channel-agnostic, so the same message arriving twice — even via different
-channels — is processed once.
+The poller starts when IMAP creds are set. `OUTBOUND_PROVIDER` is `smtp` | `log`
+(empty = auto: SMTP if configured, else startup error). `log` sends nothing and
+is for local runs only. Dedup is deterministic, so the same message fetched
+twice is processed once.
 
 > Auth is password / App Password over TLS. OAuth2 (XOAUTH2) for Gmail / 365 is
 > future work.
@@ -56,19 +49,19 @@ Configuration comes from environment variables. Copy `.env.example` to `.env`
 and fill it in; the server loads it at startup. Defaults live in the struct
 tags in [internal/config/config.go](internal/config/config.go).
 
-## 30-second demo
+## Running
 
 ```bash
 git clone https://github.com/atdayev/submission-triage.git
 cd submission-triage
-make demo
+cp .env.example .env   # fill in IMAP_* and SMTP_*
+make run
 ```
 
-`make demo` builds and runs the server, replays the `testdata/eml/` corpus
-through the webhook, and tails the log. It needs a Unix-style shell (WSL, Git
-Bash, or Linux/macOS); the other targets work on native Windows. No Postmark or
-Anthropic key is required — without them the service uses a log-only sender and
-the heuristic classifier, and wires the real ones in once you set the env vars.
+Set `IMAP_*` to the mailbox to watch and `SMTP_*` to send replies from (a Gmail
+App Password covers both). Without an Anthropic key the heuristic classifier is
+used; set `ANTHROPIC_API_KEY` to enable LLM classification and field extraction.
+Set `OUTBOUND_PROVIDER=log` to run the pipeline without sending real mail.
 
 ## Architecture
 
@@ -79,7 +72,7 @@ cmd/ ──> internal/app ──> internal/delivery ──> internal/service ─
                                                                    └─> internal/infrastructure
 internal/model    ── pure domain, no I/O
 internal/database ── SQLite connection + migrations
-pkg/ ── logger, retry, glob, postmarkeml, telemetry, ...
+pkg/ ── logger, retry, glob, emlparse, telemetry, ...
 ```
 
 | Layer | Lives in | Owns |
@@ -87,13 +80,14 @@ pkg/ ── logger, retry, glob, postmarkeml, telemetry, ...
 | Domain | internal/model | entities, state machine, checklist evaluation |
 | Repository | internal/repository | storage contracts + SQLite impl |
 | Service | internal/service | use cases, idempotency, audit, retries |
-| Delivery | internal/delivery | HTTP handlers, IMAP poller, payload→ingest mapping |
-| Infrastructure | internal/infrastructure | Postmark/SMTP, Anthropic, doc extractors, checklist YAML |
+| Delivery | internal/delivery | health endpoint, IMAP poller, payload→ingest mapping |
+| Infrastructure | internal/infrastructure | SMTP, Anthropic, doc extractors, checklist YAML |
 | App | internal/app | composition root, graceful shutdown |
 
 Cross-cutting guarantees: deterministic-ID idempotency (re-delivery is a no-op),
 a structured audit log, exponential-backoff retries on external clients, a
-bounded reply-worker pool off the request path, constant-time webhook auth,
+durable reply outbox (replies are persisted before sending and redelivered
+until sent, surviving queue overflow, crashes, and provider outages),
 OpenTelemetry metrics, and context-bounded graceful shutdown.
 
 ## Configurable checklists

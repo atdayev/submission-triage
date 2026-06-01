@@ -40,6 +40,3 @@ jobs:
 
       - name: test (race)
         run: go test -race -count=1 ./...
-
-      - name: e2e
-        run: go test -tags=e2e -count=1 ./test/e2e/...

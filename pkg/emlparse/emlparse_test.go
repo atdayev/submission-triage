@@ -1,4 +1,4 @@
-package postmarkeml
+package emlparse
 
 import (
 	"encoding/base64"

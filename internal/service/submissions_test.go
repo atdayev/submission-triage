@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -16,6 +17,51 @@ import (
 	repomocks "github.com/atdayev/submission-triage/internal/repository/mocks"
 	"github.com/atdayev/submission-triage/pkg/glob"
 )
+
+// fakeOutbox is an in-memory OutboxRepository for tests.
+type fakeOutbox struct {
+	mu      sync.Mutex
+	entries map[string]*model.OutboxEntry
+	seq     int
+}
+
+func newFakeOutbox() *fakeOutbox { return &fakeOutbox{entries: map[string]*model.OutboxEntry{}} }
+
+func (f *fakeOutbox) Enqueue(_ context.Context, e *model.OutboxEntry) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if e.ID == "" {
+		f.seq++
+		e.ID = fmt.Sprintf("ob-%d", f.seq)
+	}
+	if e.Status == "" {
+		e.Status = model.OutboxPending
+	}
+	cp := *e
+	f.entries[e.ID] = &cp
+	return nil
+}
+
+func (f *fakeOutbox) ListPending(_ context.Context, _ time.Time, _ int) ([]model.OutboxEntry, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []model.OutboxEntry
+	for _, e := range f.entries {
+		if e.Status == model.OutboxPending {
+			out = append(out, *e)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeOutbox) Update(_ context.Context, id string, status model.OutboxStatus, attempts int, lastErr string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if e, ok := f.entries[id]; ok {
+		e.Status, e.Attempts, e.LastError = status, attempts, lastErr
+	}
+	return nil
+}
 
 type fakeMail struct {
 	mu         sync.Mutex
@@ -79,7 +125,7 @@ func smallChecklist() model.Checklist {
 func newSvc(t *testing.T, subs *repomocks.SubmissionRepository, aud *repomocks.AuditRepository, mail *fakeMail, cl model.Checklist) *SubmissionsService {
 	t.Helper()
 	log := logrus.NewEntry(logrus.New())
-	repo := &repository.Repository{Submissions: subs, Audit: aud}
+	repo := &repository.Repository{Submissions: subs, Audit: aud, Outbox: newFakeOutbox()}
 	return NewSubmissionsService(Dependencies{
 		Config:         &config.Config{Escalation: config.EscalationConfig{ThresholdHours: 72}},
 		Repository:     repo,

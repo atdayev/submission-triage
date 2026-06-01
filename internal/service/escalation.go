@@ -5,6 +5,8 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
+
+	"github.com/atdayev/submission-triage/pkg/logger"
 )
 
 type EscalationWorker struct {
@@ -18,6 +20,7 @@ func NewEscalationWorker(svc *SubmissionsService, interval time.Duration, log *l
 }
 
 func (w *EscalationWorker) Run(ctx context.Context) {
+	ctx = logger.ContextWithLogger(ctx, w.log)
 	w.log.WithField("interval", w.interval.String()).Info("escalation worker started")
 	t := time.NewTicker(w.interval)
 	defer t.Stop()
@@ -35,6 +38,9 @@ func (w *EscalationWorker) Run(ctx context.Context) {
 			w.log.Info("escalation worker stopping")
 			return
 		case <-t.C:
+			if err := w.svc.RedeliverOutbox(ctx); err != nil {
+				w.log.WithError(err).Error("outbox redelivery failed")
+			}
 			if err := w.svc.CheckEscalations(ctx); err != nil {
 				w.log.WithError(err).Error("periodic escalation check failed")
 			}

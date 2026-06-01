@@ -10,12 +10,12 @@ import (
 
 	"github.com/atdayev/submission-triage/internal/model"
 	"github.com/atdayev/submission-triage/internal/service"
-	"github.com/atdayev/submission-triage/pkg/postmarkeml"
+	"github.com/atdayev/submission-triage/pkg/emlparse"
 )
 
 // Translate converts a parsed payload into an IngestRequest, stamping the
 // inbound channel as source.
-func Translate(p postmarkeml.Payload, source string) service.IngestRequest {
+func Translate(p emlparse.Payload, source string) service.IngestRequest {
 	var inReplyTo string
 	var references []string
 	for _, hdr := range p.Headers {

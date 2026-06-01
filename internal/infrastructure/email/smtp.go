@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"mime"
 	"net"
 	"net/smtp"
 	"net/textproto"
@@ -70,25 +71,27 @@ func (s *SMTPSender) SendThreadedReply(ctx context.Context, r model.Reply) (stri
 	return msgID, nil
 }
 
+// buildMessage renders a threaded text/plain RFC822 message.
 func (s *SMTPSender) buildMessage(r model.Reply, msgID string) []byte {
-	from := s.cfg.FromAddress
+	fromAddr := stripCRLF(s.cfg.FromAddress)
+	from := fromAddr
 	if s.cfg.FromName != "" {
-		from = fmt.Sprintf("%s <%s>", s.cfg.FromName, s.cfg.FromAddress)
+		from = fmt.Sprintf("%s <%s>", mime.QEncoding.Encode("utf-8", s.cfg.FromName), fromAddr)
 	}
 
 	var h strings.Builder
 	fmt.Fprintf(&h, "From: %s\r\n", from)
-	fmt.Fprintf(&h, "To: %s\r\n", r.ToAddress)
-	fmt.Fprintf(&h, "Subject: %s\r\n", r.Subject)
+	fmt.Fprintf(&h, "To: %s\r\n", stripCRLF(r.ToAddress))
+	fmt.Fprintf(&h, "Subject: %s\r\n", mime.QEncoding.Encode("utf-8", r.Subject))
 	fmt.Fprintf(&h, "Date: %s\r\n", time.Now().Format(time.RFC1123Z))
 	fmt.Fprintf(&h, "Message-ID: <%s>\r\n", msgID)
 	if r.InReplyTo != "" {
-		fmt.Fprintf(&h, "In-Reply-To: <%s>\r\n", strings.Trim(r.InReplyTo, "<>"))
+		fmt.Fprintf(&h, "In-Reply-To: <%s>\r\n", stripCRLF(strings.Trim(r.InReplyTo, "<>")))
 	}
 	if len(r.References) > 0 {
 		refs := make([]string, 0, len(r.References))
 		for _, ref := range r.References {
-			refs = append(refs, "<"+strings.Trim(ref, "<>")+">")
+			refs = append(refs, "<"+stripCRLF(strings.Trim(ref, "<>"))+">")
 		}
 		fmt.Fprintf(&h, "References: %s\r\n", strings.Join(refs, " "))
 	}
@@ -99,6 +102,11 @@ func (s *SMTPSender) buildMessage(r model.Reply, msgID string) []byte {
 	body := strings.ReplaceAll(r.BodyText, "\r\n", "\n")
 	body = strings.ReplaceAll(body, "\n", "\r\n")
 	return []byte(h.String() + body)
+}
+
+// stripCRLF removes CR/LF so a crafted field can't inject extra headers.
+func stripCRLF(s string) string {
+	return strings.NewReplacer("\r", "", "\n", "").Replace(s)
 }
 
 func domainOf(addr string) string {

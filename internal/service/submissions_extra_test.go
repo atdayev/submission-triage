@@ -72,7 +72,7 @@ func newSvcWith(t *testing.T, subs *repomocks.SubmissionRepository, aud *repomoc
 	t.Helper()
 	cl := store.All()[0]
 	log := logrus.NewEntry(logrus.New())
-	repo := &repository.Repository{Submissions: subs, Audit: aud}
+	repo := &repository.Repository{Submissions: subs, Audit: aud, Outbox: newFakeOutbox()}
 	return NewSubmissionsService(Dependencies{
 		Config: &config.Config{Escalation: config.EscalationConfig{
 			ThresholdHours:      72,

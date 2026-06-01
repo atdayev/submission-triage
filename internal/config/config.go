@@ -13,7 +13,6 @@ type Config struct {
 	HTTP       HTTPConfig
 	Database   DatabaseConfig
 	Log        LogConfig
-	Postmark   PostmarkConfig
 	IMAP       IMAPConfig
 	SMTP       SMTPConfig
 	Outbound   OutboundConfig
@@ -47,14 +46,6 @@ type LogConfig struct {
 	RotationHours int    `env:"LOG_ROTATION_HOURS" envDefault:"24"`
 }
 
-type PostmarkConfig struct {
-	ServerToken            string `env:"POSTMARK_SERVER_TOKEN"`
-	FromAddress            string `env:"POSTMARK_FROM_ADDRESS" envDefault:"submissions@example.com"`
-	FromName               string `env:"POSTMARK_FROM_NAME" envDefault:"Submission Triage"`
-	WebhookSecret          string `env:"POSTMARK_WEBHOOK_SECRET"`
-	WebhookSignatureSecret string `env:"POSTMARK_WEBHOOK_SIGNATURE_SECRET"`
-}
-
 // IMAPConfig drives the optional inbound poller. It activates only when host,
 // username, and password are all set.
 type IMAPConfig struct {
@@ -75,11 +66,11 @@ type SMTPConfig struct {
 	Username    string `env:"SMTP_USERNAME"`
 	Password    string `env:"SMTP_PASSWORD"`
 	FromAddress string `env:"SMTP_FROM_ADDRESS"`
-	FromName    string `env:"SMTP_FROM_NAME"`
+	FromName    string `env:"SMTP_FROM_NAME" envDefault:"Submission Triage"`
 }
 
 // OutboundConfig selects the reply channel. Provider is "postmark", "smtp",
-// "log", or "" for auto (smtp if configured, else postmark, else log).
+// "log", or "" for auto (smtp, then postmark). Auto errors if neither is set.
 type OutboundConfig struct {
 	Provider string `env:"OUTBOUND_PROVIDER"`
 }
@@ -120,19 +111,10 @@ func Load() (*Config, error) {
 	if err := env.Parse(&cfg); err != nil {
 		return nil, fmt.Errorf("parse config from environment: %w", err)
 	}
-	applyDerivedDefaults(&cfg)
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 	return &cfg, nil
-}
-
-// applyDerivedDefaults fills values that depend on another field, which a
-// static envDefault tag cannot express.
-func applyDerivedDefaults(c *Config) {
-	if c.SMTP.FromName == "" {
-		c.SMTP.FromName = c.Postmark.FromName
-	}
 }
 
 func (c *Config) Validate() error {

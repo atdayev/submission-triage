@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -84,16 +85,13 @@ func Build(ctx context.Context, cfg *config.Config, log *logrus.Entry, migration
 		Log:            log,
 	})
 
-	router := deliveryhttp.NewRouter(cfg, svc, db, log)
+	router := deliveryhttp.NewRouter(db, log)
 
 	var poller *imap.Poller
 	if cfg.IMAP.Configured() {
 		poller = imap.NewPoller(cfg.IMAP, svc, log)
-	}
-
-	webhookOn := cfg.Postmark.WebhookSecret != "" || cfg.Postmark.WebhookSignatureSecret != ""
-	if !webhookOn && poller == nil {
-		log.Warn("no inbound channel configured (no webhook secret, no IMAP); the service will not ingest mail")
+	} else {
+		log.Warn("IMAP not configured; the service will not ingest mail")
 	}
 
 	return &BuiltApp{
@@ -105,27 +103,21 @@ func Build(ctx context.Context, cfg *config.Config, log *logrus.Entry, migration
 }
 
 // chooseSender picks the outbound channel: an explicit outbound.provider wins;
-// empty auto-selects SMTP, then Postmark, then the log sender.
+// empty auto-selects SMTP. "log" never auto-selects (it sends nothing), so a
+// missing SMTP config is a startup error, not a silent no-op.
 func chooseSender(cfg *config.Config, log *logrus.Entry) (email.Sender, error) {
 	attempts, base := cfg.Retry.Attempts, cfg.Retry.BaseDelay()
 	switch strings.ToLower(cfg.Outbound.Provider) {
 	case "smtp":
 		return email.NewSMTPSender(cfg.SMTP, attempts, base, log), nil
-	case "postmark":
-		return email.NewPostmarkSender(cfg.Postmark, attempts, base, log), nil
 	case "log":
 		return email.NewLogSender(log), nil
 	case "":
-		switch {
-		case cfg.SMTP.Configured():
+		if cfg.SMTP.Configured() {
 			return email.NewSMTPSender(cfg.SMTP, attempts, base, log), nil
-		case cfg.Postmark.ServerToken != "":
-			return email.NewPostmarkSender(cfg.Postmark, attempts, base, log), nil
-		default:
-			log.Warn("no outbound provider configured; falling back to log-only sender")
-			return email.NewLogSender(log), nil
 		}
+		return nil, errors.New("no outbound provider configured: set SMTP_*, or OUTBOUND_PROVIDER=log to send nothing")
 	default:
-		return nil, fmt.Errorf("unknown outbound provider %q (want postmark|smtp|log)", cfg.Outbound.Provider)
+		return nil, fmt.Errorf("unknown outbound provider %q (want smtp|log)", cfg.Outbound.Provider)
 	}
 }

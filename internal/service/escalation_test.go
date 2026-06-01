@@ -24,7 +24,7 @@ func TestEscalationWorker_StopsOnContextCancel(t *testing.T) {
 	log := logrus.NewEntry(logrus.New())
 	svc := &SubmissionsService{
 		cfg:        &config.Config{Escalation: config.EscalationConfig{ThresholdHours: 72}},
-		repo:       &repository.Repository{Submissions: subs, Audit: aud},
+		repo:       &repository.Repository{Submissions: subs, Audit: aud, Outbox: newFakeOutbox()},
 		checklists: &fakeStore{cl: model.Checklist{PolicyType: "cgl"}},
 		now:        time.Now,
 		log:        log,

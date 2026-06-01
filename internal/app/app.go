@@ -8,6 +8,7 @@ import (
 	"net"
 	httpstd "net/http"
 	"os/signal"
+	"runtime/debug"
 	"strconv"
 	"sync"
 	"syscall"
@@ -20,6 +21,24 @@ import (
 	"github.com/atdayev/submission-triage/pkg/logger"
 	"github.com/atdayev/submission-triage/pkg/telemetry"
 )
+
+// buildInfo reports the module version and VCS revision Go embeds at build time.
+func buildInfo() (version, revision string) {
+	version, revision = "dev", "unknown"
+	bi, ok := debug.ReadBuildInfo()
+	if !ok {
+		return version, revision
+	}
+	if bi.Main.Version != "" {
+		version = bi.Main.Version
+	}
+	for _, s := range bi.Settings {
+		if s.Key == "vcs.revision" {
+			revision = s.Value
+		}
+	}
+	return version, revision
+}
 
 func Run() error {
 	_ = godotenv.Load() // best-effort: .env into process env if present, never overrides existing vars
@@ -38,6 +57,9 @@ func Run() error {
 		return fmt.Errorf("setup logger: %w", err)
 	}
 	defer func() { _ = closeLog() }()
+
+	version, revision := buildInfo()
+	log.WithField("version", version).WithField("revision", revision).Info("submission-triage starting")
 
 	rootCtx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()

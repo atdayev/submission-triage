@@ -81,16 +81,24 @@ type SubmissionsService struct {
 	replyCtx    context.Context // reply lifetime; canceled at Shutdown
 	replyCancel context.CancelFunc
 	drainGrace  time.Duration
+
+	outboxRetryAfter  time.Duration // only sweep entries older than this, so the online sender isn't double-dispatched
+	outboxMaxAttempts int
+	outboxBatch       int
 }
 
-const defaultReplyDrainGrace = 10 * time.Second
+const (
+	defaultReplyDrainGrace   = 10 * time.Second
+	defaultOutboxRetryAfter  = 2 * time.Minute
+	defaultOutboxMaxAttempts = 10
+	defaultOutboxBatch       = 100
+)
 
 type replyJob struct {
-	ctx           context.Context
-	sub           model.Submission
-	missing       []model.MissingItem
-	inbound       model.Email
-	policyUnknown bool
+	ctx          context.Context
+	reply        model.Reply
+	submissionID string
+	outboxID     string
 }
 
 type IngestRequest struct {
@@ -104,7 +112,7 @@ type IngestRequest struct {
 	BodyText    string
 	ReceivedAt  time.Time
 	Attachments []model.Attachment
-	Source      string // inbound channel: "postmark" | "imap"
+	Source      string
 }
 
 type IngestResult struct {
@@ -146,6 +154,9 @@ func NewSubmissionsService(d Dependencies) *SubmissionsService {
 	if s.drainGrace <= 0 {
 		s.drainGrace = defaultReplyDrainGrace
 	}
+	s.outboxRetryAfter = defaultOutboxRetryAfter
+	s.outboxMaxAttempts = defaultOutboxMaxAttempts
+	s.outboxBatch = defaultOutboxBatch
 	for i := 0; i < workers; i++ {
 		s.replyWG.Add(1)
 		go s.replyWorker()
@@ -166,8 +177,21 @@ func (s *SubmissionsService) replyJobContext(reqCtx context.Context) context.Con
 func (s *SubmissionsService) replyWorker() {
 	defer s.replyWG.Done()
 	for job := range s.replyJobs {
-		s.sendAndRecordReply(job.ctx, &job.sub, job.missing, job.inbound, job.policyUnknown)
+		s.dispatchOnline(job)
 		s.inFlightWG.Done()
+	}
+}
+
+// dispatchOnline is the low-latency path: send immediately, mark the outbox
+// entry sent on success. On failure the entry stays pending for the sweeper.
+func (s *SubmissionsService) dispatchOnline(job replyJob) {
+	if err := s.deliver(job.ctx, job.reply, job.submissionID); err != nil {
+		logger.GetLoggerFromContext(job.ctx).WithError(err).Warn("reply send failed; will retry from outbox")
+		s.audit(job.ctx, job.submissionID, model.EventReplyFailed, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := s.repo.Outbox.Update(job.ctx, job.outboxID, model.OutboxSent, 0, ""); err != nil {
+		s.log.WithError(err).WithField("outbox_id", job.outboxID).Warn("mark outbox sent failed")
 	}
 }
 
@@ -325,25 +349,25 @@ func (s *SubmissionsService) ingestEmailInner(ctx context.Context, req IngestReq
 		State:        sub.State,
 		MissingItems: missing,
 	}
-	job := replyJob{
-		ctx:           s.replyJobContext(ctx),
-		sub:           *sub,
-		missing:       missing,
-		inbound:       inbound,
-		policyUnknown: policyUnknown,
+	// write-ahead: persist the reply before dispatching, so it survives queue
+	// overflow, a crash, or a provider outage — the sweeper redelivers it.
+	reply := s.buildReply(sub, missing, inbound, policyUnknown)
+	entry := &model.OutboxEntry{SubmissionID: sub.ID, Reply: reply, Status: model.OutboxPending}
+	if err := s.repo.Outbox.Enqueue(ctx, entry); err != nil {
+		s.log.WithError(err).WithField("submission_id", sub.ID).Error("outbox enqueue failed; reply not queued")
+		s.audit(ctx, sub.ID, model.EventReplyFailed, map[string]any{"error": "outbox enqueue: " + err.Error()})
+		return result, nil
 	}
+	result.ReplyQueued = true
+
+	// best-effort immediate dispatch; if the channel is full the sweeper sends it
+	job := replyJob{ctx: s.replyJobContext(ctx), reply: reply, submissionID: sub.ID, outboxID: entry.ID}
 	s.inFlightWG.Add(1)
 	select {
 	case s.replyJobs <- job:
-		result.ReplyQueued = true
 	default:
-		// queue full: drop instead of blocking the handler (audited + metered)
 		s.inFlightWG.Done()
-		s.metrics.ReplyDroppedTotal.Add(ctx, 1)
-		s.audit(ctx, sub.ID, model.EventReplyFailed, map[string]any{
-			"error":   "reply queue full; reply dropped",
-			"backlog": cap(s.replyJobs),
-		})
+		s.metrics.ReplyDroppedTotal.Add(ctx, 1) // not lost: deferred to the outbox sweeper
 	}
 	return result, nil
 }
@@ -382,38 +406,64 @@ func (s *SubmissionsService) knownChecklistNames() []string {
 	return out
 }
 
-func (s *SubmissionsService) sendAndRecordReply(ctx context.Context, sub *model.Submission, missing []model.MissingItem, inbound model.Email, policyUnknown bool) {
-	var reply model.Reply
+func (s *SubmissionsService) buildReply(sub *model.Submission, missing []model.MissingItem, inbound model.Email, policyUnknown bool) model.Reply {
 	switch {
 	case policyUnknown:
-		reply = model.BuildPolicyUnknownReply(*sub, inbound, s.knownChecklistNames())
+		return model.BuildPolicyUnknownReply(*sub, inbound, s.knownChecklistNames())
 	case len(missing) > 0:
-		reply = model.BuildMissingItemsReply(*sub, missing, inbound)
+		return model.BuildMissingItemsReply(*sub, missing, inbound)
 	default:
-		reply = model.BuildCompletionReply(*sub, inbound)
+		return model.BuildCompletionReply(*sub, inbound)
 	}
+}
 
+// deliver sends a reply and, on success, records the outbound email and audits
+// reply.sent. It does not touch the outbox; callers own that state transition.
+func (s *SubmissionsService) deliver(ctx context.Context, reply model.Reply, submissionID string) error {
 	providerMsgID, err := s.mail.SendThreadedReply(ctx, reply)
 	if err != nil {
 		s.metrics.ReplySendTotal.Add(ctx, 1, metric.WithAttributes(attribute.String("status", "failed")))
-		logger.GetLoggerFromContext(ctx).WithError(err).Warn("reply send failed; submission state preserved")
-		s.audit(ctx, sub.ID, model.EventReplyFailed, map[string]any{
-			"error": err.Error(),
-		})
-		return
+		return err
 	}
-
 	s.metrics.ReplySendTotal.Add(ctx, 1, metric.WithAttributes(attribute.String("status", "success")))
 	outbound := outboundEmail(reply, providerMsgID, s.now())
 	if err := s.repo.Submissions.UpsertEmail(ctx, &outbound); err != nil {
-		s.log.WithError(err).WithField("submission_id", sub.ID).Warn("outbound email upsert failed")
+		s.log.WithError(err).WithField("submission_id", submissionID).Warn("outbound email upsert failed")
 	}
-	s.audit(ctx, sub.ID, model.EventReplySent, map[string]any{
+	s.audit(ctx, submissionID, model.EventReplySent, map[string]any{
 		"provider_msg_id": providerMsgID,
 		"to":              reply.ToAddress,
 		"subject":         reply.Subject,
 		"via":             s.mail.Name(),
 	})
+	return nil
+}
+
+// RedeliverOutbox resends pending replies the online path didn't get out
+// (overflow, crash, provider outage). Entries are dead-lettered after
+// outboxMaxAttempts. Run periodically by the escalation worker.
+func (s *SubmissionsService) RedeliverOutbox(ctx context.Context) error {
+	cutoff := s.now().Add(-s.outboxRetryAfter)
+	rows, err := s.repo.Outbox.ListPending(ctx, cutoff, s.outboxBatch)
+	if err != nil {
+		return fmt.Errorf("outbox: list pending: %w", err)
+	}
+	for _, row := range rows {
+		if err := s.deliver(ctx, row.Reply, row.SubmissionID); err != nil {
+			attempts := row.Attempts + 1
+			if attempts >= s.outboxMaxAttempts {
+				_ = s.repo.Outbox.Update(ctx, row.ID, model.OutboxFailed, attempts, err.Error())
+				s.audit(ctx, row.SubmissionID, model.EventReplyFailed, map[string]any{
+					"error": err.Error(), "attempts": attempts, "dead_lettered": true,
+				})
+			} else {
+				_ = s.repo.Outbox.Update(ctx, row.ID, model.OutboxPending, attempts, err.Error())
+			}
+			continue
+		}
+		_ = s.repo.Outbox.Update(ctx, row.ID, model.OutboxSent, row.Attempts, "")
+	}
+	return nil
 }
 
 func (s *SubmissionsService) CheckEscalations(ctx context.Context) error {

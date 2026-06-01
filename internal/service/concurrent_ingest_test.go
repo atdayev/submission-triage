@@ -12,7 +12,7 @@ import (
 	repomocks "github.com/atdayev/submission-triage/internal/repository/mocks"
 )
 
-// without singleflight, concurrent webhooks for one email create N orphan rows;
+// without singleflight, concurrent ingests of one email create N orphan rows;
 // the gate collapses them so only the first executes.
 func TestIngestEmail_ConcurrentSameEmail_SingleSubmission(t *testing.T) {
 	subs := repomocks.NewSubmissionRepository(t)

@@ -1,4 +1,5 @@
-package postmarkeml
+// Package emlparse parses RFC822 email into the Payload the pipeline consumes.
+package emlparse
 
 import (
 	"encoding/base64"
@@ -17,33 +18,33 @@ import (
 const maxMultipartDepth = 32 // bound recursion; crafted mail can nest forever
 
 type Address struct {
-	Email string `json:"Email"`
-	Name  string `json:"Name"`
+	Email string
+	Name  string
 }
 
 type Header struct {
-	Name  string `json:"Name"`
-	Value string `json:"Value"`
+	Name  string
+	Value string
 }
 
 type Attachment struct {
-	Name          string `json:"Name"`
-	Content       string `json:"Content"`
-	ContentType   string `json:"ContentType"`
-	ContentLength int    `json:"ContentLength"`
+	Name          string
+	Content       string
+	ContentType   string
+	ContentLength int
 }
 
 type Payload struct {
-	MessageID   string       `json:"MessageID"`
-	From        string       `json:"From"`
-	FromFull    Address      `json:"FromFull"`
-	To          string       `json:"To"`
-	ToFull      []Address    `json:"ToFull"`
-	Subject     string       `json:"Subject"`
-	TextBody    string       `json:"TextBody"`
-	Date        string       `json:"Date"`
-	Headers     []Header     `json:"Headers"`
-	Attachments []Attachment `json:"Attachments"`
+	MessageID   string
+	From        string
+	FromFull    Address
+	To          string
+	ToFull      []Address
+	Subject     string
+	TextBody    string
+	Date        string
+	Headers     []Header
+	Attachments []Attachment
 }
 
 func FromFile(path string) (Payload, error) {
@@ -56,7 +57,7 @@ func FromFile(path string) (Payload, error) {
 }
 
 // FromReader parses an RFC822 message (e.g. a raw message fetched over IMAP)
-// into the same Payload shape as the Postmark webhook produces.
+// into the Payload shape the pipeline consumes.
 func FromReader(r io.Reader) (Payload, error) {
 	var p Payload
 	msg, err := mail.ReadMessage(r)
@@ -84,7 +85,7 @@ func FromReader(r io.Reader) (Payload, error) {
 	p.FromFull = from
 	p.To = to.Email
 	p.ToFull = []Address{to}
-	p.Subject = msg.Header.Get("Subject")
+	p.Subject = decodeHeader(msg.Header.Get("Subject"))
 	p.TextBody = text
 	p.Date = date
 	p.Headers = []Header{
@@ -103,7 +104,7 @@ func parseBody(msg *mail.Message) (string, []Attachment, error) {
 		if derr != nil {
 			return "", nil, derr
 		}
-		return string(body), nil, nil
+		return toUTF8(body, params["charset"]), nil, nil
 	}
 
 	var text string
@@ -144,7 +145,7 @@ func walkParts(r io.Reader, boundary string, text *string, atts *[]Attachment, d
 
 		if disp == "attachment" || partParams["name"] != "" {
 			*atts = append(*atts, Attachment{
-				Name:          firstNonEmpty(partParams["name"], part.FileName(), "attachment.bin"),
+				Name:          decodeHeader(firstNonEmpty(partParams["name"], part.FileName(), "attachment.bin")),
 				Content:       base64.StdEncoding.EncodeToString(body),
 				ContentType:   partType,
 				ContentLength: len(body),
@@ -152,7 +153,7 @@ func walkParts(r io.Reader, boundary string, text *string, atts *[]Attachment, d
 			continue
 		}
 		if *text == "" && strings.HasPrefix(partType, "text/plain") {
-			*text = string(body)
+			*text = toUTF8(body, partParams["charset"])
 		}
 	}
 }
@@ -177,6 +178,15 @@ func decodeBody(r io.Reader, encoding string) ([]byte, error) {
 	default:
 		return raw, nil
 	}
+}
+
+// decodeHeader decodes RFC2047 encoded-words; plain text passes through.
+func decodeHeader(s string) string {
+	got, err := (&mime.WordDecoder{}).DecodeHeader(s)
+	if err != nil {
+		return s
+	}
+	return got
 }
 
 func splitAddress(in string) Address {

@@ -1,6 +1,3 @@
-// Package imap polls an existing mailbox over IMAP and feeds new mail into the
-// same ingest pipeline the Postmark webhook uses. It is an additive inbound
-// channel: enabled only when IMAP credentials are configured.
 package imap
 
 import (
@@ -13,7 +10,8 @@ import (
 	"github.com/atdayev/submission-triage/internal/config"
 	"github.com/atdayev/submission-triage/internal/delivery/emailingest"
 	"github.com/atdayev/submission-triage/internal/service"
-	"github.com/atdayev/submission-triage/pkg/postmarkeml"
+	"github.com/atdayev/submission-triage/pkg/emlparse"
+	"github.com/atdayev/submission-triage/pkg/logger"
 )
 
 const defaultBatchLimit = 50
@@ -89,6 +87,11 @@ func (p *Poller) pollOnce(ctx context.Context) {
 		p.log.WithError(err).Warn("imap fetch failed")
 		return
 	}
+	if len(msgs) == 0 {
+		p.log.Debug("imap poll: no unseen messages")
+		return
+	}
+	p.log.WithField("count", len(msgs)).Info("imap poll: processing unseen messages")
 	for _, m := range msgs {
 		if ctx.Err() != nil {
 			return
@@ -98,21 +101,29 @@ func (p *Poller) pollOnce(ctx context.Context) {
 }
 
 func (p *Poller) process(ctx context.Context, mb mailbox, m rawMessage) {
-	payload, err := postmarkeml.FromReader(bytes.NewReader(m.Raw))
+	rid := logger.GenerateRequestID()
+	log := p.log.WithFields(logrus.Fields{logger.RequestIDField: rid, "uid": m.UID})
+	ctx = logger.ContextWithRequestID(logger.ContextWithLogger(ctx, log), rid)
+
+	payload, err := emlparse.FromReader(bytes.NewReader(m.Raw))
 	if err != nil {
-		// won't parse on a later tick either; mark read so we don't loop on it
-		p.log.WithError(err).WithField("uid", m.UID).Warn("imap: unparseable message; marking read")
+		log.WithError(err).Warn("imap: unparseable message; marking read")
 		_ = mb.MarkSeen(ctx, m.UID)
 		return
 	}
 
-	if _, err := p.ingest.IngestEmail(ctx, emailingest.Translate(payload, "imap")); err != nil {
-		// transient failure: leave unread for the next tick (reprocessing is idempotent)
-		p.log.WithError(err).WithField("uid", m.UID).Warn("imap: ingest failed; leaving unread for retry")
+	res, err := p.ingest.IngestEmail(ctx, emailingest.Translate(payload, "imap"))
+	if err != nil {
+		log.WithError(err).Warn("imap: ingest failed; leaving unread for retry")
 		return
 	}
+	log.WithFields(logrus.Fields{
+		"submission_id": res.SubmissionID,
+		"state":         res.State,
+		"duplicate":     res.IsDuplicate,
+	}).Info("imap: message ingested")
 
 	if err := mb.MarkSeen(ctx, m.UID); err != nil {
-		p.log.WithError(err).WithField("uid", m.UID).Warn("imap: mark-seen failed")
+		log.WithError(err).Warn("imap: mark-seen failed")
 	}
 }

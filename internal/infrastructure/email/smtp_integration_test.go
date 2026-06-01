@@ -88,6 +88,58 @@ func fakeSMTPServer(t *testing.T) (string, *receivedMail) {
 	return ln.Addr().String(), rec
 }
 
+// stallingServer accepts a connection then never speaks SMTP, so a client
+// blocks reading the greeting — used to prove context cancellation unblocks it.
+func stallingServer(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	stop := make(chan struct{})
+	t.Cleanup(func() { close(stop); _ = ln.Close() })
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		<-stop
+	}()
+	return ln.Addr().String()
+}
+
+func TestIntegration_SMTP_ContextCancelUnblocksSend(t *testing.T) {
+	host, port, _ := net.SplitHostPort(stallingServer(t))
+	s := &SMTPSender{
+		cfg:           config.SMTPConfig{Host: host, Port: port, FromAddress: "ops@agency.example"},
+		send:          realSMTPSend,
+		log:           logrus.NewEntry(logrus.New()),
+		retryAttempts: 1,
+		retryBase:     time.Millisecond,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := s.SendThreadedReply(ctx, model.Reply{ToAddress: "broker@x", Subject: "hi"})
+		errCh <- err
+	}()
+
+	// let the client connect and block on the greeting, then cancel mid-send
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("expected error after context cancellation")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("send did not return after cancellation; close-on-cancel is broken")
+	}
+}
+
 func TestIntegration_SMTP_RealSendSequence(t *testing.T) {
 	addr, rec := fakeSMTPServer(t)
 	host, port, _ := net.SplitHostPort(addr)

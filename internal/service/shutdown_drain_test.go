@@ -51,7 +51,7 @@ func TestIngestEmail_ReplyGoroutineSurvivesCtxCancel(t *testing.T) {
 	log := logrus.NewEntry(logrus.New())
 	svc := NewSubmissionsService(Dependencies{
 		Config:         &config.Config{Escalation: config.EscalationConfig{ThresholdHours: 72}},
-		Repository:     &repository.Repository{Submissions: subs, Audit: aud},
+		Repository:     &repository.Repository{Submissions: subs, Audit: aud, Outbox: newFakeOutbox()},
 		EmailSender:    mail,
 		Classifier:     &filenameClassifier{checklist: cl},
 		ChecklistStore: &fakeStore{cl: cl},
@@ -132,7 +132,7 @@ func TestShutdown_BoundedWhenSendStuck(t *testing.T) {
 			Escalation: config.EscalationConfig{ThresholdHours: 72},
 			HTTP:       config.HTTPConfig{ShutdownTimeoutSec: 1}, // 1s drain grace
 		},
-		Repository:     &repository.Repository{Submissions: subs, Audit: aud},
+		Repository:     &repository.Repository{Submissions: subs, Audit: aud, Outbox: newFakeOutbox()},
 		EmailSender:    mail,
 		Classifier:     &filenameClassifier{checklist: cl},
 		ChecklistStore: &fakeStore{cl: cl},

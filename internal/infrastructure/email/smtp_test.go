@@ -77,6 +77,62 @@ func TestSMTP_HappyPath_HeadersAndThreading(t *testing.T) {
 	}
 }
 
+func TestSMTP_EncodesNonASCIISubjectAndName(t *testing.T) {
+	var captured []byte
+	s := testSMTP(func(_ context.Context, _ config.SMTPConfig, _ string, _ []string, msg []byte) error {
+		captured = msg
+		return nil
+	})
+	s.cfg.FromName = "Café Triage"
+
+	if _, err := s.SendThreadedReply(context.Background(), model.Reply{
+		ToAddress: "broker@x",
+		Subject:   "Re: Validación de póliza",
+	}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	m := string(captured)
+	// raw 8-bit bytes must never reach the headers; they must be RFC2047-encoded
+	if strings.Contains(m, "Validación") || strings.Contains(m, "Café") {
+		t.Errorf("non-ASCII left raw in headers:\n%s", m)
+	}
+	if !strings.Contains(m, "Subject: =?utf-8?q?") {
+		t.Errorf("subject not RFC2047-encoded:\n%s", m)
+	}
+	if !strings.Contains(m, "From: =?utf-8?q?") {
+		t.Errorf("from-name not RFC2047-encoded:\n%s", m)
+	}
+}
+
+func TestSMTP_NeutralizesHeaderInjection(t *testing.T) {
+	var captured []byte
+	s := testSMTP(func(_ context.Context, _ config.SMTPConfig, _ string, _ []string, msg []byte) error {
+		captured = msg
+		return nil
+	})
+
+	if _, err := s.SendThreadedReply(context.Background(), model.Reply{
+		ToAddress: "broker@x\r\nBcc: evil@z",
+		Subject:   "ok\r\nX-Injected: yes",
+		InReplyTo: "root@x\r\nX-Evil: 1",
+		BodyText:  "body",
+	}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	m := string(captured)
+	// no crafted field may start a new header line in the rendered message
+	for _, bad := range []string{"\nBcc:", "\nX-Injected:", "\nX-Evil:"} {
+		if strings.Contains(m, bad) {
+			t.Errorf("injected header line %q survived:\n%s", strings.TrimPrefix(bad, "\n"), m)
+		}
+	}
+	if n := strings.Count(m, "\r\nTo: "); n != 1 {
+		t.Errorf("expected exactly one To header, got %d:\n%s", n, m)
+	}
+}
+
 func TestSMTP_OmitsThreadingHeadersWhenAbsent(t *testing.T) {
 	var captured []byte
 	s := testSMTP(func(_ context.Context, _ config.SMTPConfig, _ string, _ []string, msg []byte) error {
