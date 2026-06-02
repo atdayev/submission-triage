@@ -21,7 +21,7 @@ func TestDo_MaxDelayCapsExponentialGrowth(t *testing.T) {
 	}
 	jitter = recordSleep
 
-	// 20 attempts, base 1s → without cap the 19th delay would be ~524288s.
+	// 20 attempts, base 1s → without cap the largest delay would be 2^18 ≈ 262144s.
 	// With MaxDelay=30s we should hit the cap quickly.
 	_ = Do(context.Background(), 20, 1*time.Second, func(context.Context) error {
 		return errors.New("always fails")

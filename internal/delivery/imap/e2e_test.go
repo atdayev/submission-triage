@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/sirupsen/logrus"
 
@@ -154,7 +155,14 @@ func TestE2E_RealIMAPTrigger(t *testing.T) {
 		t.Errorf("reply.sent audits: got %d, want >= %d", n, len(emls))
 	}
 
-	// Stale cases escalate.
+	// The freshness clock is driven by processing time (not the sender's Date
+	// header), so simulate aged cases by back-dating the awaiting rows well past
+	// any threshold, then confirm they escalate.
+	aged := time.Now().Add(-10000 * time.Hour).UnixNano()
+	if _, err := db.ExecContext(ctx, "UPDATE submissions SET last_action_at = ? WHERE state = ?",
+		aged, string(model.StateAwaiting)); err != nil {
+		t.Fatalf("age awaiting: %v", err)
+	}
 	if err := svc.CheckEscalations(ctx); err != nil {
 		t.Fatalf("escalations: %v", err)
 	}

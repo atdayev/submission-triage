@@ -1,7 +1,7 @@
 # testdata
 
-Synthetic, non-real submission emails used by the demo replay (`make demo`)
-and the end-to-end test in `test/e2e/replay_test.go`.
+Synthetic, non-real submission emails used by the end-to-end test in
+`internal/delivery/imap/e2e_test.go`.
 
 **Nothing here represents a real submission, real insured, or real broker.**
 All names, addresses, and claim narratives are fabricated. The "PDF"

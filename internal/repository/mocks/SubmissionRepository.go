@@ -51,6 +51,36 @@ func (_m *SubmissionRepository) FindByEmailReference(ctx context.Context, messag
 	return r0, r1, r2
 }
 
+// FindByDeterministicID provides a mock function with given fields: ctx, deterministicID
+func (_m *SubmissionRepository) FindByDeterministicID(ctx context.Context, deterministicID string) (*model.Submission, error) {
+	ret := _m.Called(ctx, deterministicID)
+
+	if len(ret) == 0 {
+		panic("no return value specified for FindByDeterministicID")
+	}
+
+	var r0 *model.Submission
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context, string) (*model.Submission, error)); ok {
+		return rf(ctx, deterministicID)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context, string) *model.Submission); ok {
+		r0 = rf(ctx, deterministicID)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(*model.Submission)
+		}
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context, string) error); ok {
+		r1 = rf(ctx, deterministicID)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
 // ListCompletedBefore provides a mock function with given fields: ctx, olderThanUnixNano, limit
 func (_m *SubmissionRepository) ListCompletedBefore(ctx context.Context, olderThanUnixNano int64, limit int) ([]model.Submission, error) {
 	ret := _m.Called(ctx, olderThanUnixNano, limit)

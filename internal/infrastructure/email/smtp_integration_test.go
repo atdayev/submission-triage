@@ -51,7 +51,8 @@ func fakeSMTPServer(t *testing.T) (string, *receivedMail) {
 			cmd := strings.ToUpper(strings.TrimSpace(line))
 			switch {
 			case strings.HasPrefix(cmd, "EHLO"), strings.HasPrefix(cmd, "HELO"):
-				// advertise AUTH PLAIN but not STARTTLS, so the client auths without upgrading
+				// no STARTTLS advertised; the client only proceeds in the clear
+				// because the host is loopback (isLocalhost), never for a remote server
 				fmt.Fprint(conn, "250-test\r\n250 AUTH PLAIN\r\n")
 			case strings.HasPrefix(cmd, "AUTH"):
 				rec.authed = true

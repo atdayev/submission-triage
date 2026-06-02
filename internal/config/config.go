@@ -69,8 +69,8 @@ type SMTPConfig struct {
 	FromName    string `env:"SMTP_FROM_NAME" envDefault:"Submission Triage"`
 }
 
-// OutboundConfig selects the reply channel. Provider is "postmark", "smtp",
-// "log", or "" for auto (smtp, then postmark). Auto errors if neither is set.
+// OutboundConfig selects the reply channel. Provider is "smtp", "log", or ""
+// for auto (smtp if configured, else a startup error).
 type OutboundConfig struct {
 	Provider string `env:"OUTBOUND_PROVIDER"`
 }
@@ -126,6 +126,12 @@ func (c *Config) Validate() error {
 	}
 	if c.Checklists.Directory == "" {
 		return errors.New("config: checklists.directory required")
+	}
+	if c.Escalation.IntervalMinutes <= 0 {
+		return errors.New("config: escalation.interval_minutes must be > 0")
+	}
+	if c.IMAP.Configured() && c.IMAP.PollIntervalSeconds <= 0 {
+		return errors.New("config: imap.poll_interval_seconds must be > 0")
 	}
 	return nil
 }

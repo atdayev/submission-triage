@@ -44,7 +44,15 @@ func (c *HeuristicLLMClassifier) Classify(ctx context.Context, in Input) (Result
 	}
 
 	byContent := matchByContent(in)
-	if r, ok := singleMatch(merge(byName, byContent), 0.85, "filename or content match"); ok {
+	if r, ok := singleMatch(merge(byName, byContent), 0.85, ""); ok {
+		switch id := r.CandidateID; {
+		case byName[id] && byContent[id]:
+			r.Reason = "filename and content match"
+		case byName[id]:
+			r.Reason = "filename match"
+		default:
+			r.Reason = "content match"
+		}
 		return r, nil
 	}
 

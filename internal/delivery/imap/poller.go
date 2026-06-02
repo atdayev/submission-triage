@@ -105,6 +105,13 @@ func (p *Poller) process(ctx context.Context, mb mailbox, m rawMessage) {
 	log := p.log.WithFields(logrus.Fields{logger.RequestIDField: rid, "uid": m.UID})
 	ctx = logger.ContextWithRequestID(logger.ContextWithLogger(ctx, log), rid)
 
+	// a panic on one message must not kill the poller
+	defer func() {
+		if r := recover(); r != nil {
+			log.Errorf("imap: panic processing message: %v", r)
+		}
+	}()
+
 	payload, err := emlparse.FromReader(bytes.NewReader(m.Raw))
 	if err != nil {
 		log.WithError(err).Warn("imap: unparseable message; marking read")

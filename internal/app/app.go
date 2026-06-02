@@ -22,7 +22,9 @@ import (
 	"github.com/atdayev/submission-triage/pkg/telemetry"
 )
 
-// buildInfo reports the module version and VCS revision Go embeds at build time.
+// buildInfo reports version and VCS revision from the embedded build info.
+// Plain `go build` reports version "(devel)"; a real version comes from
+// `go install module@version` or VCS tag stamping.
 func buildInfo() (version, revision string) {
 	version, revision = "dev", "unknown"
 	bi, ok := debug.ReadBuildInfo()

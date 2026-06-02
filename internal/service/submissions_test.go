@@ -124,13 +124,18 @@ func smallChecklist() model.Checklist {
 
 func newSvc(t *testing.T, subs *repomocks.SubmissionRepository, aud *repomocks.AuditRepository, mail *fakeMail, cl model.Checklist) *SubmissionsService {
 	t.Helper()
+	return newSvcWithClassifier(t, subs, aud, mail, cl, &filenameClassifier{checklist: cl})
+}
+
+func newSvcWithClassifier(t *testing.T, subs *repomocks.SubmissionRepository, aud *repomocks.AuditRepository, mail *fakeMail, cl model.Checklist, clf classifier.Classifier) *SubmissionsService {
+	t.Helper()
 	log := logrus.NewEntry(logrus.New())
 	repo := &repository.Repository{Submissions: subs, Audit: aud, Outbox: newFakeOutbox()}
 	return NewSubmissionsService(Dependencies{
 		Config:         &config.Config{Escalation: config.EscalationConfig{ThresholdHours: 72}},
 		Repository:     repo,
 		EmailSender:    mail,
-		Classifier:     &filenameClassifier{checklist: cl},
+		Classifier:     clf,
 		ChecklistStore: &fakeStore{cl: cl},
 		TextExtractors: map[string]TextExtractor{
 			"application/pdf": fakeExtractor{},

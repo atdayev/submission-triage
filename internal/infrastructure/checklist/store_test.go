@@ -99,6 +99,45 @@ func TestNewYAMLStore_MalformedYAMLRejected(t *testing.T) {
 	}
 }
 
+func TestNewYAMLStore_DuplicatePolicyTypeRejected(t *testing.T) {
+	dir := t.TempDir()
+	writeYAML(t, dir, "a.yaml", cglYAML)
+	writeYAML(t, dir, "b.yaml", cglYAML) // same policy_type: cgl
+
+	if _, err := NewYAMLStore(dir, logrus.NewEntry(logrus.New())); err == nil {
+		t.Fatal("expected error for duplicate policy_type")
+	}
+}
+
+func TestNewYAMLStore_InvalidGlobRejected(t *testing.T) {
+	dir := t.TempDir()
+	writeYAML(t, dir, "bad.yaml", `name: Bad
+policy_type: bad
+required_items:
+  - id: x
+    description: "x"
+    match:
+      filename_patterns: ["[unterminated"]
+`)
+	if _, err := NewYAMLStore(dir, logrus.NewEntry(logrus.New())); err == nil {
+		t.Fatal("expected error for invalid filename glob")
+	}
+}
+
+func TestNewYAMLStore_EmptyItemIDRejected(t *testing.T) {
+	dir := t.TempDir()
+	writeYAML(t, dir, "bad.yaml", `name: Bad
+policy_type: bad
+required_items:
+  - description: "no id"
+    match:
+      filename_patterns: ["*x*"]
+`)
+	if _, err := NewYAMLStore(dir, logrus.NewEntry(logrus.New())); err == nil {
+		t.Fatal("expected error for required item with empty id")
+	}
+}
+
 func TestReload_PicksUpChanges(t *testing.T) {
 	dir := t.TempDir()
 	writeYAML(t, dir, "cgl.yaml", cglYAML)

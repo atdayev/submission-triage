@@ -2,15 +2,32 @@ package service
 
 import (
 	"context"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/mock"
 
+	"github.com/atdayev/submission-triage/internal/infrastructure/classifier"
 	"github.com/atdayev/submission-triage/internal/model"
 	repomocks "github.com/atdayev/submission-triage/internal/repository/mocks"
 )
+
+// blockingClassifier parks the singleflight leader inside Classify so the test
+// can prove the other goroutines join the in-flight call before it returns.
+type blockingClassifier struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingClassifier) Classify(_ context.Context, _ classifier.Input) (classifier.Result, error) {
+	b.once.Do(func() { close(b.entered) })
+	<-b.release
+	return classifier.Result{By: "heuristic"}, nil
+}
 
 // without singleflight, concurrent ingests of one email create N orphan rows;
 // the gate collapses them so only the first executes.
@@ -32,7 +49,8 @@ func TestIngestEmail_ConcurrentSameEmail_SingleSubmission(t *testing.T) {
 	subs.On("UpsertEmail", mock.Anything, mock.Anything).Return(nil).Maybe()
 	aud.On("Append", mock.Anything, mock.Anything).Return(nil)
 
-	svc := newSvc(t, subs, aud, mail, cl)
+	bc := &blockingClassifier{entered: make(chan struct{}), release: make(chan struct{})}
+	svc := newSvcWithClassifier(t, subs, aud, mail, cl, bc)
 
 	const N = 10
 	req := IngestRequest{
@@ -46,6 +64,7 @@ func TestIngestEmail_ConcurrentSameEmail_SingleSubmission(t *testing.T) {
 	}
 
 	start := make(chan struct{})
+	var launched atomic.Int32
 	var wg sync.WaitGroup
 	results := make([]IngestResult, N)
 	errs := make([]error, N)
@@ -54,10 +73,20 @@ func TestIngestEmail_ConcurrentSameEmail_SingleSubmission(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			<-start
+			launched.Add(1)
 			results[i], errs[i] = svc.IngestEmail(context.Background(), req)
 		}(i)
 	}
 	close(start)
+
+	// leader holds the singleflight key; wait for all goroutines, then let them park
+	<-bc.entered
+	for launched.Load() < int32(N) {
+		runtime.Gosched()
+	}
+	time.Sleep(20 * time.Millisecond)
+	close(bc.release)
+
 	wg.Wait()
 	svc.Wait()
 

@@ -27,15 +27,23 @@ func (e *XLSX) Extract(data []byte) (string, error) {
 	var out strings.Builder
 	emitted := 0
 	for _, sheet := range f.GetSheetList() {
-		rows, err := f.GetRows(sheet)
+		if emitted >= maxXLSXRows {
+			break
+		}
+		// stream rows; GetRows would materialize the whole sheet
+		rows, err := f.Rows(sheet)
 		if err != nil {
 			continue
 		}
-		for _, row := range rows {
+		for rows.Next() {
 			if emitted >= maxXLSXRows {
-				return out.String(), nil
+				break
 			}
-			line := strings.TrimSpace(strings.Join(row, "\t"))
+			cols, err := rows.Columns()
+			if err != nil {
+				continue
+			}
+			line := strings.TrimSpace(strings.Join(cols, "\t"))
 			if line == "" {
 				continue
 			}
@@ -43,6 +51,7 @@ func (e *XLSX) Extract(data []byte) (string, error) {
 			out.WriteString("\n")
 			emitted++
 		}
+		_ = rows.Close()
 	}
 	return out.String(), nil
 }

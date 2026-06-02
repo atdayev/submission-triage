@@ -91,7 +91,14 @@ func (s *YAMLStore) Reload() error {
 		if raw.PolicyType == "" {
 			return fmt.Errorf("checklist: %s missing policy_type", path)
 		}
-		loaded[raw.PolicyType] = raw.toModel()
+		if _, dup := loaded[raw.PolicyType]; dup {
+			return fmt.Errorf("checklist: %s: duplicate policy_type %q", path, raw.PolicyType)
+		}
+		cl := raw.toModel()
+		if err := validateChecklist(cl); err != nil {
+			return fmt.Errorf("checklist: %s: %w", path, err)
+		}
+		loaded[raw.PolicyType] = cl
 		return nil
 	})
 	if err != nil {
@@ -120,6 +127,21 @@ func (s *YAMLStore) All() []model.Checklist {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].PolicyType < out[j].PolicyType })
 	return out
+}
+
+// validateChecklist checks item ids and filename globs.
+func validateChecklist(c model.Checklist) error {
+	for _, item := range c.Required {
+		if item.ID == "" {
+			return fmt.Errorf("required item with empty id")
+		}
+		for _, p := range item.Match.FilenamePatterns {
+			if _, err := filepath.Match(p, ""); err != nil {
+				return fmt.Errorf("item %q: invalid filename pattern %q: %w", item.ID, p, err)
+			}
+		}
+	}
+	return nil
 }
 
 func (r rawChecklist) toModel() model.Checklist {

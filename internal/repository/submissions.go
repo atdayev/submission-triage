@@ -18,6 +18,8 @@ import (
 type SubmissionRepository interface {
 	UpsertSubmission(ctx context.Context, s *model.Submission) error
 	FindByEmailReference(ctx context.Context, messageIDs []string) (*model.Submission, bool, error)
+	// FindByDeterministicID finds the submission owning an email by deterministic id.
+	FindByDeterministicID(ctx context.Context, deterministicID string) (*model.Submission, error)
 	ListStale(ctx context.Context, olderThanUnixNano int64, limit int) ([]model.Submission, error)
 	ListCompletedBefore(ctx context.Context, olderThanUnixNano int64, limit int) ([]model.Submission, error)
 	ListEscalatedSince(ctx context.Context, sinceUnixNano int64, limit int) ([]model.Submission, error)
@@ -125,6 +127,22 @@ func (r *SubmissionRepositoryImpl) FindByEmailReference(ctx context.Context, mes
 	return s, ambiguous, nil
 }
 
+func (r *SubmissionRepositoryImpl) FindByDeterministicID(ctx context.Context, deterministicID string) (*model.Submission, error) {
+	if deterministicID == "" {
+		return nil, model.ErrSubmissionNotFound
+	}
+	var submissionID string
+	err := r.db.QueryRowContext(ctx,
+		`SELECT submission_id FROM emails WHERE deterministic_id = ?`, deterministicID).Scan(&submissionID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, model.ErrSubmissionNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query deterministic id: %w", err)
+	}
+	return r.GetByID(ctx, submissionID)
+}
+
 func (r *SubmissionRepositoryImpl) findSubmissionIDsByRefs(ctx context.Context, refs []string) ([]string, error) {
 	in := placeholderList(len(refs))
 	args := make([]any, 0, len(refs)*2)
@@ -161,7 +179,8 @@ func (r *SubmissionRepositoryImpl) pickMostRecentlyUpdated(ctx context.Context, 
 	for i, id := range ids {
 		args[i] = id
 	}
-	query := fmt.Sprintf(`SELECT id FROM submissions WHERE id IN (%s) ORDER BY updated_at DESC LIMIT 1`, in)
+	// id breaks updated_at ties
+	query := fmt.Sprintf(`SELECT id FROM submissions WHERE id IN (%s) ORDER BY updated_at DESC, id DESC LIMIT 1`, in)
 	var best string
 	if err := r.db.QueryRowContext(ctx, query, args...).Scan(&best); err != nil {
 		return "", fmt.Errorf("select most-recent thread: %w", err)
@@ -178,6 +197,14 @@ func nonEmpty(in []string) []string {
 		}
 	}
 	return out
+}
+
+// nanoOrNow avoids persisting a zero time (UnixNano of zero is year 1754).
+func nanoOrNow(t time.Time) int64 {
+	if t.IsZero() {
+		return time.Now().UTC().UnixNano()
+	}
+	return t.UnixNano()
 }
 
 func placeholderList(n int) string {
@@ -313,7 +340,7 @@ func upsertSubmissionRow(ctx context.Context, tx *sql.Tx, s *model.Submission) e
 			escalated_at=excluded.escalated_at,
 			missing_items=excluded.missing_items`,
 		s.ID, s.PolicyType, string(s.State), s.SubjectLine, s.FromAddress, s.FromName,
-		s.ThreadKey, s.CreatedAt.UnixNano(), s.UpdatedAt.UnixNano(), s.LastActionAt.UnixNano(),
+		s.ThreadKey, nanoOrNow(s.CreatedAt), nanoOrNow(s.UpdatedAt), nanoOrNow(s.LastActionAt),
 		escalatedAt, string(missingJSON),
 	)
 	if err != nil {

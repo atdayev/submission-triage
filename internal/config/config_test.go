@@ -42,9 +42,40 @@ func TestValidate_AcceptsMinimalConfig(t *testing.T) {
 		HTTP:       HTTPConfig{Port: 8080},
 		Database:   DatabaseConfig{Path: "x"},
 		Checklists: ChecklistsConfig{Directory: "y"},
+		Escalation: EscalationConfig{IntervalMinutes: 15},
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("unexpected: %v", err)
+	}
+}
+
+func TestValidate_RejectsNonPositiveIntervals(t *testing.T) {
+	base := func() *Config {
+		return &Config{
+			HTTP:       HTTPConfig{Port: 8080},
+			Database:   DatabaseConfig{Path: "x"},
+			Checklists: ChecklistsConfig{Directory: "y"},
+			Escalation: EscalationConfig{IntervalMinutes: 15},
+		}
+	}
+
+	c := base()
+	c.Escalation.IntervalMinutes = 0
+	if err := c.Validate(); err == nil {
+		t.Error("escalation interval 0 should be rejected (NewTicker would panic)")
+	}
+
+	c = base()
+	c.IMAP = IMAPConfig{Host: "imap.x", Username: "u", Password: "p", PollIntervalSeconds: 0}
+	if err := c.Validate(); err == nil {
+		t.Error("imap poll interval 0 with IMAP configured should be rejected")
+	}
+
+	// poll interval 0 is harmless when IMAP is not configured (poller never starts)
+	c = base()
+	c.IMAP = IMAPConfig{PollIntervalSeconds: 0}
+	if err := c.Validate(); err != nil {
+		t.Errorf("unconfigured IMAP should not trip poll-interval validation: %v", err)
 	}
 }
 

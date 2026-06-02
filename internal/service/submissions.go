@@ -85,6 +85,9 @@ type SubmissionsService struct {
 	outboxRetryAfter  time.Duration // only sweep entries older than this, so the online sender isn't double-dispatched
 	outboxMaxAttempts int
 	outboxBatch       int
+
+	dispatchMu  sync.Mutex
+	dispatching map[string]struct{} // outbox ids in flight; the sweeper skips them
 }
 
 const (
@@ -137,17 +140,18 @@ func NewSubmissionsService(d Dependencies) *SubmissionsService {
 		metrics = telemetry.NoopMetrics()
 	}
 	s := &SubmissionsService{
-		cfg:        d.Config,
-		repo:       d.Repository,
-		mail:       d.EmailSender,
-		classifier: d.Classifier,
-		checklists: d.ChecklistStore,
-		extractors: d.TextExtractors,
-		llm:        d.LLM,
-		metrics:    metrics,
-		now:        time.Now,
-		log:        d.Log,
-		replyJobs:  make(chan replyJob, queue),
+		cfg:         d.Config,
+		repo:        d.Repository,
+		mail:        d.EmailSender,
+		classifier:  d.Classifier,
+		checklists:  d.ChecklistStore,
+		extractors:  d.TextExtractors,
+		llm:         d.LLM,
+		metrics:     metrics,
+		now:         time.Now,
+		log:         d.Log,
+		replyJobs:   make(chan replyJob, queue),
+		dispatching: map[string]struct{}{},
 	}
 	s.replyCtx, s.replyCancel = context.WithCancel(context.Background())
 	s.drainGrace = d.Config.HTTP.ShutdownTimeout()
@@ -185,6 +189,7 @@ func (s *SubmissionsService) replyWorker() {
 // dispatchOnline is the low-latency path: send immediately, mark the outbox
 // entry sent on success. On failure the entry stays pending for the sweeper.
 func (s *SubmissionsService) dispatchOnline(job replyJob) {
+	defer s.releaseDispatch(job.outboxID)
 	if err := s.deliver(job.ctx, job.reply, job.submissionID); err != nil {
 		logger.GetLoggerFromContext(job.ctx).WithError(err).Warn("reply send failed; will retry from outbox")
 		s.audit(job.ctx, job.submissionID, model.EventReplyFailed, map[string]any{"error": err.Error()})
@@ -193,6 +198,28 @@ func (s *SubmissionsService) dispatchOnline(job replyJob) {
 	if err := s.repo.Outbox.Update(job.ctx, job.outboxID, model.OutboxSent, 0, ""); err != nil {
 		s.log.WithError(err).WithField("outbox_id", job.outboxID).Warn("mark outbox sent failed")
 	}
+}
+
+func (s *SubmissionsService) claimDispatch(id string) {
+	s.dispatchMu.Lock()
+	if s.dispatching == nil {
+		s.dispatching = map[string]struct{}{}
+	}
+	s.dispatching[id] = struct{}{}
+	s.dispatchMu.Unlock()
+}
+
+func (s *SubmissionsService) releaseDispatch(id string) {
+	s.dispatchMu.Lock()
+	delete(s.dispatching, id)
+	s.dispatchMu.Unlock()
+}
+
+func (s *SubmissionsService) isDispatching(id string) bool {
+	s.dispatchMu.Lock()
+	defer s.dispatchMu.Unlock()
+	_, ok := s.dispatching[id]
+	return ok
 }
 
 func (s *SubmissionsService) setClock(c clock) { s.now = c }
@@ -253,6 +280,19 @@ func (s *SubmissionsService) ingestEmailInner(ctx context.Context, req IngestReq
 			"message_id": req.MessageID,
 		})
 	case errors.Is(err, model.ErrSubmissionNotFound):
+		// no thread headers: dedup on the deterministic id so a redelivered
+		// header-less email isn't reprocessed into a second submission/reply
+		if len(refs) == 0 {
+			if existing, dErr := s.repo.Submissions.FindByDeterministicID(ctx, emailID); dErr == nil {
+				s.audit(ctx, existing.ID, model.EventEmailDuplicate, map[string]any{
+					"deterministic_id": emailID,
+					"source":           req.Source,
+				})
+				return IngestResult{SubmissionID: existing.ID, State: existing.State, IsDuplicate: true}, nil
+			} else if !errors.Is(dErr, model.ErrSubmissionNotFound) {
+				return IngestResult{}, fmt.Errorf("dedup by deterministic id: %w", dErr)
+			}
+		}
 		sub, err = s.createSubmission(ctx, req)
 		if err != nil {
 			return IngestResult{}, fmt.Errorf("create submission: %w", err)
@@ -337,9 +377,6 @@ func (s *SubmissionsService) ingestEmailInner(ctx context.Context, req IngestReq
 		})
 	}
 
-	// age from the email's own time, not when we processed it
-	sub.LastActionAt = inbound.ReceivedAt
-
 	if err := s.repo.Submissions.UpsertSubmission(ctx, sub); err != nil {
 		return IngestResult{}, fmt.Errorf("upsert: %w", err)
 	}
@@ -362,10 +399,12 @@ func (s *SubmissionsService) ingestEmailInner(ctx context.Context, req IngestReq
 
 	// best-effort immediate dispatch; if the channel is full the sweeper sends it
 	job := replyJob{ctx: s.replyJobContext(ctx), reply: reply, submissionID: sub.ID, outboxID: entry.ID}
+	s.claimDispatch(entry.ID)
 	s.inFlightWG.Add(1)
 	select {
 	case s.replyJobs <- job:
 	default:
+		s.releaseDispatch(entry.ID)
 		s.inFlightWG.Done()
 		s.metrics.ReplyDroppedTotal.Add(ctx, 1) // not lost: deferred to the outbox sweeper
 	}
@@ -449,6 +488,9 @@ func (s *SubmissionsService) RedeliverOutbox(ctx context.Context) error {
 		return fmt.Errorf("outbox: list pending: %w", err)
 	}
 	for _, row := range rows {
+		if s.isDispatching(row.ID) {
+			continue
+		}
 		if err := s.deliver(ctx, row.Reply, row.SubmissionID); err != nil {
 			attempts := row.Attempts + 1
 			if attempts >= s.outboxMaxAttempts {
@@ -546,17 +588,17 @@ func (s *SubmissionsService) SendEscalationDigest(ctx context.Context) error {
 	if recipient == "" || interval <= 0 {
 		return nil
 	}
-	since := s.now().Add(-interval)
-	subs, err := s.repo.Submissions.ListEscalatedSince(ctx, since.UnixNano(), 500)
+	// all currently-escalated cases; a failed send just retries next tick
+	subs, err := s.repo.Submissions.ListEscalatedSince(ctx, 0, 500)
 	if err != nil {
-		return fmt.Errorf("list escalated-since: %w", err)
+		return fmt.Errorf("list escalated: %w", err)
 	}
 	if len(subs) == 0 {
 		return nil
 	}
 
 	var body strings.Builder
-	fmt.Fprintf(&body, "Escalated submissions in the last %s:\n\n", interval)
+	body.WriteString("Currently escalated submissions:\n\n")
 	for _, sub := range subs {
 		fmt.Fprintf(&body, "  - %s | %s | from %s | last action %s\n",
 			sub.ID, sub.PolicyType, sub.FromAddress, sub.LastActionAt.UTC().Format(time.RFC3339))
@@ -726,7 +768,7 @@ func (s *SubmissionsService) auditLLMCall(ctx context.Context, submissionID, op,
 	})
 }
 
-func (s *SubmissionsService) extractText(a model.Attachment) string {
+func (s *SubmissionsService) extractText(a model.Attachment) (text string) {
 	if len(a.Content) == 0 {
 		return ""
 	}
@@ -734,12 +776,19 @@ func (s *SubmissionsService) extractText(a model.Attachment) string {
 	if !ok || ext == nil {
 		return ""
 	}
-	text, err := ext.Extract(a.Content)
+	// a malformed document must not crash the poller
+	defer func() {
+		if r := recover(); r != nil {
+			s.log.WithField("filename", a.Filename).Warnf("text extraction panicked: %v", r)
+			text = ""
+		}
+	}()
+	out, err := ext.Extract(a.Content)
 	if err != nil {
 		s.log.WithError(err).WithField("filename", a.Filename).Warn("text extraction failed")
 		return ""
 	}
-	return text
+	return out
 }
 
 func (s *SubmissionsService) audit(ctx context.Context, submissionID string, evt model.EventType, payload map[string]any) {

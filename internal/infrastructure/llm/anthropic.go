@@ -285,10 +285,7 @@ func (c *AnthropicClient) callMessages(ctx context.Context, body anthropicReques
 			return err
 		}
 
-		var parsed anthropicResponse
-		if err := json.Unmarshal(respBody, &parsed); err != nil {
-			return fmt.Errorf("anthropic: decode: %w", err)
-		}
+		// status decides retry/permanent before decoding; a 4xx/5xx body may not be JSON
 		if resp.StatusCode >= 500 {
 			return fmt.Errorf("anthropic: server error %d", resp.StatusCode)
 		}
@@ -297,10 +294,16 @@ func (c *AnthropicClient) callMessages(ctx context.Context, body anthropicReques
 		}
 		if resp.StatusCode >= 400 {
 			msg := ""
-			if parsed.Error != nil {
-				msg = parsed.Error.Message
+			var errResp anthropicResponse
+			if json.Unmarshal(respBody, &errResp) == nil && errResp.Error != nil {
+				msg = errResp.Error.Message
 			}
 			return retry.MarkPermanent(fmt.Errorf("anthropic: client error %d: %s", resp.StatusCode, msg))
+		}
+
+		var parsed anthropicResponse
+		if err := json.Unmarshal(respBody, &parsed); err != nil {
+			return fmt.Errorf("anthropic: decode: %w", err)
 		}
 
 		usage.InputTokens = parsed.Usage.InputTokens

@@ -194,6 +194,32 @@ func TestAnthropic_4xx_NotRetried(t *testing.T) {
 	}
 }
 
+// A 4xx whose body is not JSON (gateway HTML, empty) must still be treated as
+// permanent, not retried as a decode error.
+func TestAnthropic_4xxNonJSONBody_NotRetried(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte("<html><body>400 Bad Request</body></html>"))
+	}))
+	defer srv.Close()
+
+	c := testClient(t, srv.URL)
+	_, err := c.Classify(context.Background(), ClassificationRequest{
+		Candidates: []ClassificationCandidate{{ID: "x", Description: "y"}},
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if hits.Load() != 1 {
+		t.Errorf("expected 1 hit (permanent), got %d", hits.Load())
+	}
+	if !strings.Contains(err.Error(), "400") {
+		t.Errorf("error should mention 400, got: %v", err)
+	}
+}
+
 func TestAnthropic_EmptyAPIKey_FailsBeforeRequest(t *testing.T) {
 	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

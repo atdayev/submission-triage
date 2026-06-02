@@ -26,8 +26,8 @@ single binary.
 
 Point the tool at an existing mailbox — no domain, DNS, or provider signup; a
 Gmail App Password works. The poller reads unread mail every
-`IMAP_POLL_INTERVAL_SECONDS`, runs it through the pipeline, replies over SMTP
-from the same mailbox, then marks it read.
+`IMAP_POLL_INTERVAL_SECONDS`, runs it through the pipeline, enqueues a durable
+threaded reply (sent over SMTP from the same mailbox), then marks it read.
 
 ```bash
 IMAP_HOST=imap.gmail.com  IMAP_USERNAME=you@gmail.com  IMAP_PASSWORD=<app-password>
@@ -40,8 +40,9 @@ The poller starts when IMAP creds are set. `OUTBOUND_PROVIDER` is `smtp` | `log`
 is for local runs only. Dedup is deterministic, so the same message fetched
 twice is processed once.
 
-> Auth is password / App Password over TLS. OAuth2 (XOAUTH2) for Gmail / 365 is
-> future work.
+> Auth is password / App Password. Outbound SMTP always uses TLS to a remote
+> server (implicit on port 465, STARTTLS otherwise); a server that offers
+> neither is refused. OAuth2 (XOAUTH2) for Gmail / 365 is future work.
 
 ## Configuration
 

@@ -79,14 +79,14 @@ func (m *imapMailbox) FetchUnseen(ctx context.Context, limit int) ([]rawMessage,
 	if len(uids) == 0 {
 		return nil, nil
 	}
-	if limit > 0 && len(uids) > limit {
-		uids = uids[:limit]
-	}
 
-	// probe sizes first so an oversized body is never pulled into memory; over-cap is skipped
-	uids = m.underCap(uids)
+	// filter by size before the limit so over-cap mail can't starve the batch
+	uids = m.underCap(ctx, uids)
 	if len(uids) == 0 {
 		return nil, nil
+	}
+	if limit > 0 && len(uids) > limit {
+		uids = uids[:limit]
 	}
 
 	msgs, err := m.c.Fetch(goimap.UIDSetNum(uids...), &goimap.FetchOptions{
@@ -109,8 +109,9 @@ func (m *imapMailbox) FetchUnseen(ctx context.Context, limit int) ([]rawMessage,
 }
 
 // underCap returns the UIDs whose server-reported size is within maxBytes,
-// fetching only RFC822.SIZE (no bodies). A zero cap keeps everything.
-func (m *imapMailbox) underCap(uids []goimap.UID) []goimap.UID {
+// fetching only RFC822.SIZE (no bodies). A zero cap keeps everything. Over-cap
+// messages are marked seen so they don't recur every poll.
+func (m *imapMailbox) underCap(ctx context.Context, uids []goimap.UID) []goimap.UID {
 	if m.maxBytes <= 0 {
 		return uids
 	}
@@ -129,7 +130,10 @@ func (m *imapMailbox) underCap(uids []goimap.UID) []goimap.UID {
 				"uid":  uint32(s.UID),
 				"size": s.RFC822Size,
 				"max":  m.maxBytes,
-			}).Warn("imap: message over size cap; skipping (left unread)")
+			}).Warn("imap: message over size cap; marking seen")
+			if err := m.MarkSeen(ctx, uint32(s.UID)); err != nil {
+				m.log.WithError(err).WithField("uid", uint32(s.UID)).Warn("imap: mark over-cap seen failed")
+			}
 			continue
 		}
 		keep = append(keep, s.UID)

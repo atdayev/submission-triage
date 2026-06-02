@@ -81,3 +81,34 @@ func TestRedeliverOutbox_RetriesThenDeadLetters(t *testing.T) {
 		t.Error("expected a dead-lettered reply.failed audit")
 	}
 }
+
+// The sweeper must not re-send an entry the online worker still has in flight.
+func TestRedeliverOutbox_SkipsInFlight(t *testing.T) {
+	ctx := context.Background()
+	ob := newFakeOutbox()
+	subs := repomocks.NewSubmissionRepository(t)
+	subs.On("UpsertEmail", mock.Anything, mock.Anything).Return(nil).Maybe()
+	aud := repomocks.NewAuditRepository(t)
+	aud.On("Append", mock.Anything, mock.Anything).Return(nil).Maybe()
+	mail := &fakeMail{}
+	svc := outboxSvc(ob, mail, subs, aud, 3)
+
+	e := &model.OutboxEntry{SubmissionID: "s1", Reply: model.Reply{ToAddress: "broker@x"}}
+	_ = ob.Enqueue(ctx, e)
+
+	svc.claimDispatch(e.ID) // online worker is sending it
+	if err := svc.RedeliverOutbox(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if mail.sentCount() != 0 {
+		t.Fatalf("sweeper double-sent an in-flight entry: %d", mail.sentCount())
+	}
+
+	svc.releaseDispatch(e.ID) // online send finished (here, without marking sent)
+	if err := svc.RedeliverOutbox(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if mail.sentCount() != 1 {
+		t.Fatalf("after release the sweeper should deliver: got %d", mail.sentCount())
+	}
+}

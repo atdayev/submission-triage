@@ -22,7 +22,7 @@ func TestChooseSender(t *testing.T) {
 		{"explicit log sends nothing", &config.Config{Outbound: config.OutboundConfig{Provider: "log"}}, "log"},
 		{"auto picks smtp when configured", &config.Config{SMTP: smtpCfg}, "smtp"},
 		{"auto fails when no smtp configured", &config.Config{}, ""},
-		{"explicit smtp without config still selects smtp", &config.Config{Outbound: config.OutboundConfig{Provider: "smtp"}}, "smtp"},
+		{"explicit smtp without config errors", &config.Config{Outbound: config.OutboundConfig{Provider: "smtp"}}, ""},
 		{"unknown provider errors", &config.Config{Outbound: config.OutboundConfig{Provider: "carrierpigeon"}}, ""},
 	}
 

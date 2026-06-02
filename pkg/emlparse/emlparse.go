@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"mime"
 	"mime/multipart"
@@ -28,10 +29,9 @@ type Header struct {
 }
 
 type Attachment struct {
-	Name          string
-	Content       string
-	ContentType   string
-	ContentLength int
+	Name        string
+	Content     string
+	ContentType string
 }
 
 type Payload struct {
@@ -104,19 +104,26 @@ func parseBody(msg *mail.Message) (string, []Attachment, error) {
 		if derr != nil {
 			return "", nil, derr
 		}
-		return toUTF8(body, params["charset"]), nil, nil
+		text := toUTF8(body, params["charset"])
+		if strings.HasPrefix(mediaType, "text/html") {
+			text = stripHTML(text)
+		}
+		return text, nil, nil
 	}
 
-	var text string
+	var text, htmlBody string
 	var atts []Attachment
-	if err := walkParts(msg.Body, params["boundary"], &text, &atts, 0); err != nil {
+	if err := walkParts(msg.Body, params["boundary"], &text, &htmlBody, &atts, 0); err != nil {
 		return text, atts, err
+	}
+	if text == "" && htmlBody != "" {
+		text = stripHTML(htmlBody)
 	}
 	return text, atts, nil
 }
 
 // tolerate per-part errors; only an outer reader failure aborts the walk.
-func walkParts(r io.Reader, boundary string, text *string, atts *[]Attachment, depth int) error {
+func walkParts(r io.Reader, boundary string, text, htmlBody *string, atts *[]Attachment, depth int) error {
 	if depth > maxMultipartDepth {
 		return fmt.Errorf("multipart: nesting exceeds depth %d", maxMultipartDepth)
 	}
@@ -134,7 +141,7 @@ func walkParts(r io.Reader, boundary string, text *string, atts *[]Attachment, d
 
 		if strings.HasPrefix(partType, "multipart/") {
 			// nested-walk failures don't abort the outer walk; recover what we can
-			_ = walkParts(part, partParams["boundary"], text, atts, depth+1)
+			_ = walkParts(part, partParams["boundary"], text, htmlBody, atts, depth+1)
 			continue
 		}
 
@@ -145,15 +152,17 @@ func walkParts(r io.Reader, boundary string, text *string, atts *[]Attachment, d
 
 		if disp == "attachment" || partParams["name"] != "" {
 			*atts = append(*atts, Attachment{
-				Name:          decodeHeader(firstNonEmpty(partParams["name"], part.FileName(), "attachment.bin")),
-				Content:       base64.StdEncoding.EncodeToString(body),
-				ContentType:   partType,
-				ContentLength: len(body),
+				Name:        decodeHeader(firstNonEmpty(partParams["name"], part.FileName(), "attachment.bin")),
+				Content:     base64.StdEncoding.EncodeToString(body),
+				ContentType: partType,
 			})
 			continue
 		}
-		if *text == "" && strings.HasPrefix(partType, "text/plain") {
+		switch {
+		case *text == "" && strings.HasPrefix(partType, "text/plain"):
 			*text = toUTF8(body, partParams["charset"])
+		case *htmlBody == "" && strings.HasPrefix(partType, "text/html"):
+			*htmlBody = toUTF8(body, partParams["charset"])
 		}
 	}
 }
@@ -165,7 +174,7 @@ func decodeBody(r io.Reader, encoding string) ([]byte, error) {
 	}
 	switch strings.ToLower(strings.TrimSpace(encoding)) {
 	case "base64":
-		if dec, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(raw))); err == nil {
+		if dec, err := base64.StdEncoding.DecodeString(stripASCIISpace(string(raw))); err == nil {
 			return dec, nil
 		}
 		return raw, nil
@@ -207,4 +216,32 @@ func firstNonEmpty(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+func stripASCIISpace(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case ' ', '\t', '\r', '\n':
+			return -1
+		}
+		return r
+	}, s)
+}
+
+// stripHTML drops tags and unescapes entities.
+func stripHTML(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	inTag := false
+	for _, r := range s {
+		switch {
+		case r == '<':
+			inTag = true
+		case r == '>':
+			inTag = false
+		case !inTag:
+			b.WriteRune(r)
+		}
+	}
+	return strings.TrimSpace(html.UnescapeString(b.String()))
 }

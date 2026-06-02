@@ -62,9 +62,12 @@ type Metrics struct {
 	DigestSentTotal   metric.Int64Counter
 }
 
-// NewMetrics builds the instrument set. Call after Init.
+// NewMetrics builds the instrument set from the global meter provider. Call after Init.
 func NewMetrics() (*Metrics, error) {
-	m := otel.Meter("github.com/atdayev/submission-triage")
+	return newMetrics(otel.Meter("github.com/atdayev/submission-triage"))
+}
+
+func newMetrics(m metric.Meter) (*Metrics, error) {
 	ingestTotal, err := m.Int64Counter("submission_triage_ingest_total",
 		metric.WithDescription("Inbound emails ingested, labeled by final state and duplicate flag."))
 	if err != nil {
@@ -125,9 +128,8 @@ func NewMetrics() (*Metrics, error) {
 	}, nil
 }
 
-// NoopMetrics returns no-op instruments for tests.
+// NoopMetrics returns no-op instruments for tests, without touching global state.
 func NoopMetrics() *Metrics {
-	otel.SetMeterProvider(noop.NewMeterProvider())
-	m, _ := NewMetrics()
+	m, _ := newMetrics(noop.NewMeterProvider().Meter("github.com/atdayev/submission-triage"))
 	return m
 }

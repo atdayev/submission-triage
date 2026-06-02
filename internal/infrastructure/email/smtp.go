@@ -109,6 +109,15 @@ func stripCRLF(s string) string {
 	return strings.NewReplacer("\r", "", "\n", "").Replace(s)
 }
 
+// isLocalhost reports loopback hosts.
+func isLocalhost(host string) bool {
+	switch strings.ToLower(host) {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	}
+	return false
+}
+
 func domainOf(addr string) string {
 	if at := strings.LastIndex(addr, "@"); at >= 0 && at < len(addr)-1 {
 		return addr[at+1:]
@@ -155,6 +164,8 @@ func realSMTPSend(ctx context.Context, cfg config.SMTPConfig, from string, to []
 			if err := client.StartTLS(tlsCfg); err != nil {
 				return err
 			}
+		} else if !isLocalhost(cfg.Host) {
+			return retry.MarkPermanent(fmt.Errorf("smtp: %s does not offer STARTTLS; refusing to send over plaintext", cfg.Host))
 		}
 	}
 	if cfg.Username != "" {

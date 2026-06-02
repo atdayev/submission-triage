@@ -109,6 +109,9 @@ func chooseSender(cfg *config.Config, log *logrus.Entry) (email.Sender, error) {
 	attempts, base := cfg.Retry.Attempts, cfg.Retry.BaseDelay()
 	switch strings.ToLower(cfg.Outbound.Provider) {
 	case "smtp":
+		if !cfg.SMTP.Configured() {
+			return nil, errors.New("OUTBOUND_PROVIDER=smtp but SMTP is not configured: set SMTP_HOST and SMTP_FROM_ADDRESS")
+		}
 		return email.NewSMTPSender(cfg.SMTP, attempts, base, log), nil
 	case "log":
 		return email.NewLogSender(log), nil

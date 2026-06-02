@@ -7,7 +7,7 @@ build:
 	go build -o $(SERVER_BIN) ./cmd/server
 
 test:
-	go test -short ./...
+	go test ./...
 
 run: build
 	$(SERVER_BIN)
@@ -22,4 +22,4 @@ lint:
 	golangci-lint run ./...
 
 clean:
-	rm -rf $(BIN_DIR) data logs *.db *.db-shm *.db-wal coverage.out
+	rm -rf $(BIN_DIR) data logs *.db *.db-shm *.db-wal

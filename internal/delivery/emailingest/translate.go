@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"net/mail"
 	"strings"
 	"time"
 
@@ -23,22 +24,23 @@ func Translate(p emlparse.Payload, source string) service.IngestRequest {
 		case "in-reply-to":
 			inReplyTo = strings.TrimSpace(hdr.Value)
 		case "references":
-			for _, v := range strings.Fields(hdr.Value) {
-				references = append(references, strings.TrimSpace(v))
-			}
+			references = append(references, splitReferences(hdr.Value)...)
 		}
 	}
 
 	to := make([]string, 0, len(p.ToFull))
 	for _, t := range p.ToFull {
-		to = append(to, t.Email)
+		if t.Email != "" {
+			to = append(to, t.Email)
+		}
 	}
 	if len(to) == 0 && p.To != "" {
 		to = []string{p.To}
 	}
 
+	// mail.ParseDate is lenient (named zones, no weekday); fall back to now
 	receivedAt := time.Now().UTC()
-	if t, err := time.Parse(time.RFC1123Z, p.Date); err == nil {
+	if t, err := mail.ParseDate(p.Date); err == nil {
 		receivedAt = t.UTC()
 	}
 
@@ -80,6 +82,25 @@ func Translate(p emlparse.Payload, source string) service.IngestRequest {
 
 func trimAngle(s string) string {
 	return strings.Trim(s, "<>")
+}
+
+// splitReferences extracts each <msg-id>, falling back to a whitespace split.
+func splitReferences(v string) []string {
+	var out []string
+	rest := v
+	for {
+		i := strings.IndexByte(rest, '<')
+		j := strings.IndexByte(rest, '>')
+		if i < 0 || j < 0 || j < i {
+			break
+		}
+		out = append(out, rest[i:j+1])
+		rest = rest[j+1:]
+	}
+	if len(out) == 0 {
+		return strings.Fields(v)
+	}
+	return out
 }
 
 func trimAngles(in []string) []string {
