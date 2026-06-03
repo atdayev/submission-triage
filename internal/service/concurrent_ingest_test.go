@@ -41,7 +41,7 @@ func TestIngestEmail_ConcurrentSameEmail_SingleSubmission(t *testing.T) {
 
 	var upsertCalls atomic.Int32
 	var capturedID atomic.Value // string
-	subs.On("UpsertSubmission", mock.Anything, mock.Anything).Return(nil).Run(func(args mock.Arguments) {
+	subs.On("UpsertSubmissionWithReply", mock.Anything, mock.Anything, mock.Anything).Return(nil).Run(func(args mock.Arguments) {
 		upsertCalls.Add(1)
 		s := args.Get(1).(*model.Submission)
 		capturedID.Store(s.ID)
@@ -97,7 +97,7 @@ func TestIngestEmail_ConcurrentSameEmail_SingleSubmission(t *testing.T) {
 	}
 
 	if upsertCalls.Load() != 1 {
-		t.Fatalf("UpsertSubmission was called %d times; expected exactly 1 (singleflight should collapse the rest)", upsertCalls.Load())
+		t.Fatalf("UpsertSubmissionWithReply was called %d times; expected exactly 1 (singleflight should collapse the rest)", upsertCalls.Load())
 	}
 
 	wantID := capturedID.Load().(string)

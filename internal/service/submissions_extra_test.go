@@ -97,7 +97,7 @@ func TestIngestEmail_UnknownPolicy_TransitionsToAwaitingAndSendsClarification(t 
 	store := &multiStore{byType: map[string]model.Checklist{"cgl": cglChecklistWithLossRuns()}}
 
 	subs.On("FindByEmailReference", mock.Anything, mock.Anything).Return(nil, false, model.ErrSubmissionNotFound)
-	subs.On("UpsertSubmission", mock.Anything, mock.Anything).Return(nil)
+	subs.On("UpsertSubmissionWithReply", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 	subs.On("UpsertEmail", mock.Anything, mock.Anything).Return(nil).Maybe()
 
 	policyUnknownSeen := false
@@ -148,7 +148,7 @@ func TestIngestEmail_RequiresField_ExtractedAndStoredOnDoc(t *testing.T) {
 
 	var captured *model.Submission
 	subs.On("FindByEmailReference", mock.Anything, mock.Anything).Return(nil, false, model.ErrSubmissionNotFound)
-	subs.On("UpsertSubmission", mock.Anything, mock.Anything).Return(nil).Run(func(args mock.Arguments) {
+	subs.On("UpsertSubmissionWithReply", mock.Anything, mock.Anything, mock.Anything).Return(nil).Run(func(args mock.Arguments) {
 		captured = args.Get(1).(*model.Submission)
 	})
 	subs.On("UpsertEmail", mock.Anything, mock.Anything).Return(nil).Maybe()
@@ -200,7 +200,7 @@ func TestIngestEmail_RequiresField_BelowMinFailsChecklist(t *testing.T) {
 	}
 
 	subs.On("FindByEmailReference", mock.Anything, mock.Anything).Return(nil, false, model.ErrSubmissionNotFound)
-	subs.On("UpsertSubmission", mock.Anything, mock.Anything).Return(nil)
+	subs.On("UpsertSubmissionWithReply", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 	subs.On("UpsertEmail", mock.Anything, mock.Anything).Return(nil).Maybe()
 	aud.On("Append", mock.Anything, mock.Anything).Return(nil)
 
@@ -234,7 +234,7 @@ func TestIngestEmail_RequiresField_LLMErrorSoftPasses(t *testing.T) {
 	lm := &fakeLLM{extractErr: errors.New("llm down")}
 
 	subs.On("FindByEmailReference", mock.Anything, mock.Anything).Return(nil, false, model.ErrSubmissionNotFound)
-	subs.On("UpsertSubmission", mock.Anything, mock.Anything).Return(nil)
+	subs.On("UpsertSubmissionWithReply", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 	subs.On("UpsertEmail", mock.Anything, mock.Anything).Return(nil).Maybe()
 
 	llmFailed := false
@@ -286,7 +286,7 @@ func TestIngestEmail_ThreadedFollowUp_TransitionsToComplete(t *testing.T) {
 		MissingItems: []model.MissingItem{{ID: "acord_126", Description: "ACORD 126"}},
 	}
 	subs.On("FindByEmailReference", mock.Anything, mock.Anything).Return(existing, false, nil)
-	subs.On("UpsertSubmission", mock.Anything, mock.Anything).Return(nil)
+	subs.On("UpsertSubmissionWithReply", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 	subs.On("UpsertEmail", mock.Anything, mock.Anything).Return(nil).Maybe()
 	aud.On("Append", mock.Anything, mock.Anything).Return(nil)
 

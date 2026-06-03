@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -151,7 +152,7 @@ func TestIngestEmail_NewSubmission_Complete(t *testing.T) {
 	cl := smallChecklist()
 
 	subs.On("FindByEmailReference", mock.Anything, mock.Anything).Return(nil, false, model.ErrSubmissionNotFound)
-	subs.On("UpsertSubmission", mock.Anything, mock.Anything).Return(nil)
+	subs.On("UpsertSubmissionWithReply", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 	subs.On("UpsertEmail", mock.Anything, mock.Anything).Return(nil).Maybe()
 	aud.On("Append", mock.Anything, mock.Anything).Return(nil)
 
@@ -205,7 +206,7 @@ func TestIngestEmail_DuplicateSecondIngest(t *testing.T) {
 			return nil
 		},
 	)
-	subs.On("UpsertSubmission", mock.Anything, mock.Anything).Return(nil).Run(func(args mock.Arguments) {
+	subs.On("UpsertSubmissionWithReply", mock.Anything, mock.Anything, mock.Anything).Return(nil).Run(func(args mock.Arguments) {
 		s := args.Get(1).(*model.Submission)
 		cp := *s
 		cp.Emails = append([]model.Email{}, s.Emails...)
@@ -245,7 +246,7 @@ func TestIngestEmail_ReplyFailureKeepsState(t *testing.T) {
 	cl := smallChecklist()
 
 	subs.On("FindByEmailReference", mock.Anything, mock.Anything).Return(nil, false, model.ErrSubmissionNotFound)
-	subs.On("UpsertSubmission", mock.Anything, mock.Anything).Return(nil)
+	subs.On("UpsertSubmissionWithReply", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 
 	foundReplyFailed := false
 	aud.On("Append", mock.Anything, mock.Anything).Return(nil).Run(func(args mock.Arguments) {
@@ -272,6 +273,36 @@ func TestIngestEmail_ReplyFailureKeepsState(t *testing.T) {
 	}
 	if !foundReplyFailed {
 		t.Fatal("expected EventReplyFailed in audit log")
+	}
+}
+
+// A persistence failure must surface as an error so the IMAP poller leaves the
+// message unread and retries the whole ingest, rather than marking it seen with
+// no reply queued (which dedup would then make unrecoverable).
+func TestIngestEmail_PersistFailureReturnsError(t *testing.T) {
+	subs := repomocks.NewSubmissionRepository(t)
+	aud := repomocks.NewAuditRepository(t)
+	mail := &fakeMail{}
+	cl := smallChecklist()
+
+	subs.On("FindByEmailReference", mock.Anything, mock.Anything).Return(nil, false, model.ErrSubmissionNotFound)
+	subs.On("UpsertSubmissionWithReply", mock.Anything, mock.Anything, mock.Anything).Return(errors.New("db down"))
+	aud.On("Append", mock.Anything, mock.Anything).Return(nil)
+
+	svc := newSvc(t, subs, aud, mail, cl)
+	_, err := svc.IngestEmail(context.Background(), IngestRequest{
+		MessageID: "msg-persist-fail",
+		Subject:   "New Submission - CGL",
+		Attachments: []model.Attachment{
+			{Filename: "ACORD_125.pdf", ContentType: "application/pdf", Content: []byte("a125")},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected ingest to fail when persistence fails")
+	}
+	svc.Wait()
+	if mail.sentCount() != 0 {
+		t.Fatalf("no reply should be sent when persistence failed, got %d", mail.sentCount())
 	}
 }
 

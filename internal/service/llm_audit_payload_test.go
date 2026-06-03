@@ -33,7 +33,7 @@ func TestIngestEmail_LLMCallAuditPayload_Shape(t *testing.T) {
 	}
 
 	subs.On("FindByEmailReference", mock.Anything, mock.Anything).Return(nil, false, model.ErrSubmissionNotFound)
-	subs.On("UpsertSubmission", mock.Anything, mock.Anything).Return(nil)
+	subs.On("UpsertSubmissionWithReply", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 	subs.On("UpsertEmail", mock.Anything, mock.Anything).Return(nil).Maybe()
 
 	var llmCallPayloads []map[string]any

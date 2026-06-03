@@ -20,7 +20,7 @@ func TestIngestEmail_DedupEmptyMessageID(t *testing.T) {
 	subs.On("FindByEmailReference", mock.Anything, mock.Anything).Return(nil, false, model.ErrSubmissionNotFound)
 
 	var created *model.Submission
-	subs.On("UpsertSubmission", mock.Anything, mock.Anything).Return(nil).Run(func(args mock.Arguments) {
+	subs.On("UpsertSubmissionWithReply", mock.Anything, mock.Anything, mock.Anything).Return(nil).Run(func(args mock.Arguments) {
 		created = args.Get(1).(*model.Submission)
 	})
 	subs.On("UpsertEmail", mock.Anything, mock.Anything).Return(nil).Maybe()

@@ -377,23 +377,20 @@ func (s *SubmissionsService) ingestEmailInner(ctx context.Context, req IngestReq
 		})
 	}
 
-	if err := s.repo.Submissions.UpsertSubmission(ctx, sub); err != nil {
-		return IngestResult{}, fmt.Errorf("upsert: %w", err)
-	}
-
 	result := IngestResult{
 		SubmissionID: sub.ID,
 		State:        sub.State,
 		MissingItems: missing,
 	}
-	// write-ahead: persist the reply before dispatching, so it survives queue
-	// overflow, a crash, or a provider outage — the sweeper redelivers it.
+	// write-ahead: the submission and its reply commit in one transaction, so we
+	// never record the inbound email without an outbox row — that gap would be
+	// unrecoverable, since thread/deterministic-id dedup short-circuits the
+	// retry before a reply could be re-enqueued. A failure here returns an error
+	// so the poller leaves the message unread and the whole ingest is retried.
 	reply := s.buildReply(sub, missing, inbound, policyUnknown)
-	entry := &model.OutboxEntry{SubmissionID: sub.ID, Reply: reply, Status: model.OutboxPending}
-	if err := s.repo.Outbox.Enqueue(ctx, entry); err != nil {
-		s.log.WithError(err).WithField("submission_id", sub.ID).Error("outbox enqueue failed; reply not queued")
-		s.audit(ctx, sub.ID, model.EventReplyFailed, map[string]any{"error": "outbox enqueue: " + err.Error()})
-		return result, nil
+	entry := &model.OutboxEntry{ID: uuid.NewString(), SubmissionID: sub.ID, Reply: reply, Status: model.OutboxPending}
+	if err := s.repo.Submissions.UpsertSubmissionWithReply(ctx, sub, entry); err != nil {
+		return IngestResult{}, fmt.Errorf("persist submission with reply: %w", err)
 	}
 	result.ReplyQueued = true
 
