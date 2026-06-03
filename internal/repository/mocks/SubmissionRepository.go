@@ -14,6 +14,36 @@ type SubmissionRepository struct {
 	mock.Mock
 }
 
+// FindByDeterministicID provides a mock function with given fields: ctx, deterministicID
+func (_m *SubmissionRepository) FindByDeterministicID(ctx context.Context, deterministicID string) (*model.Submission, error) {
+	ret := _m.Called(ctx, deterministicID)
+
+	if len(ret) == 0 {
+		panic("no return value specified for FindByDeterministicID")
+	}
+
+	var r0 *model.Submission
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context, string) (*model.Submission, error)); ok {
+		return rf(ctx, deterministicID)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context, string) *model.Submission); ok {
+		r0 = rf(ctx, deterministicID)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(*model.Submission)
+		}
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context, string) error); ok {
+		r1 = rf(ctx, deterministicID)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
 // FindByEmailReference provides a mock function with given fields: ctx, messageIDs
 func (_m *SubmissionRepository) FindByEmailReference(ctx context.Context, messageIDs []string) (*model.Submission, bool, error) {
 	ret := _m.Called(ctx, messageIDs)
@@ -49,36 +79,6 @@ func (_m *SubmissionRepository) FindByEmailReference(ctx context.Context, messag
 	}
 
 	return r0, r1, r2
-}
-
-// FindByDeterministicID provides a mock function with given fields: ctx, deterministicID
-func (_m *SubmissionRepository) FindByDeterministicID(ctx context.Context, deterministicID string) (*model.Submission, error) {
-	ret := _m.Called(ctx, deterministicID)
-
-	if len(ret) == 0 {
-		panic("no return value specified for FindByDeterministicID")
-	}
-
-	var r0 *model.Submission
-	var r1 error
-	if rf, ok := ret.Get(0).(func(context.Context, string) (*model.Submission, error)); ok {
-		return rf(ctx, deterministicID)
-	}
-	if rf, ok := ret.Get(0).(func(context.Context, string) *model.Submission); ok {
-		r0 = rf(ctx, deterministicID)
-	} else {
-		if ret.Get(0) != nil {
-			r0 = ret.Get(0).(*model.Submission)
-		}
-	}
-
-	if rf, ok := ret.Get(1).(func(context.Context, string) error); ok {
-		r1 = rf(ctx, deterministicID)
-	} else {
-		r1 = ret.Error(1)
-	}
-
-	return r0, r1
 }
 
 // ListCompletedBefore provides a mock function with given fields: ctx, olderThanUnixNano, limit
@@ -200,6 +200,24 @@ func (_m *SubmissionRepository) UpsertSubmission(ctx context.Context, s *model.S
 	var r0 error
 	if rf, ok := ret.Get(0).(func(context.Context, *model.Submission) error); ok {
 		r0 = rf(ctx, s)
+	} else {
+		r0 = ret.Error(0)
+	}
+
+	return r0
+}
+
+// UpsertSubmissionWithReply provides a mock function with given fields: ctx, s, reply
+func (_m *SubmissionRepository) UpsertSubmissionWithReply(ctx context.Context, s *model.Submission, reply *model.OutboxEntry) error {
+	ret := _m.Called(ctx, s, reply)
+
+	if len(ret) == 0 {
+		panic("no return value specified for UpsertSubmissionWithReply")
+	}
+
+	var r0 error
+	if rf, ok := ret.Get(0).(func(context.Context, *model.Submission, *model.OutboxEntry) error); ok {
+		r0 = rf(ctx, s, reply)
 	} else {
 		r0 = ret.Error(0)
 	}

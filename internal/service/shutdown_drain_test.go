@@ -37,7 +37,7 @@ func TestIngestEmail_ReplyGoroutineSurvivesCtxCancel(t *testing.T) {
 	cl := smallChecklist()
 
 	subs.On("FindByEmailReference", mock.Anything, mock.Anything).Return(nil, false, model.ErrSubmissionNotFound)
-	subs.On("UpsertSubmission", mock.Anything, mock.Anything).Return(nil)
+	subs.On("UpsertSubmissionWithReply", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 	subs.On("UpsertEmail", mock.Anything, mock.Anything).Return(nil).Maybe()
 
 	replySentSeen := atomic.Bool{}
@@ -122,7 +122,7 @@ func TestShutdown_BoundedWhenSendStuck(t *testing.T) {
 	cl := smallChecklist()
 
 	subs.On("FindByEmailReference", mock.Anything, mock.Anything).Return(nil, false, model.ErrSubmissionNotFound)
-	subs.On("UpsertSubmission", mock.Anything, mock.Anything).Return(nil)
+	subs.On("UpsertSubmissionWithReply", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 	subs.On("UpsertEmail", mock.Anything, mock.Anything).Return(nil).Maybe()
 	aud.On("Append", mock.Anything, mock.Anything).Return(nil)
 

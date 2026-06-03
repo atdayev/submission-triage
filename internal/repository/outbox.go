@@ -32,6 +32,17 @@ func NewOutboxRepository(db *sql.DB, log *logrus.Entry) *OutboxRepositoryImpl {
 }
 
 func (r *OutboxRepositoryImpl) Enqueue(ctx context.Context, e *model.OutboxEntry) error {
+	return insertOutboxRow(ctx, r.db, e)
+}
+
+// execContext is satisfied by both *sql.DB and *sql.Tx, so insertOutboxRow can
+// run standalone or inside a caller's transaction (see UpsertSubmissionWithReply).
+type execContext interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+// insertOutboxRow writes one pending reply, defaulting id/timestamps/status.
+func insertOutboxRow(ctx context.Context, ex execContext, e *model.OutboxEntry) error {
 	if e == nil {
 		return fmt.Errorf("outbox: nil entry")
 	}
@@ -50,7 +61,7 @@ func (r *OutboxRepositoryImpl) Enqueue(ctx context.Context, e *model.OutboxEntry
 	if err != nil {
 		return fmt.Errorf("outbox: marshal reply: %w", err)
 	}
-	_, err = r.db.ExecContext(ctx, `
+	_, err = ex.ExecContext(ctx, `
 		INSERT INTO outbox (id, submission_id, reply_json, status, attempts, last_error, created_at, updated_at)
 		VALUES (?,?,?,?,?,?,?,?)`,
 		e.ID, e.SubmissionID, string(payload), string(e.Status), e.Attempts, e.LastError,

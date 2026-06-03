@@ -17,6 +17,10 @@ import (
 //go:generate mockery --name=SubmissionRepository --output=mocks --outpkg=mocks --filename=SubmissionRepository.go
 type SubmissionRepository interface {
 	UpsertSubmission(ctx context.Context, s *model.Submission) error
+	// UpsertSubmissionWithReply persists the submission and its durable reply in
+	// one transaction, so an email is never recorded without its outbox row (a
+	// gap that thread/deterministic-id dedup would make unrecoverable on retry).
+	UpsertSubmissionWithReply(ctx context.Context, s *model.Submission, reply *model.OutboxEntry) error
 	FindByEmailReference(ctx context.Context, messageIDs []string) (*model.Submission, bool, error)
 	// FindByDeterministicID finds the submission owning an email by deterministic id.
 	FindByDeterministicID(ctx context.Context, deterministicID string) (*model.Submission, error)
@@ -61,6 +65,41 @@ func (r *SubmissionRepositoryImpl) UpsertSubmission(ctx context.Context, s *mode
 		if err := upsertDocumentRow(ctx, tx, &s.Documents[i]); err != nil {
 			return err
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+	return nil
+}
+
+func (r *SubmissionRepositoryImpl) UpsertSubmissionWithReply(ctx context.Context, s *model.Submission, reply *model.OutboxEntry) error {
+	if s == nil || s.ID == "" {
+		return errors.New("sqlite: UpsertSubmissionWithReply requires non-empty id")
+	}
+	if reply == nil {
+		return errors.New("sqlite: UpsertSubmissionWithReply requires non-nil reply")
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if err := upsertSubmissionRow(ctx, tx, s); err != nil {
+		return err
+	}
+	for i := range s.Emails {
+		if err := upsertEmailRow(ctx, tx, &s.Emails[i]); err != nil && !errors.Is(err, model.ErrDuplicateEmail) {
+			return err
+		}
+	}
+	for i := range s.Documents {
+		if err := upsertDocumentRow(ctx, tx, &s.Documents[i]); err != nil {
+			return err
+		}
+	}
+	if err := insertOutboxRow(ctx, tx, reply); err != nil {
+		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit: %w", err)
