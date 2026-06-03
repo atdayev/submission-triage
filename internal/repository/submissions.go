@@ -17,9 +17,7 @@ import (
 //go:generate mockery --name=SubmissionRepository --output=mocks --outpkg=mocks --filename=SubmissionRepository.go
 type SubmissionRepository interface {
 	UpsertSubmission(ctx context.Context, s *model.Submission) error
-	// UpsertSubmissionWithReply persists the submission and its durable reply in
-	// one transaction, so an email is never recorded without its outbox row (a
-	// gap that thread/deterministic-id dedup would make unrecoverable on retry).
+	// UpsertSubmissionWithReply persists the submission and its reply in one tx.
 	UpsertSubmissionWithReply(ctx context.Context, s *model.Submission, reply *model.OutboxEntry) error
 	FindByEmailReference(ctx context.Context, messageIDs []string) (*model.Submission, bool, error)
 	// FindByDeterministicID finds the submission owning an email by deterministic id.

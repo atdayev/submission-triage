@@ -382,11 +382,8 @@ func (s *SubmissionsService) ingestEmailInner(ctx context.Context, req IngestReq
 		State:        sub.State,
 		MissingItems: missing,
 	}
-	// write-ahead: the submission and its reply commit in one transaction, so we
-	// never record the inbound email without an outbox row — that gap would be
-	// unrecoverable, since thread/deterministic-id dedup short-circuits the
-	// retry before a reply could be re-enqueued. A failure here returns an error
-	// so the poller leaves the message unread and the whole ingest is retried.
+	// submission and reply commit in one tx: an inbound email without an outbox
+	// row is unrecoverable (dedup blocks the retry). On failure the poller retries.
 	reply := s.buildReply(sub, missing, inbound, policyUnknown)
 	entry := &model.OutboxEntry{ID: uuid.NewString(), SubmissionID: sub.ID, Reply: reply, Status: model.OutboxPending}
 	if err := s.repo.Submissions.UpsertSubmissionWithReply(ctx, sub, entry); err != nil {

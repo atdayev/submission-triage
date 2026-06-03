@@ -276,9 +276,7 @@ func TestIngestEmail_ReplyFailureKeepsState(t *testing.T) {
 	}
 }
 
-// A persistence failure must surface as an error so the IMAP poller leaves the
-// message unread and retries the whole ingest, rather than marking it seen with
-// no reply queued (which dedup would then make unrecoverable).
+// a persist failure must surface as an error so the poller retries, not mark seen
 func TestIngestEmail_PersistFailureReturnsError(t *testing.T) {
 	subs := repomocks.NewSubmissionRepository(t)
 	aud := repomocks.NewAuditRepository(t)

@@ -51,9 +51,6 @@ func TestUpsertSubmissionWithReply_CommitsSubmissionEmailAndReply(t *testing.T) 
 	}
 }
 
-// A failing reply insert must roll back the whole ingest. Otherwise the inbound
-// email persists without an outbox row, and thread/deterministic-id dedup makes
-// the missing reply unrecoverable on the next poll.
 func TestUpsertSubmissionWithReply_RollsBackWhenReplyInsertFails(t *testing.T) {
 	db, subs, _ := setupDB(t)
 	ctx := context.Background()

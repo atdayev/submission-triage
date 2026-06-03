@@ -35,8 +35,7 @@ func (r *OutboxRepositoryImpl) Enqueue(ctx context.Context, e *model.OutboxEntry
 	return insertOutboxRow(ctx, r.db, e)
 }
 
-// execContext is satisfied by both *sql.DB and *sql.Tx, so insertOutboxRow can
-// run standalone or inside a caller's transaction (see UpsertSubmissionWithReply).
+// execContext lets insertOutboxRow run on a *sql.DB or a caller's *sql.Tx.
 type execContext interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }

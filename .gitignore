@@ -2,6 +2,7 @@
 bin/
 *.exe
 *.test
+/submission-triage
 
 # Coverage / profiling
 *.out
@@ -33,4 +34,3 @@ go.work.sum
 # Tooling / working notes
 .claude
 HANDOFF.md
-Nic
