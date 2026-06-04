@@ -1,0 +1,38 @@
+# submission-triage systemd unit.
+#
+# Install:
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin submission-triage
+#   sudo mkdir -p /opt/submission-triage /etc/submission-triage
+#   sudo cp bin/server /opt/submission-triage/submission-triage
+#   sudo cp -r checklists migrations /opt/submission-triage/
+#   sudo cp .env /etc/submission-triage/env          # filled-in config, chmod 600
+#   sudo chown -R submission-triage:submission-triage /opt/submission-triage
+#   sudo cp deploy/systemd/submission-triage.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now submission-triage
+#
+# Logs: journalctl -u submission-triage -f
+
+[Unit]
+Description=submission-triage — inbox submission checker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=submission-triage
+Group=submission-triage
+WorkingDirectory=/opt/submission-triage
+ExecStart=/opt/submission-triage/submission-triage
+EnvironmentFile=/etc/submission-triage/env
+Restart=always
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/opt/submission-triage
+
+[Install]
+WantedBy=multi-user.target

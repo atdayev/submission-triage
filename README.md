@@ -1,152 +1,235 @@
 # submission-triage
 
-Open-source Go service that an insurance agency runs against its inbox to
-auto-check whether incoming submission emails contain all required documents,
-reply (threaded) with what's missing, and escalate stalled cases. SQLite-backed,
-single binary.
+An open-source Go service that watches an insurance agency's submission inbox,
+checks each incoming submission against a per-policy-type requirements
+checklist, and replies in-thread with exactly what's missing. It runs against
+any Gmail inbox with an App Password, stores everything in a single SQLite
+file, and ships as one static binary.
 
-## What it does
+## Why
 
-- Watches an inbox: polls any IMAP mailbox (Gmail App Password, Microsoft 365,
-  generic).
-- Parses email + attachments (PDF, DOCX, XLSX, CSV, plain).
-- Classifies each attachment against a YAML checklist; consults the Anthropic
-  API only when filename/keyword heuristics are inconclusive.
-- Extracts structured fields via Anthropic tool-use when a checklist item
-  declares `requires_field`.
-- Replies in-thread with what's outstanding, or asks for clarification when the
-  policy type can't be inferred.
-- Tracks each case across follow-ups via Message-ID / In-Reply-To / References,
-  not content matching.
-- Escalates stale submissions, emails a periodic digest, and auto-closes
-  completed ones after a quiet period.
-- Writes a structured audit entry for every state change and external/LLM call.
+Commercial submissions arrive incomplete. A broker emails over an ACORD
+application but forgets the loss runs, or sends loss runs covering three years
+when the carrier wants five. Today a human notices that — eventually — and
+emails back to ask. Until they do, the file sits, the quote slips, and nobody
+is sure whose turn it is.
 
-## Mail channels
+submission-triage does that first pass automatically and immediately: it reads
+the attachments, compares them to what the line of business actually requires,
+and sends a clear "we still need X" reply on the same thread within seconds —
+so the back-and-forth starts now instead of whenever someone gets to it.
 
-Point the tool at an existing mailbox — no domain, DNS, or provider signup; a
-Gmail App Password works. The poller reads unread mail every
-`IMAP_POLL_INTERVAL_SECONDS`, runs it through the pipeline, enqueues a durable
-threaded reply (sent over SMTP from the same mailbox), then marks it read.
+## Status
 
-```bash
-IMAP_HOST=imap.gmail.com  IMAP_USERNAME=you@gmail.com  IMAP_PASSWORD=<app-password>
-SMTP_HOST=smtp.gmail.com  SMTP_USERNAME=you@gmail.com  SMTP_PASSWORD=<app-password>
-SMTP_FROM_ADDRESS=you@gmail.com
-```
+Five lines of business ship today, each with its own checklist: **Commercial
+General Liability, Business Owners Policy (BOP), Workers' Compensation,
+Commercial Property, and Cyber Liability**.
 
-The poller starts when IMAP creds are set. `OUTBOUND_PROVIDER` is `smtp` | `log`
-(empty = auto: SMTP if configured, else startup error). `log` sends nothing and
-is for local runs only. Dedup is deterministic, so the same message fetched
-twice is processed once.
+Honest gaps, up front:
 
-> Auth is password / App Password. Outbound SMTP always uses TLS to a remote
-> server (implicit on port 465, STARTTLS otherwise); a server that offers
-> neither is refused. OAuth2 (XOAUTH2) for Gmail / 365 is future work.
+- **Auth is Gmail App Password (basic auth over TLS) only.** No OAuth2/XOAUTH2,
+  so Microsoft 365 tenants that disabled basic auth are not supported yet.
+- **No production deployments yet.** This is new and self-hosted; you'd be
+  early. Treat it accordingly.
 
-## Configuration
+## How it works
 
-Configuration comes from environment variables. Copy `.env.example` to `.env`
-and fill it in; the server loads it at startup. Defaults live in the struct
-tags in [internal/config/config.go](internal/config/config.go).
+For each unread message in the watched mailbox:
 
-## Running
+1. **Poll** the inbox over IMAP (every `IMAP_POLL_INTERVAL_SECONDS`).
+2. **Parse** the email and its attachments (PDF, DOCX, XLSX, CSV, plain text).
+3. **Infer the policy type** from the subject line, then **classify** each
+   attachment against that checklist — filename/keyword heuristics first,
+   falling back to **Claude Haiku 4.5** only when the heuristics are
+   inconclusive.
+4. **Evaluate** the checklist: which required documents are present, and do
+   declared fields meet their rule (e.g. loss runs covering ≥ 5 years).
+5. **Reply in-thread** with what's outstanding — or ask which line of business
+   it is when the subject doesn't say.
+6. **Escalate** cases that go quiet, email a periodic digest, and auto-close
+   completed ones after a quiet period.
+7. **Audit** every state change and external call to SQLite.
+
+Reliability: replies are written to a durable outbox in the same transaction
+as the submission and redelivered until sent (surviving crashes and provider
+outages), and ingest is idempotent on Message-ID plus a content hash, so the
+same message seen twice is processed once.
+
+## Quickstart (~15 minutes)
+
+You need Go 1.25+ and a Gmail account.
+
+**1. Clone and build.**
 
 ```bash
 git clone https://github.com/atdayev/submission-triage.git
 cd submission-triage
-cp .env.example .env   # fill in IMAP_* and SMTP_*
-make run
+make build          # produces ./bin/server
 ```
 
-Set `IMAP_*` to the mailbox to watch and `SMTP_*` to send replies from (a Gmail
-App Password covers both). Without an Anthropic key the heuristic classifier is
-used; set `ANTHROPIC_API_KEY` to enable LLM classification and field extraction.
-Set `OUTBOUND_PROVIDER=log` to run the pipeline without sending real mail.
+**2. Get a Gmail App Password.** Enable 2-Step Verification on the account,
+then create a 16-character App Password at
+<https://myaccount.google.com/apppasswords>. This lets the service log in over
+IMAP/SMTP without your real password.
 
-## Architecture
+**3. Configure.** Copy the example env file and fill in the IMAP and SMTP
+blocks (for Gmail they're the same account and the same App Password):
 
-Pragmatic clean architecture: lower layers know nothing about upper layers.
-
-```
-cmd/ ──> internal/app ──> internal/delivery ──> internal/service ──┬─> internal/repository
-                                                                   └─> internal/infrastructure
-internal/model    ── pure domain, no I/O
-internal/database ── SQLite connection + migrations
-pkg/ ── logger, retry, glob, emlparse, telemetry, ...
+```bash
+cp .env.example .env
 ```
 
-| Layer | Lives in | Owns |
+```bash
+IMAP_HOST=imap.gmail.com   IMAP_USERNAME=you@gmail.com   IMAP_PASSWORD=<app-password>
+SMTP_HOST=smtp.gmail.com   SMTP_USERNAME=you@gmail.com   SMTP_PASSWORD=<app-password>
+SMTP_FROM_ADDRESS=you@gmail.com
+```
+
+**4. (Optional) Enable the LLM.** Set `ANTHROPIC_API_KEY` to let Claude resolve
+attachments the heuristics can't and read declared checklist fields. Without a
+key the service still runs; ambiguous classification falls back to the
+heuristic and field rules pass on document presence.
+
+**5. Start it.**
+
+```bash
+make run            # build + run; or ./bin/server after make build
+```
+
+**6. Send a test.** From another account, email the watched inbox with a
+subject naming the line of business (e.g. `New CGL submission – Acme LLC`) and
+attach an ACORD 125. Within the poll interval (default 30s) plus normal mail
+delivery, you'll get a threaded reply listing whatever the CGL checklist still
+wants. Reply with the missing documents and it continues the thread; when the
+file is complete it sends a "moving to underwriting" note.
+
+## Configuration
+
+All configuration is environment variables, loaded from `.env` at startup.
+`.env.example` documents every one; the essentials:
+
+**IMAP — the inbox to watch (required).** The poller is inactive until host,
+username, and password are all set.
+
+| Variable | Purpose | Default |
 |---|---|---|
-| Domain | internal/model | entities, state machine, checklist evaluation |
-| Repository | internal/repository | storage contracts + SQLite impl |
-| Service | internal/service | use cases, idempotency, audit, retries |
-| Delivery | internal/delivery | health endpoint, IMAP poller, payload→ingest mapping |
-| Infrastructure | internal/infrastructure | SMTP, Anthropic, doc extractors, checklist YAML |
-| App | internal/app | composition root, graceful shutdown |
+| `IMAP_HOST` | IMAP server (`imap.gmail.com` for Gmail) | — (required) |
+| `IMAP_USERNAME` | Mailbox login | — (required) |
+| `IMAP_PASSWORD` | App Password | — (required) |
+| `IMAP_PORT` | IMAP port (implicit TLS) | `993` |
+| `IMAP_MAILBOX` | Folder to watch | `INBOX` |
+| `IMAP_POLL_INTERVAL_SECONDS` | How often to check for mail | `30` |
+| `IMAP_MAX_MESSAGE_MB` | Skip messages larger than this | `32` |
 
-Cross-cutting guarantees: deterministic-ID idempotency (re-delivery is a no-op),
-a structured audit log, exponential-backoff retries on external clients, a
-durable reply outbox (replies are persisted before sending and redelivered
-until sent, surviving queue overflow, crashes, and provider outages),
-OpenTelemetry metrics, and context-bounded graceful shutdown.
+**SMTP — where replies are sent from (required).** Same mailbox/App Password as
+IMAP for Gmail. Port 587 uses STARTTLS, 465 uses implicit TLS.
 
-## Configurable checklists
+| Variable | Purpose | Default |
+|---|---|---|
+| `SMTP_HOST` | SMTP server (`smtp.gmail.com` for Gmail) | — (required) |
+| `SMTP_USERNAME` | Mailbox login | — (required) |
+| `SMTP_PASSWORD` | App Password | — (required) |
+| `SMTP_FROM_ADDRESS` | From address on replies | — (required) |
+| `SMTP_PORT` | SMTP port | `587` |
+| `SMTP_FROM_NAME` | Display name on replies | `Submission Triage` |
+| `OUTBOUND_PROVIDER` | `smtp`, `log`, or blank (auto) | auto |
 
-One YAML file per policy type in `checklists/`. Drop in a new file and restart.
+**LLM — Anthropic (optional).**
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | Enables LLM classification + field extraction | — (off if blank) |
+| `ANTHROPIC_MODEL` | Model id | `claude-haiku-4-5` |
+| `ANTHROPIC_TIMEOUT_SECONDS` | Per-call timeout | `30` |
+| `ANTHROPIC_MAX_TOKENS` | Output token cap | `2048` |
+
+**Escalation timers (optional).**
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `ESCALATION_INTERVAL_MINUTES` | How often the worker runs | `15` |
+| `ESCALATION_THRESHOLD_HOURS` | Quiet time before a case escalates | `72` |
+| `ESCALATION_AUTO_CLOSE_AFTER_HOURS` | Auto-close after quiet hours | `336` |
+| `ESCALATION_DIGEST_INTERVAL_HOURS` | Digest send cadence | `24` |
+| `ESCALATION_DIGEST_RECIPIENT` | Digest recipient | — (off if blank) |
+
+**Other (optional):** `DB_PATH` (`./data/submission-triage.db`),
+`CHECKLISTS_DIR` (`./checklists`), `HTTP_PORT` (`8080`, health endpoint only),
+logging (`LOG_LEVEL`, `LOG_FORMAT`, `LOG_DIR`), reply worker pool
+(`REPLY_WORKERS`, `REPLY_QUEUE_SIZE`), retries (`RETRY_ATTEMPTS`,
+`RETRY_BASE_DELAY_MS`), and OpenTelemetry (`OTEL_EXPORTER_OTLP_ENDPOINT`,
+blank disables metrics export). See `.env.example` for all of them.
+
+## Customizing checklists
+
+A checklist is one YAML file per policy type in `checklists/`. Add a file and
+restart. Here's the shipped CGL checklist, annotated:
 
 ```yaml
 name: Commercial General Liability
-policy_type: cgl
+policy_type: cgl                 # matched against the inferred line of business
 required_items:
   - id: acord_125
-    description: "ACORD 125 Commercial Insurance Application"
+    description: "ACORD 125 Commercial Insurance Application"   # shown to the sender
     match:
-      filename_patterns: ["*ACORD*125*", "*application*"]
-      content_keywords: ["Commercial Insurance Application"]
+      filename_patterns: ["*ACORD*125*", "*application*"]       # tried first
+      content_keywords: ["Commercial Insurance Application"]    # then document text
   - id: loss_runs
     description: "Loss runs for the past 5 years"
     match:
       filename_patterns: ["*loss*run*", "*claims*history*"]
       content_keywords: ["Loss Run", "Claims History"]
-    requires_field:
-      name: years_covered
+    requires_field:            # the only supported predicate beyond presence
+      name: years_covered      # field the LLM extracts from the document
       type: number
-      min_value: 5
+      min_value: 5             # fails if the value is below this
+      unit: years              # noun used in the customer-facing reply
 escalation:
-  threshold_hours: 72
+  threshold_hours: 72          # overrides the global threshold for this line
   action: email_digest
-  digest_recipient: ops@agency.example
 ```
 
-`requires_field` is enforced via Anthropic tool-use
-([`ExtractField`](internal/infrastructure/llm/anthropic.go)); with no LLM
-configured the field soft-passes on document presence.
-`escalation.threshold_hours` overrides the global threshold, and
-`action: email_digest` feeds the digest worker (`digest_recipient`, or the
-global `ESCALATION_DIGEST_RECIPIENT`). Unknown keys are rejected at startup.
-Five checklists ship: CGL, BOP, workers' comp, commercial property, cyber.
+`requires_field` is the **only** rule beyond "is the document present", and it
+needs the LLM enabled to extract the value (without a key it passes on
+presence). Wording like "5 years" in the other four checklists is descriptive
+text only — it is not enforced. Unknown YAML keys are rejected at startup.
 
-## Storage
+## Hosting
 
-SQLite via [`modernc.org/sqlite`](https://pkg.go.dev/modernc.org/sqlite) (pure
-Go, no CGO). The DB lives at `DB_PATH` (default `./data/submission-triage.db`);
-migrations under [migrations/](migrations/) run at startup or via `make migrate`.
+It's one static binary (~22 MB, no CGO, no external database) plus a SQLite
+file, so it runs comfortably on a **GCP e2-micro free-tier VM** — estimated
+~30–80 MB RAM at agency volume. SQLite stores submission metadata, extracted
+text, and the audit log (raw attachment bytes are not retained), so disk growth
+is modest.
 
-## Non-goals (v1)
+A ready systemd unit lives at
+[`deploy/systemd/submission-triage.service`](deploy/systemd/submission-triage.service)
+with `Restart=always`, a dedicated service user, and an `EnvironmentFile` — the
+file header lists the install steps. Run it always-on: the IMAP poller and
+escalation timers need a long-lived process, not a request-driven one.
 
-AMS / CRM integration, web UI beyond `/health`, user accounts / multi-tenant
-auth, SMS / Slack / Teams channels, producer dashboards.
+## Limitations
 
-## Coming next
+- No web UI — only a local `GET /health` endpoint.
+- No AMS/CRM write-back (Applied Epic, HawkSoft, etc.).
+- Single-tenant — one mailbox, one agency per instance.
+- Gmail App Password auth only; no Microsoft 365 / OAuth2.
+- Email only — no SMS, Slack, or Teams.
 
-AMS write-back (Applied EPIC, HawkSoft), read-only web UI, producer scorecards,
-carrier-specific checklist overlays, Slack escalations, OAuth2 for Gmail / 365.
+## Costs
+
+- **Hosting:** $0/month on a GCP e2-micro free-tier VM at typical agency
+  volume.
+- **LLM:** optional. On Claude Haiku 4.5 a classification or field-extraction
+  call is well under a cent, and many submissions never call it (the filename
+  heuristics resolve them). Leave `ANTHROPIC_API_KEY` blank to spend nothing.
+
+## Help
+
+Questions, bugs, or "would this work for my agency?" — open a
+[GitHub issue](https://github.com/atdayev/submission-triage/issues) or DM the
+maintainer on LinkedIn.
 
 ## License
 
 MIT. See [LICENSE](LICENSE).
-
-## Contact
-
-Built by Atda Yev (atdayewkemal@gmail.com). PRs and issues welcome.
