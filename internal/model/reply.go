@@ -78,10 +78,31 @@ func greetingName(e Email) string {
 			return parts[0]
 		}
 	}
-	if e.FromAddress != "" {
-		if at := strings.Index(e.FromAddress, "@"); at > 0 {
-			return e.FromAddress[:at]
+	if at := strings.Index(e.FromAddress, "@"); at > 0 {
+		if local := e.FromAddress[:at]; usableGreeting(local) {
+			return local
 		}
 	}
 	return "there"
+}
+
+var roleLocalParts = map[string]bool{
+	"submissions": true,
+	"info":        true,
+	"noreply":     true,
+	"no-reply":    true,
+	"support":     true,
+}
+
+// usableGreeting reports whether an email local-part reads as a first name.
+// Digit-bearing handles, very short ones, and role addresses fall back to
+// "there" rather than greeting "Hi noreply,".
+func usableGreeting(local string) bool {
+	if len(local) < 3 {
+		return false
+	}
+	if strings.ContainsAny(local, "0123456789") {
+		return false
+	}
+	return !roleLocalParts[strings.ToLower(local)]
 }
