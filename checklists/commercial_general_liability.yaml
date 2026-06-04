@@ -34,6 +34,7 @@ required_items:
       name: years_covered
       type: number
       min_value: 5
+      unit: years
   - id: schedule_of_locations
     description: "Schedule of insured locations"
     match:

@@ -51,6 +51,7 @@ type rawRequiresField struct {
 	Name     string   `yaml:"name"`
 	Type     string   `yaml:"type"`
 	MinValue *float64 `yaml:"min_value,omitempty"`
+	Unit     string   `yaml:"unit,omitempty"`
 }
 
 type rawEscalation struct {
@@ -172,6 +173,7 @@ func (r rawChecklist) toModel() model.Checklist {
 				Name:     item.RequiresField.Name,
 				Type:     ft,
 				MinValue: item.RequiresField.MinValue,
+				Unit:     item.RequiresField.Unit,
 			}
 		}
 		out.Required = append(out.Required, req)

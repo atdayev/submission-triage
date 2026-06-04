@@ -95,6 +95,7 @@ func TestEvaluateChecklist_RequiresField(t *testing.T) {
 			Name:     "years_covered",
 			Type:     FieldTypeNumber,
 			MinValue: &minVal,
+			Unit:     "years",
 		},
 	}
 	cl := Checklist{Required: []RequiredItem{item}}
@@ -129,19 +130,19 @@ func TestEvaluateChecklist_RequiresField(t *testing.T) {
 			name:        "field value below minimum fails",
 			fields:      map[string]any{"years_covered": 3.0},
 			wantMissing: true,
-			reasonHint:  "needs at least",
+			reasonHint:  "covers only 3 years, need at least 5",
 		},
 		{
 			name:        "field value explicitly nil fails",
 			fields:      map[string]any{"years_covered": nil},
 			wantMissing: true,
-			reasonHint:  "not found in document",
+			reasonHint:  "could not confirm the number of years covered",
 		},
 		{
 			name:        "field value non-numeric fails",
 			fields:      map[string]any{"years_covered": "five"},
 			wantMissing: true,
-			reasonHint:  "not numeric",
+			reasonHint:  "could not confirm the number of years covered",
 		},
 		{
 			name:        "integer value accepted",
@@ -163,6 +164,11 @@ func TestEvaluateChecklist_RequiresField(t *testing.T) {
 			}
 			if tc.reasonHint != "" && !strings.Contains(missing[0].Reason, tc.reasonHint) {
 				t.Errorf("Reason missing hint %q: got %q", tc.reasonHint, missing[0].Reason)
+			}
+			if tc.wantMissing {
+				if r := missing[0].Reason; strings.Contains(r, "field") || strings.Contains(r, "years_covered") {
+					t.Errorf("Reason leaks internal jargon: %q", r)
+				}
 			}
 		})
 	}

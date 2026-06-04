@@ -44,6 +44,9 @@ type RequiresField struct {
 	Name     string
 	Type     FieldType
 	MinValue *float64
+	// Unit is the human noun for the value (e.g. "years"), used to phrase
+	// customer-facing reasons without leaking the internal field name.
+	Unit string
 }
 
 func EvaluateChecklist(s Submission, c Checklist) []MissingItem {
@@ -86,7 +89,8 @@ func EvaluateChecklist(s Submission, c Checklist) []MissingItem {
 }
 
 // soft-pass when extraction didn't run (nil map / absent key). A present
-// nil means it ran and the field's missing → fail. Else validate.
+// nil means it ran and the field's missing → fail. Else validate. Reasons are
+// customer-facing copy: no field key, no "field" jargon.
 func evaluateField(rf *RequiresField, doc *Document) (string, bool) {
 	if doc.ExtractedFields == nil {
 		return "", true
@@ -96,18 +100,34 @@ func evaluateField(rf *RequiresField, doc *Document) (string, bool) {
 		return "", true
 	}
 	if raw == nil {
-		return fmt.Sprintf("field %q not found in document", rf.Name), false
+		return unconfirmedReason(rf.Unit), false
 	}
 	if rf.MinValue != nil {
 		f, ok := numericValue(raw)
 		if !ok {
-			return fmt.Sprintf("field %q is not numeric", rf.Name), false
+			return unconfirmedReason(rf.Unit), false
 		}
 		if f < *rf.MinValue {
-			return fmt.Sprintf("field %q is %v, needs at least %v", rf.Name, f, *rf.MinValue), false
+			return shortfallReason(rf.Unit, f, *rf.MinValue), false
 		}
 	}
 	return "", true
+}
+
+// shortfallReason explains a below-minimum numeric value in plain language.
+func shortfallReason(unit string, have, need float64) string {
+	if unit != "" {
+		return fmt.Sprintf("covers only %v %s, need at least %v", have, unit, need)
+	}
+	return fmt.Sprintf("only %v provided, need at least %v", have, need)
+}
+
+// unconfirmedReason explains that extraction ran but produced no usable value.
+func unconfirmedReason(unit string) string {
+	if unit != "" {
+		return fmt.Sprintf("could not confirm the number of %s covered", unit)
+	}
+	return "could not confirm the required detail on this document"
 }
 
 func numericValue(v any) (float64, bool) {
