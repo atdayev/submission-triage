@@ -40,3 +40,42 @@ jobs:
 
       - name: test (race)
         run: go test -race -count=1 ./...
+
+  deploy:
+    needs: build-test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: cross-compile linux/amd64
+        run: GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o server-linux-amd64 ./cmd/server
+
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: submission-triage
+
+      # ship the binary, swap it in atomically (keep .bak), restart, confirm active
+      - name: deploy to VM
+        run: |
+          gcloud compute scp server-linux-amd64 Admin@submission-triage:/tmp/st-new \
+            --zone us-central1-a --quiet
+          gcloud compute ssh Admin@submission-triage --zone us-central1-a --quiet --command '
+            set -e
+            sudo install -m 0755 /tmp/st-new /opt/submission-triage/submission-triage.new
+            sudo cp -p /opt/submission-triage/submission-triage /opt/submission-triage/submission-triage.bak
+            sudo systemctl stop submission-triage
+            sudo mv /opt/submission-triage/submission-triage.new /opt/submission-triage/submission-triage
+            sudo systemctl start submission-triage
+            rm -f /tmp/st-new
+            sleep 2
+            systemctl is-active submission-triage'

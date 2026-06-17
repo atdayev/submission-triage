@@ -3,6 +3,7 @@ bin/
 *.exe
 *.test
 /submission-triage
+server-linux-amd64
 
 # Coverage / profiling
 *.out
@@ -34,3 +35,5 @@ go.work.sum
 # Tooling / working notes
 .claude
 HANDOFF.md
+DEMO_FACTS.md
+demo-attachments/
