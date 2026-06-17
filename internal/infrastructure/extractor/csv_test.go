@@ -5,6 +5,25 @@ import (
 	"testing"
 )
 
+func TestCSV_EmptyRowsDoNotExhaustEmitBudget(t *testing.T) {
+	// encoding/csv returns delimiter-bearing empty rows (unlike bare blank lines,
+	// which it skips); they must not count against the emit cap, so a later data
+	// row still survives
+	var b strings.Builder
+	for i := 0; i < maxCSVRows+100; i++ {
+		b.WriteString(",\n")
+	}
+	b.WriteString("x,y\n")
+
+	out, err := NewCSV().Extract([]byte(b.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "x\ty") {
+		t.Errorf("data row dropped after empty rows: %q", out)
+	}
+}
+
 func TestCSV_Extract(t *testing.T) {
 	cases := []struct {
 		name    string

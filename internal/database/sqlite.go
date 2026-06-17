@@ -16,6 +16,7 @@ import (
 	_ "modernc.org/sqlite" // register the sqlite driver
 )
 
+// Open opens the SQLite database at path, applying WAL and connection settings.
 func Open(ctx context.Context, path string, log *logrus.Entry) (*sql.DB, error) {
 	if path == "" {
 		return nil, errors.New("sqlite: empty path")
@@ -45,6 +46,7 @@ func Open(ctx context.Context, path string, log *logrus.Entry) (*sql.DB, error) 
 	return db, nil
 }
 
+// Migrate applies pending .sql migrations from dir in lexical order.
 func Migrate(ctx context.Context, db *sql.DB, dir string, log *logrus.Entry) error {
 	if _, err := db.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS schema_migrations (

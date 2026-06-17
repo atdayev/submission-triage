@@ -119,7 +119,7 @@ username, and password are all set.
 | `IMAP_PORT` | IMAP port (implicit TLS) | `993` |
 | `IMAP_MAILBOX` | Folder to watch | `INBOX` |
 | `IMAP_POLL_INTERVAL_SECONDS` | How often to check for mail | `30` |
-| `IMAP_MAX_MESSAGE_MB` | Skip messages larger than this | `32` |
+| `IMAP_MAX_MESSAGE_MB` | Skip messages larger than this (logged once, marked read) | `32` |
 
 **SMTP — where replies are sent from (required).** Same mailbox/App Password as
 IMAP for Gmail. Port 587 uses STARTTLS, 465 uses implicit TLS.
@@ -156,14 +156,14 @@ IMAP for Gmail. Port 587 uses STARTTLS, 465 uses implicit TLS.
 **Other (optional):** `DB_PATH` (`./data/submission-triage.db`),
 `CHECKLISTS_DIR` (`./checklists`), `HTTP_PORT` (`8080`, health endpoint only),
 logging (`LOG_LEVEL`, `LOG_FORMAT`, `LOG_DIR`), reply worker pool
-(`REPLY_WORKERS`, `REPLY_QUEUE_SIZE`), retries (`RETRY_ATTEMPTS`,
-`RETRY_BASE_DELAY_MS`), and OpenTelemetry (`OTEL_EXPORTER_OTLP_ENDPOINT`,
-blank disables metrics export). See `.env.example` for all of them.
+(`REPLY_WORKERS`, `REPLY_QUEUE_SIZE`), and retries (`RETRY_ATTEMPTS`,
+`RETRY_BASE_DELAY_MS`). See `.env.example` for all of them.
 
 ## Customizing checklists
 
 A checklist is one YAML file per policy type in `checklists/`. Add a file and
-restart. Here's the shipped CGL checklist, annotated:
+restart. Here's an excerpt of the shipped CGL checklist, annotated (the real
+file lists more required items):
 
 ```yaml
 name: Commercial General Liability

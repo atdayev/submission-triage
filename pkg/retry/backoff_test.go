@@ -8,12 +8,12 @@ import (
 )
 
 func TestDo_MaxDelayCapsExponentialGrowth(t *testing.T) {
-	// Replace jitter with identity so timing is deterministic.
+	// replace jitter with identity so timing is deterministic
 	origJitter := jitter
 	jitter = func(d time.Duration) time.Duration { return d }
 	t.Cleanup(func() { jitter = origJitter })
 
-	// Track each sleep the loop tried.
+	// track each sleep the loop tried
 	var sleeps []time.Duration
 	recordSleep := func(d time.Duration) time.Duration {
 		sleeps = append(sleeps, d)
@@ -22,7 +22,7 @@ func TestDo_MaxDelayCapsExponentialGrowth(t *testing.T) {
 	jitter = recordSleep
 
 	// 20 attempts, base 1s → without cap the largest delay would be 2^18 ≈ 262144s.
-	// With MaxDelay=30s we should hit the cap quickly.
+	// with MaxDelay=30s we should hit the cap quickly
 	_ = Do(context.Background(), 20, 1*time.Second, func(context.Context) error {
 		return errors.New("always fails")
 	})
@@ -35,9 +35,24 @@ func TestDo_MaxDelayCapsExponentialGrowth(t *testing.T) {
 			t.Errorf("sleep #%d = %v exceeds MaxDelay %v", i, d, MaxDelay)
 		}
 	}
-	// The last few should all be exactly MaxDelay.
+	// the last few should all be exactly MaxDelay
 	if last := sleeps[len(sleeps)-1]; last != MaxDelay {
 		t.Errorf("expected last sleep to hit MaxDelay (%v), got %v", MaxDelay, last)
+	}
+}
+
+// Real jitter on a capped delay can overshoot MaxDelay by +20%; Do must clamp
+// the post-jitter sleep, not just the base delay.
+func TestDo_PostJitterSleepNeverExceedsMaxDelay(t *testing.T) {
+	origJitter := jitter
+	t.Cleanup(func() { jitter = origJitter })
+
+	for i := 0; i < 500; i++ {
+		// real (random) jitter, then apply the same clamp Do uses
+		sleep := capDelay(origJitter(MaxDelay))
+		if sleep > MaxDelay {
+			t.Fatalf("iter %d: post-jitter sleep %v exceeds MaxDelay %v", i, sleep, MaxDelay)
+		}
 	}
 }
 
@@ -66,8 +81,8 @@ func TestJitter_ZeroOrNegativeReturnsUnchanged(t *testing.T) {
 }
 
 func TestJitter_VariesAcrossCalls(t *testing.T) {
-	// With 200 calls the chance of every value being identical is
-	// vanishingly small unless jitter is broken.
+	// with 200 calls the chance of every value being identical is
+	// vanishingly small unless jitter is broken
 	const d = 100 * time.Millisecond
 	seen := map[time.Duration]int{}
 	for i := 0; i < 200; i++ {

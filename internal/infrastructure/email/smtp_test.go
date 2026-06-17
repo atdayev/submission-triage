@@ -200,6 +200,25 @@ func TestSMTP_ReuseSameMessageIDAcrossRetries(t *testing.T) {
 	}
 }
 
+func TestSMTP_DeterministicMessageIDAcrossSends(t *testing.T) {
+	// a redelivery of the same reply must reuse the Message-ID so a receiver dedupes it
+	s := testSMTP(func(_ context.Context, _ config.SMTPConfig, _ string, _ []string, _ []byte) error {
+		return nil
+	})
+	r := model.Reply{SubmissionID: "sub-1", ToAddress: "broker@x", Subject: "Re: thread", BodyText: "need loss runs"}
+	id1, err := s.SendThreadedReply(context.Background(), r)
+	if err != nil {
+		t.Fatalf("send 1: %v", err)
+	}
+	id2, err := s.SendThreadedReply(context.Background(), r)
+	if err != nil {
+		t.Fatalf("send 2: %v", err)
+	}
+	if id1 != id2 {
+		t.Errorf("Message-ID not stable across redeliveries: %q vs %q", id1, id2)
+	}
+}
+
 func TestSMTP_ValidationErrors(t *testing.T) {
 	called := false
 	send := func(_ context.Context, _ config.SMTPConfig, _ string, _ []string, _ []byte) error {
@@ -226,5 +245,83 @@ func TestSMTP_ValidationErrors(t *testing.T) {
 func TestSMTP_Name(t *testing.T) {
 	if got := testSMTP(nil).Name(); got != "smtp" {
 		t.Errorf("Name: got %q, want smtp", got)
+	}
+}
+
+func TestBuildMessage_SanitizesThreadingRefs(t *testing.T) {
+	s := testSMTP(nil)
+	msg := string(s.buildMessage(model.Reply{
+		ToAddress:  "broker@x",
+		Subject:    "Re: thread",
+		BodyText:   "b",
+		InReplyTo:  "  weird id  ",
+		References: []string{"root@x", "p r e v@x"},
+	}, "mid@host"))
+
+	// internal whitespace/brackets are stripped within each id; ids stay
+	// space-separated, so "p r e v@x" becomes "<prev@x>"
+	for _, want := range []string{
+		"In-Reply-To: <weirdid>\r\n",
+		"References: <root@x> <prev@x>\r\n",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("missing sanitized header %q in:\n%s", want, msg)
+		}
+	}
+	if strings.Contains(msg, "p r e v") {
+		t.Errorf("internal whitespace not stripped from reference:\n%s", msg)
+	}
+}
+
+func TestBuildMessage_FoldsAndCapsReferences(t *testing.T) {
+	refs := make([]string, 0, 80)
+	for i := 0; i < 80; i++ {
+		refs = append(refs, "abcdefghijklmnopqrstuvwxyz0123456789@mail.example.com")
+	}
+	s := testSMTP(nil)
+	msg := string(s.buildMessage(model.Reply{ToAddress: "b@x", Subject: "Re: x", BodyText: "b", References: refs}, "mid@host"))
+
+	for _, line := range strings.Split(msg, "\r\n") {
+		if len(line) > 998 {
+			t.Fatalf("header line exceeds RFC 5322 998-octet limit: %d octets", len(line))
+		}
+	}
+	// at most maxRefs tokens survive
+	if n := strings.Count(msg, "@mail.example.com"); n > maxRefs {
+		t.Errorf("References not capped: %d tokens > %d", n, maxRefs)
+	}
+}
+
+func TestBuildMessage_TruncatesLongSubject(t *testing.T) {
+	s := testSMTP(nil)
+	long := strings.Repeat("A", 4000)
+	msg := string(s.buildMessage(model.Reply{ToAddress: "b@x", Subject: long, BodyText: "b"}, "mid@host"))
+	for _, line := range strings.Split(msg, "\r\n") {
+		if len(line) > 998 {
+			t.Fatalf("subject produced a header line over 998 octets: %d", len(line))
+		}
+	}
+}
+
+func TestBuildMessage_DropsAbsurdlyLongRef(t *testing.T) {
+	s := testSMTP(nil)
+	longRef := strings.Repeat("x", 2000) + "@h" // a single oversized message-id
+	msg := string(s.buildMessage(model.Reply{
+		ToAddress:  "b@x",
+		Subject:    "Re: x",
+		BodyText:   "b",
+		References: []string{"root@x", longRef},
+	}, "mid@host"))
+
+	for _, line := range strings.Split(msg, "\r\n") {
+		if len(line) > 998 {
+			t.Fatalf("a single long ref produced a header line over 998 octets: %d", len(line))
+		}
+	}
+	if !strings.Contains(msg, "<root@x>") {
+		t.Errorf("legit reference dropped:\n%s", msg)
+	}
+	if strings.Contains(msg, longRef) {
+		t.Errorf("absurd reference not dropped:\n%s", msg)
 	}
 }

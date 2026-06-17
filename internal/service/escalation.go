@@ -9,19 +9,26 @@ import (
 	"github.com/atdayev/submission-triage/pkg/logger"
 )
 
+// EscalationWorker periodically redelivers the outbox and runs escalation, closure, and digest checks.
 type EscalationWorker struct {
 	svc      *SubmissionsService
 	interval time.Duration
 	log      *logrus.Entry
 }
 
+// NewEscalationWorker returns a worker that runs periodic escalation checks.
 func NewEscalationWorker(svc *SubmissionsService, interval time.Duration, log *logrus.Entry) *EscalationWorker {
 	return &EscalationWorker{svc: svc, interval: interval, log: log}
 }
 
+// Run sweeps the outbox once, then ticks the periodic checks until ctx is canceled.
 func (w *EscalationWorker) Run(ctx context.Context) {
 	ctx = logger.ContextWithLogger(ctx, w.log)
 	w.log.WithField("interval", w.interval.String()).Info("escalation worker started")
+	// sweep the outbox immediately so post-crash replies don't wait a full interval
+	if err := w.svc.RedeliverOutbox(ctx); err != nil {
+		w.log.WithError(err).Error("startup outbox redelivery failed")
+	}
 	t := time.NewTicker(w.interval)
 	defer t.Stop()
 	digestInterval := w.svc.cfg.Escalation.DigestInterval()
@@ -38,6 +45,9 @@ func (w *EscalationWorker) Run(ctx context.Context) {
 			w.log.Info("escalation worker stopping")
 			return
 		case <-t.C:
+			if ctx.Err() != nil {
+				return // canceled concurrently with the tick; skip a doomed cycle
+			}
 			if err := w.svc.RedeliverOutbox(ctx); err != nil {
 				w.log.WithError(err).Error("outbox redelivery failed")
 			}
@@ -48,6 +58,9 @@ func (w *EscalationWorker) Run(ctx context.Context) {
 				w.log.WithError(err).Error("periodic closure check failed")
 			}
 		case <-digestC:
+			if ctx.Err() != nil {
+				return
+			}
 			if err := w.svc.SendEscalationDigest(ctx); err != nil {
 				w.log.WithError(err).Error("escalation digest send failed")
 			}

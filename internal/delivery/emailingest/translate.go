@@ -14,8 +14,7 @@ import (
 	"github.com/atdayev/submission-triage/pkg/emlparse"
 )
 
-// Translate converts a parsed payload into an IngestRequest, stamping the
-// inbound channel as source.
+// Translate converts a parsed payload into an IngestRequest stamped with source.
 func Translate(p emlparse.Payload, source string) service.IngestRequest {
 	var inReplyTo string
 	var references []string
@@ -38,27 +37,9 @@ func Translate(p emlparse.Payload, source string) service.IngestRequest {
 		to = []string{p.To}
 	}
 
-	// mail.ParseDate is lenient (named zones, no weekday); fall back to now
-	receivedAt := time.Now().UTC()
-	if t, err := mail.ParseDate(p.Date); err == nil {
-		receivedAt = t.UTC()
-	}
+	receivedAt := parseReceivedAt(p.Date)
 
-	atts := make([]model.Attachment, 0, len(p.Attachments))
-	for _, a := range p.Attachments {
-		raw, err := base64.StdEncoding.DecodeString(a.Content)
-		if err != nil {
-			continue
-		}
-		sum := sha256.Sum256(raw)
-		atts = append(atts, model.Attachment{
-			Filename:    a.Name,
-			ContentType: a.ContentType,
-			Size:        len(raw),
-			SHA256:      hex.EncodeToString(sum[:]),
-			Content:     raw,
-		})
-	}
+	atts := decodeAttachments(p.Attachments)
 
 	fromAddr := p.FromFull.Email
 	if fromAddr == "" {
@@ -80,25 +61,67 @@ func Translate(p emlparse.Payload, source string) service.IngestRequest {
 	}
 }
 
+// parseReceivedAt parses the Date header to UTC, falling back to now on error or unresolved zone.
+func parseReceivedAt(date string) time.Time {
+	if t, err := mail.ParseDate(date); err == nil && !unresolvedZone(t) {
+		return t.UTC()
+	}
+	return time.Now().UTC()
+}
+
+// decodeAttachments base64-decodes each attachment, skipping empties, and stamps a SHA256.
+func decodeAttachments(in []emlparse.Attachment) []model.Attachment {
+	atts := make([]model.Attachment, 0, len(in))
+	for _, a := range in {
+		raw, err := base64.StdEncoding.DecodeString(a.Content)
+		if err != nil || len(raw) == 0 {
+			continue
+		}
+		sum := sha256.Sum256(raw)
+		atts = append(atts, model.Attachment{
+			Filename:    a.Name,
+			ContentType: a.ContentType,
+			Size:        len(raw),
+			SHA256:      hex.EncodeToString(sum[:]),
+			Content:     raw,
+		})
+	}
+	return atts
+}
+
 func trimAngle(s string) string {
 	return strings.Trim(s, "<>")
 }
 
-// splitReferences extracts each <msg-id>, falling back to a whitespace split.
+// unresolvedZone reports a named zone that ParseDate stamped at +0000.
+func unresolvedZone(t time.Time) bool {
+	name, off := t.Zone()
+	return off == 0 && name != "" && name != "UTC" && name != "GMT"
+}
+
+// splitReferences extracts each <msg-id>, falling back to message-id-like fields.
 func splitReferences(v string) []string {
 	var out []string
 	rest := v
 	for {
 		i := strings.IndexByte(rest, '<')
-		j := strings.IndexByte(rest, '>')
-		if i < 0 || j < 0 || j < i {
+		if i < 0 {
 			break
 		}
-		out = append(out, rest[i:j+1])
+		rest = rest[i:]
+		j := strings.IndexByte(rest, '>')
+		if j < 0 {
+			break
+		}
+		out = append(out, rest[:j+1])
 		rest = rest[j+1:]
 	}
 	if len(out) == 0 {
-		return strings.Fields(v)
+		for _, f := range strings.Fields(v) {
+			if strings.Contains(f, "@") && !strings.ContainsAny(f, "<>") {
+				out = append(out, f)
+			}
+		}
 	}
 	return out
 }

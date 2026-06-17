@@ -16,24 +16,31 @@ import (
 	"time"
 )
 
-const maxMultipartDepth = 32 // bound recursion; crafted mail can nest forever
+const (
+	maxMultipartDepth = 32  // bound recursion
+	maxAttachments    = 100 // bound per-message attachment count
+)
 
+// Address is a parsed email address with optional display name.
 type Address struct {
 	Email string
 	Name  string
 }
 
+// Header is a single raw message header.
 type Header struct {
 	Name  string
 	Value string
 }
 
+// Attachment is a decoded message part stored as base64 content.
 type Attachment struct {
 	Name        string
 	Content     string
 	ContentType string
 }
 
+// Payload is the parsed message the pipeline consumes.
 type Payload struct {
 	MessageID   string
 	From        string
@@ -47,6 +54,7 @@ type Payload struct {
 	Attachments []Attachment
 }
 
+// FromFile parses an RFC822 message file into a Payload.
 func FromFile(path string) (Payload, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -56,8 +64,7 @@ func FromFile(path string) (Payload, error) {
 	return FromReader(f)
 }
 
-// FromReader parses an RFC822 message (e.g. a raw message fetched over IMAP)
-// into the Payload shape the pipeline consumes.
+// FromReader parses an RFC822 message into a Payload.
 func FromReader(r io.Reader) (Payload, error) {
 	var p Payload
 	msg, err := mail.ReadMessage(r)
@@ -99,7 +106,7 @@ func FromReader(r io.Reader) (Payload, error) {
 func parseBody(msg *mail.Message) (string, []Attachment, error) {
 	contentType := msg.Header.Get("Content-Type")
 	mediaType, params, err := mime.ParseMediaType(contentType)
-	if err != nil || !strings.HasPrefix(mediaType, "multipart/") {
+	if err != nil || !strings.HasPrefix(mediaType, "multipart/") || params["boundary"] == "" {
 		body, derr := decodeBody(msg.Body, msg.Header.Get("Content-Transfer-Encoding"))
 		if derr != nil {
 			return "", nil, derr
@@ -122,7 +129,8 @@ func parseBody(msg *mail.Message) (string, []Attachment, error) {
 	return text, atts, nil
 }
 
-// tolerate per-part errors; only an outer reader failure aborts the walk.
+// walkParts collects text, HTML, and attachments from a multipart stream,
+// recovering what it parsed past per-part or truncated-stream errors.
 func walkParts(r io.Reader, boundary string, text, htmlBody *string, atts *[]Attachment, depth int) error {
 	if depth > maxMultipartDepth {
 		return fmt.Errorf("multipart: nesting exceeds depth %d", maxMultipartDepth)
@@ -134,9 +142,12 @@ func walkParts(r io.Reader, boundary string, text, htmlBody *string, atts *[]Att
 			return nil
 		}
 		if err != nil {
-			return err
+			return nil // truncated or boundary-less stream; keep what we parsed
 		}
 		partType, partParams, _ := mime.ParseMediaType(part.Header.Get("Content-Type"))
+		if partType == "" {
+			partType = "text/plain" // RFC822 default for a typeless part
+		}
 		disp, _, _ := mime.ParseMediaType(part.Header.Get("Content-Disposition"))
 
 		if strings.HasPrefix(partType, "multipart/") {
@@ -150,7 +161,14 @@ func walkParts(r io.Reader, boundary string, text, htmlBody *string, atts *[]Att
 			continue
 		}
 
-		if disp == "attachment" || partParams["name"] != "" {
+		// a named text part fills the body only while its slot is open; once the
+		// body is set, a later named text part is kept as an attachment, not dropped
+		bodyText := *text == "" && strings.HasPrefix(partType, "text/plain")
+		bodyHTML := *htmlBody == "" && strings.HasPrefix(partType, "text/html")
+		if disp == "attachment" || (partParams["name"] != "" && !bodyText && !bodyHTML) {
+			if len(*atts) >= maxAttachments {
+				continue
+			}
 			*atts = append(*atts, Attachment{
 				Name:        decodeHeader(firstNonEmpty(partParams["name"], part.FileName(), "attachment.bin")),
 				Content:     base64.StdEncoding.EncodeToString(body),
@@ -159,9 +177,9 @@ func walkParts(r io.Reader, boundary string, text, htmlBody *string, atts *[]Att
 			continue
 		}
 		switch {
-		case *text == "" && strings.HasPrefix(partType, "text/plain"):
+		case bodyText:
 			*text = toUTF8(body, partParams["charset"])
-		case *htmlBody == "" && strings.HasPrefix(partType, "text/html"):
+		case bodyHTML:
 			*htmlBody = toUTF8(body, partParams["charset"])
 		}
 	}
@@ -189,13 +207,25 @@ func decodeBody(r io.Reader, encoding string) ([]byte, error) {
 	}
 }
 
-// decodeHeader decodes RFC2047 encoded-words; plain text passes through.
+// decodeHeader decodes RFC2047 encoded-words and strips control characters.
 func decodeHeader(s string) string {
 	got, err := (&mime.WordDecoder{}).DecodeHeader(s)
 	if err != nil {
-		return s
+		got = s
 	}
-	return got
+	return stripControl(got)
+}
+
+func stripControl(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '\t' {
+			return r
+		}
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
 }
 
 func splitAddress(in string) Address {

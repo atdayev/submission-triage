@@ -12,10 +12,13 @@ import (
 
 const maxDocxPartBytes = 50 << 20
 
+// DOCX extracts plain text from .docx documents.
 type DOCX struct{}
 
+// NewDOCX returns a DOCX text extractor.
 func NewDOCX() *DOCX { return &DOCX{} }
 
+// Extract returns the text of word/document.xml from a .docx archive.
 func (e *DOCX) Extract(data []byte) (string, error) {
 	if len(data) == 0 {
 		return "", nil
@@ -49,10 +52,12 @@ func (e *DOCX) Extract(data []byte) (string, error) {
 			return "", err
 		}
 		out.WriteString(text)
+		break
 	}
 	return out.String(), nil
 }
 
+// walkDocxText concatenates the <w:t> runs from document.xml, one line per paragraph.
 func walkDocxText(b []byte) (string, error) {
 	dec := xml.NewDecoder(bytes.NewReader(b))
 	var out strings.Builder

@@ -62,3 +62,14 @@ func TestGreetingName(t *testing.T) {
 		})
 	}
 }
+
+func TestGreetingName_StripsControlChars(t *testing.T) {
+	// an unparseable From leaves control chars in the local-part: fall back
+	if got := greetingName(Email{FromAddress: "ab\r\ncd@x"}); strings.ContainsAny(got, "\r\n") {
+		t.Errorf("greeting from local-part leaked control chars: %q", got)
+	}
+	// a display name with an embedded control char is sanitized, not echoed raw
+	if got := greetingName(Email{FromName: "Da\x07na"}); strings.ContainsAny(got, "\x07") {
+		t.Errorf("greeting from display name leaked control chars: %q", got)
+	}
+}

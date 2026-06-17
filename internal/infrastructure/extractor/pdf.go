@@ -6,6 +6,8 @@ import (
 	"io"
 
 	"github.com/ledongthuc/pdf"
+
+	"github.com/atdayev/submission-triage/pkg/textutil"
 )
 
 const (
@@ -13,10 +15,13 @@ const (
 	maxPDFTextBytes = 8 << 20 // compressed streams expand; cap the output
 )
 
+// PDF extracts plain text from PDF documents.
 type PDF struct{}
 
+// NewPDF returns a PDF text extractor.
 func NewPDF() *PDF { return &PDF{} }
 
+// Extract returns the plain text of a PDF, capped by page and byte limits.
 func (e *PDF) Extract(data []byte) (string, error) {
 	if len(data) == 0 {
 		return "", nil
@@ -45,8 +50,14 @@ func (e *PDF) Extract(data []byte) (string, error) {
 		if err != nil {
 			continue
 		}
+		if remaining := maxPDFTextBytes - buf.Len(); len(texts) > remaining {
+			texts = textutil.TruncateBytes(texts, remaining)
+		}
 		if _, err := io.WriteString(&buf, texts); err != nil {
 			return "", fmt.Errorf("pdf: write: %w", err)
+		}
+		if buf.Len() >= maxPDFTextBytes {
+			break
 		}
 		buf.WriteString("\n")
 	}

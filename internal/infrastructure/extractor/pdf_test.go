@@ -26,7 +26,7 @@ func TestPDF_EmptyBytes_NoError(t *testing.T) {
 }
 
 func TestPDF_MalformedAfterHeader_Error(t *testing.T) {
-	// Starts with %PDF but immediately invalid.
+	// starts with %PDF but immediately invalid
 	_, err := NewPDF().Extract([]byte("%PDF-1.4\nthis is garbage not a real pdf"))
 	if err == nil {
 		t.Fatal("expected error for malformed pdf")

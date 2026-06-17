@@ -34,6 +34,7 @@ type ingester interface {
 	IngestEmail(ctx context.Context, req service.IngestRequest) (service.IngestResult, error)
 }
 
+// Poller polls an IMAP inbox for new mail and ingests it.
 type Poller struct {
 	dial       func(ctx context.Context) (mailbox, error)
 	ingest     ingester
@@ -43,6 +44,7 @@ type Poller struct {
 	log        *logrus.Entry
 }
 
+// NewPoller returns a Poller configured from cfg.
 func NewPoller(cfg config.IMAPConfig, svc ingester, log *logrus.Entry) *Poller {
 	return &Poller{
 		dial:       dialIMAP(cfg, log),
@@ -54,6 +56,7 @@ func NewPoller(cfg config.IMAPConfig, svc ingester, log *logrus.Entry) *Poller {
 	}
 }
 
+// Run polls until ctx is cancelled, fetching once at startup then per interval.
 func (p *Poller) Run(ctx context.Context) {
 	p.log.WithFields(logrus.Fields{
 		"interval": p.interval.String(),
@@ -75,6 +78,9 @@ func (p *Poller) Run(ctx context.Context) {
 }
 
 func (p *Poller) pollOnce(ctx context.Context) {
+	if ctx.Err() != nil {
+		return // shutting down: don't open a fresh connection
+	}
 	mb, err := p.dial(ctx)
 	if err != nil {
 		p.log.WithError(err).Warn("imap connect failed; will retry next tick")

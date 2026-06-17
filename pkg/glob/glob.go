@@ -1,12 +1,14 @@
 package glob
 
 import (
+	"path"
 	"path/filepath"
 	"strings"
 )
 
+// MatchAny reports whether target's base name matches any glob pattern, case-insensitively.
 func MatchAny(patterns []string, target string) bool {
-	lower := strings.ToLower(target)
+	lower := strings.ToLower(path.Base(target))
 	for _, pattern := range patterns {
 		if pattern == "" {
 			continue
@@ -19,6 +21,7 @@ func MatchAny(patterns []string, target string) bool {
 	return false
 }
 
+// ContainsAny reports whether body contains any keyword, case-insensitively.
 func ContainsAny(keywords []string, body string) bool {
 	if body == "" {
 		return false

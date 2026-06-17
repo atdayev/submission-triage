@@ -22,8 +22,10 @@ const (
 	requestIDCtxKey
 )
 
+// RequestIDField is the log field holding the request ID.
 const RequestIDField = "request_id"
 
+// SetupLogger builds a logrus entry writing to stdout and, if logDir is set, dated rotating files.
 func SetupLogger(level, format, serviceName, logDir string, maxAgeDays, rotationHours int) (*logrus.Entry, func() error, error) {
 	lg := logrus.New()
 
@@ -50,14 +52,18 @@ func SetupLogger(level, format, serviceName, logDir string, maxAgeDays, rotation
 		if err := os.MkdirAll(logDir, 0o755); err != nil {
 			return nil, nil, fmt.Errorf("create log dir %s: %w", logDir, err)
 		}
-		pattern := filepath.Join(logDir, serviceName+".%Y%m%d.log")
+		// include the hour when rotating sub-daily, else the %Y%m%d name collapses
+		// every intra-day rotation onto a single file
+		datePattern := "%Y%m%d"
+		if rotationHours < 24 {
+			datePattern = "%Y%m%d-%H"
+		}
+		pattern := filepath.Join(logDir, serviceName+"."+datePattern+".log")
 		opts := []rotatelogs.Option{
 			rotatelogs.WithMaxAge(time.Duration(maxAgeDays) * 24 * time.Hour),
 			rotatelogs.WithRotationTime(time.Duration(rotationHours) * time.Hour),
 		}
-		// The "current log" symlink needs privileges Windows doesn't grant
-		// a normal process (Admin / Developer Mode). Skip it there; the
-		// dated files are still written.
+		// Windows denies the symlink privilege to normal processes; dated files still written
 		if runtime.GOOS != "windows" {
 			opts = append(opts, rotatelogs.WithLinkName(filepath.Join(logDir, serviceName+".log")))
 		}
@@ -75,10 +81,12 @@ func SetupLogger(level, format, serviceName, logDir string, maxAgeDays, rotation
 	return entry, closer, nil
 }
 
+// ContextWithLogger returns a copy of ctx carrying entry.
 func ContextWithLogger(ctx context.Context, entry *logrus.Entry) context.Context {
 	return context.WithValue(ctx, loggerCtxKey, entry)
 }
 
+// GetLoggerFromContext returns the entry stored in ctx, or the standard logger if absent.
 func GetLoggerFromContext(ctx context.Context) *logrus.Entry {
 	if ctx == nil {
 		return logrus.NewEntry(logrus.StandardLogger())
@@ -89,10 +97,12 @@ func GetLoggerFromContext(ctx context.Context) *logrus.Entry {
 	return logrus.NewEntry(logrus.StandardLogger())
 }
 
+// ContextWithRequestID returns a copy of ctx carrying the request ID.
 func ContextWithRequestID(ctx context.Context, rid string) context.Context {
 	return context.WithValue(ctx, requestIDCtxKey, rid)
 }
 
+// RequestIDFromContext returns the request ID stored in ctx, or the empty string.
 func RequestIDFromContext(ctx context.Context) string {
 	if ctx == nil {
 		return ""
@@ -103,6 +113,7 @@ func RequestIDFromContext(ctx context.Context) string {
 	return ""
 }
 
+// GenerateRequestID returns a new random request ID.
 func GenerateRequestID() string {
 	return uuid.NewString()
 }

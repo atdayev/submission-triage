@@ -2,6 +2,7 @@ package model
 
 import "time"
 
+// Document is a classified attachment on a submission.
 type Document struct {
 	ID              string
 	SubmissionID    string

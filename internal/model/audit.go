@@ -2,6 +2,7 @@ package model
 
 import "time"
 
+// EventType identifies an audited pipeline event.
 type EventType string
 
 const (
@@ -23,6 +24,7 @@ const (
 	EventThreadAmbiguous    EventType = "submission.thread_ambiguous"
 )
 
+// AuditEntry is one recorded audit-log event.
 type AuditEntry struct {
 	ID           string
 	SubmissionID string

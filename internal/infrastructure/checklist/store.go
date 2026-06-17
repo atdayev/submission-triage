@@ -15,11 +15,13 @@ import (
 	"github.com/atdayev/submission-triage/internal/model"
 )
 
+// Store provides checklists by policy type.
 type Store interface {
 	Get(policyType string) (model.Checklist, bool)
 	All() []model.Checklist
 }
 
+// YAMLStore loads checklists from YAML files in a directory.
 type YAMLStore struct {
 	dir string
 	log *logrus.Entry
@@ -60,6 +62,7 @@ type rawEscalation struct {
 	DigestRecipient string `yaml:"digest_recipient"`
 }
 
+// NewYAMLStore returns a YAMLStore with checklists loaded from dir.
 func NewYAMLStore(dir string, log *logrus.Entry) (*YAMLStore, error) {
 	s := &YAMLStore{dir: dir, log: log, byKey: map[string]model.Checklist{}}
 	if err := s.Reload(); err != nil {
@@ -68,6 +71,7 @@ func NewYAMLStore(dir string, log *logrus.Entry) (*YAMLStore, error) {
 	return s, nil
 }
 
+// Reload re-reads all checklist files from the directory.
 func (s *YAMLStore) Reload() error {
 	loaded := map[string]model.Checklist{}
 	err := filepath.WalkDir(s.dir, func(path string, d fs.DirEntry, err error) error {
@@ -112,6 +116,7 @@ func (s *YAMLStore) Reload() error {
 	return nil
 }
 
+// Get returns the checklist for a policy type.
 func (s *YAMLStore) Get(policyType string) (model.Checklist, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -119,6 +124,7 @@ func (s *YAMLStore) Get(policyType string) (model.Checklist, bool) {
 	return c, ok
 }
 
+// All returns all checklists sorted by policy type.
 func (s *YAMLStore) All() []model.Checklist {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -139,6 +145,14 @@ func validateChecklist(c model.Checklist) error {
 		for _, p := range item.Match.FilenamePatterns {
 			if _, err := filepath.Match(p, ""); err != nil {
 				return fmt.Errorf("item %q: invalid filename pattern %q: %w", item.ID, p, err)
+			}
+		}
+		if rf := item.RequiresField; rf != nil {
+			if rf.Name == "" {
+				return fmt.Errorf("item %q: requires_field with empty name", item.ID)
+			}
+			if rf.MinValue != nil && rf.Type != model.FieldTypeNumber {
+				return fmt.Errorf("item %q: min_value requires type number", item.ID)
 			}
 		}
 	}

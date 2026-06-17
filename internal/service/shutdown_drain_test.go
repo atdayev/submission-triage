@@ -37,6 +37,7 @@ func TestIngestEmail_ReplyGoroutineSurvivesCtxCancel(t *testing.T) {
 	cl := smallChecklist()
 
 	subs.On("FindByEmailReference", mock.Anything, mock.Anything).Return(nil, false, model.ErrSubmissionNotFound)
+	subs.On("FindByDeterministicID", mock.Anything, mock.Anything).Return(nil, model.ErrSubmissionNotFound).Maybe()
 	subs.On("UpsertSubmissionWithReply", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 	subs.On("UpsertEmail", mock.Anything, mock.Anything).Return(nil).Maybe()
 
@@ -72,13 +73,13 @@ func TestIngestEmail_ReplyGoroutineSurvivesCtxCancel(t *testing.T) {
 		t.Fatalf("ingest: %v", err)
 	}
 
-	// Cancel inbound ctx while the goroutine is still blocked in mail.Send.
+	// cancel inbound ctx while the goroutine is still blocked in mail.Send
 	cancel()
 	if mail.sent.Load() != 0 {
 		t.Fatalf("send happened before release: got %d", mail.sent.Load())
 	}
 
-	// Release the send and drain.
+	// release the send and drain
 	close(mail.release)
 	doneWait := make(chan struct{})
 	go func() {
@@ -122,6 +123,7 @@ func TestShutdown_BoundedWhenSendStuck(t *testing.T) {
 	cl := smallChecklist()
 
 	subs.On("FindByEmailReference", mock.Anything, mock.Anything).Return(nil, false, model.ErrSubmissionNotFound)
+	subs.On("FindByDeterministicID", mock.Anything, mock.Anything).Return(nil, model.ErrSubmissionNotFound).Maybe()
 	subs.On("UpsertSubmissionWithReply", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 	subs.On("UpsertEmail", mock.Anything, mock.Anything).Return(nil).Maybe()
 	aud.On("Append", mock.Anything, mock.Anything).Return(nil)

@@ -191,3 +191,114 @@ func TestEvaluateChecklist_RequiresField_DocNotClassifiedIsStillMissing(t *testi
 		t.Errorf("Reason: got %q, want %q", missing[0].Reason, "document not provided")
 	}
 }
+
+func TestEvaluateChecklist_AnyDocSatisfiesField(t *testing.T) {
+	minVal := 5.0
+	cl := Checklist{Required: []RequiredItem{{
+		ID:            "loss_runs",
+		Description:   "Loss runs",
+		RequiresField: &RequiresField{Name: "years_covered", Type: FieldTypeNumber, MinValue: &minVal, Unit: "years"},
+	}}}
+	// the failing doc is listed first; a later satisfying doc must clear the item
+	docs := []Document{
+		{ClassifiedAs: "loss_runs", ExtractedFields: map[string]any{"years_covered": 3.0}},
+		{ClassifiedAs: "loss_runs", ExtractedFields: map[string]any{"years_covered": 7.0}},
+	}
+	if missing := EvaluateChecklist(Submission{Documents: docs}, cl); len(missing) != 0 {
+		t.Fatalf("a satisfying duplicate should clear the item, got %v", missing)
+	}
+}
+
+func TestEvaluateChecklist_NumericStringCoercion(t *testing.T) {
+	minVal := 5.0
+	cl := Checklist{Required: []RequiredItem{{
+		ID:            "loss_runs",
+		Description:   "Loss runs",
+		RequiresField: &RequiresField{Name: "years_covered", Type: FieldTypeNumber, MinValue: &minVal, Unit: "years"},
+	}}}
+
+	below := []Document{{ClassifiedAs: "loss_runs", ExtractedFields: map[string]any{"years_covered": "3"}}}
+	missing := EvaluateChecklist(Submission{Documents: below}, cl)
+	if len(missing) != 1 || !strings.Contains(missing[0].Reason, "covers only 3 years, need at least 5") {
+		t.Fatalf("string '3' should coerce and fail: %v", missing)
+	}
+
+	ok := []Document{{ClassifiedAs: "loss_runs", ExtractedFields: map[string]any{"years_covered": "7"}}}
+	if m := EvaluateChecklist(Submission{Documents: ok}, cl); len(m) != 0 {
+		t.Fatalf("string '7' should coerce and pass: %v", m)
+	}
+}
+
+func TestEvaluateChecklist_NumberTypeEnforcedWithoutMin(t *testing.T) {
+	cl := Checklist{Required: []RequiredItem{{
+		ID:            "doc",
+		Description:   "A doc",
+		RequiresField: &RequiresField{Name: "count", Type: FieldTypeNumber},
+	}}}
+	bad := []Document{{ClassifiedAs: "doc", ExtractedFields: map[string]any{"count": "abc"}}}
+	if m := EvaluateChecklist(Submission{Documents: bad}, cl); len(m) != 1 {
+		t.Fatalf("non-numeric value for a number field should fail, got %v", m)
+	}
+	good := []Document{{ClassifiedAs: "doc", ExtractedFields: map[string]any{"count": 2.0}}}
+	if m := EvaluateChecklist(Submission{Documents: good}, cl); len(m) != 0 {
+		t.Fatalf("numeric value should pass, got %v", m)
+	}
+}
+
+func TestFormatNum_NoScientificNotation(t *testing.T) {
+	cases := map[float64]string{
+		3:    "3",
+		5:    "5",
+		3.5:  "3.5",
+		1e21: "1000000000000000000000",
+		1e-7: "0.0000001",
+	}
+	for in, want := range cases {
+		if got := formatNum(in); got != want {
+			t.Errorf("formatNum(%v) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestEvaluateChecklist_SoftPassDoesNotMaskFailure(t *testing.T) {
+	minVal := 5.0
+	cl := Checklist{Required: []RequiredItem{{
+		ID:            "loss_runs",
+		Description:   "Loss runs",
+		RequiresField: &RequiresField{Name: "years_covered", Type: FieldTypeNumber, MinValue: &minVal, Unit: "years"},
+	}}}
+	// one matching doc concretely falls short (3<5); another never had extraction
+	// run (nil map = soft-pass). The soft-pass must NOT satisfy the item.
+	docs := []Document{
+		{ClassifiedAs: "loss_runs", ExtractedFields: map[string]any{"years_covered": 3.0}},
+		{ClassifiedAs: "loss_runs"},
+	}
+	missing := EvaluateChecklist(Submission{Documents: docs}, cl)
+	if len(missing) != 1 || !strings.Contains(missing[0].Reason, "covers only 3 years, need at least 5") {
+		t.Fatalf("soft-pass masked the shortfall: %v", missing)
+	}
+}
+
+func TestNumericValue_RejectsNonFinite(t *testing.T) {
+	for _, s := range []string{"NaN", "Inf", "+Inf", "-Inf"} {
+		if _, ok := numericValue(s); ok {
+			t.Errorf("numericValue(%q) should be rejected", s)
+		}
+	}
+	if f, ok := numericValue("3"); !ok || f != 3 {
+		t.Errorf("numericValue(\"3\") = %v,%v; want 3,true", f, ok)
+	}
+}
+
+func TestEvaluateChecklist_NaNValueDoesNotSatisfyMinimum(t *testing.T) {
+	minVal := 5.0
+	cl := Checklist{Required: []RequiredItem{{
+		ID:            "loss_runs",
+		Description:   "Loss runs",
+		RequiresField: &RequiresField{Name: "years_covered", Type: FieldTypeNumber, MinValue: &minVal, Unit: "years"},
+	}}}
+	docs := []Document{{ClassifiedAs: "loss_runs", ExtractedFields: map[string]any{"years_covered": "NaN"}}}
+	if m := EvaluateChecklist(Submission{Documents: docs}, cl); len(m) != 1 {
+		t.Fatalf("NaN must not satisfy the minimum, got %v", m)
+	}
+}

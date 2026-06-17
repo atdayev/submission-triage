@@ -6,6 +6,7 @@ import (
 	"time"
 )
 
+// State is a submission's lifecycle state.
 type State string
 
 const (
@@ -49,6 +50,7 @@ var allowed = map[State]map[State]struct{}{
 	},
 }
 
+// Submission tracks one incoming submission through triage.
 type Submission struct {
 	ID           string
 	PolicyType   string
@@ -66,6 +68,7 @@ type Submission struct {
 	MissingItems []MissingItem
 }
 
+// NewSubmission creates a submission in the open state.
 func NewSubmission(id, policyType, subject, fromAddress, fromName, threadKey string, now time.Time) Submission {
 	return Submission{
 		ID:           id,
@@ -81,6 +84,7 @@ func NewSubmission(id, policyType, subject, fromAddress, fromName, threadKey str
 	}
 }
 
+// TransitionTo moves the submission to next when the transition is allowed.
 func (s *Submission) TransitionTo(next State, now time.Time) error {
 	if s.State == next {
 		s.UpdatedAt = now
@@ -106,15 +110,18 @@ func (s *Submission) TransitionTo(next State, now time.Time) error {
 	return nil
 }
 
+// MarkAction resets the activity clock used for escalation.
 func (s *Submission) MarkAction(now time.Time) {
 	s.UpdatedAt = now
 	s.LastActionAt = now
 }
 
+// AttachEmail appends an email to the submission.
 func (s *Submission) AttachEmail(e Email) {
 	s.Emails = append(s.Emails, e)
 }
 
+// AttachDocument appends a classified document to the submission.
 func (s *Submission) AttachDocument(d Document) {
 	s.Documents = append(s.Documents, d)
 }

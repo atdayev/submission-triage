@@ -42,6 +42,7 @@ func TestValidate_AcceptsMinimalConfig(t *testing.T) {
 		HTTP:       HTTPConfig{Port: 8080},
 		Database:   DatabaseConfig{Path: "x"},
 		Checklists: ChecklistsConfig{Directory: "y"},
+		Log:        LogConfig{RotationHours: 24},
 		Escalation: EscalationConfig{IntervalMinutes: 15},
 	}
 	if err := cfg.Validate(); err != nil {
@@ -55,6 +56,7 @@ func TestValidate_RejectsNonPositiveIntervals(t *testing.T) {
 			HTTP:       HTTPConfig{Port: 8080},
 			Database:   DatabaseConfig{Path: "x"},
 			Checklists: ChecklistsConfig{Directory: "y"},
+			Log:        LogConfig{RotationHours: 24},
 			Escalation: EscalationConfig{IntervalMinutes: 15},
 		}
 	}
@@ -76,6 +78,142 @@ func TestValidate_RejectsNonPositiveIntervals(t *testing.T) {
 	c.IMAP = IMAPConfig{PollIntervalSeconds: 0}
 	if err := c.Validate(); err != nil {
 		t.Errorf("unconfigured IMAP should not trip poll-interval validation: %v", err)
+	}
+}
+
+func TestValidate_RejectsPortOutOfRange(t *testing.T) {
+	base := func() *Config {
+		return &Config{
+			HTTP:       HTTPConfig{Port: 8080},
+			Database:   DatabaseConfig{Path: "x"},
+			Checklists: ChecklistsConfig{Directory: "y"},
+			Log:        LogConfig{RotationHours: 24},
+			Escalation: EscalationConfig{IntervalMinutes: 15},
+		}
+	}
+
+	c := base()
+	c.HTTP.Port = 70000
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "http.port") {
+		t.Errorf("http.port 70000 should be rejected, got %v", err)
+	}
+
+	c = base()
+	c.IMAP = IMAPConfig{Host: "imap.x", Username: "u", Password: "p", PollIntervalSeconds: 30, Port: "0"}
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "imap.port") {
+		t.Errorf("imap.port 0 should be rejected, got %v", err)
+	}
+
+	c = base()
+	c.IMAP = IMAPConfig{Host: "imap.x", Username: "u", Password: "p", PollIntervalSeconds: 30, Port: "abc"}
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "imap.port") {
+		t.Errorf("non-numeric imap.port should be rejected, got %v", err)
+	}
+
+	c = base()
+	c.SMTP = SMTPConfig{Host: "smtp.x", FromAddress: "ops@x", Port: "99999"}
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "smtp.port") {
+		t.Errorf("smtp.port 99999 should be rejected, got %v", err)
+	}
+
+	// valid ports pass
+	c = base()
+	c.IMAP = IMAPConfig{Host: "imap.x", Username: "u", Password: "p", PollIntervalSeconds: 30, Port: "993", MaxMessageMB: 32}
+	c.SMTP = SMTPConfig{Host: "smtp.x", FromAddress: "ops@x", Port: "587"}
+	if err := c.Validate(); err != nil {
+		t.Errorf("valid ports should pass: %v", err)
+	}
+}
+
+func TestValidate_RejectsNegativeMaxMessageMB(t *testing.T) {
+	cfg := &Config{
+		HTTP:       HTTPConfig{Port: 8080},
+		Database:   DatabaseConfig{Path: "x"},
+		Checklists: ChecklistsConfig{Directory: "y"},
+		Log:        LogConfig{RotationHours: 24},
+		Escalation: EscalationConfig{IntervalMinutes: 15},
+		IMAP:       IMAPConfig{Host: "imap.x", Username: "u", Password: "p", PollIntervalSeconds: 30, Port: "993", MaxMessageMB: -1},
+	}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "max_message_mb") {
+		t.Errorf("negative max_message_mb should be rejected, got %v", err)
+	}
+
+	// 0 means no limit and is accepted
+	cfg.IMAP.MaxMessageMB = 0
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("max_message_mb 0 should be accepted: %v", err)
+	}
+}
+
+func TestValidate_AnthropicTokensAndTimeout(t *testing.T) {
+	base := func() *Config {
+		return &Config{
+			HTTP:       HTTPConfig{Port: 8080},
+			Database:   DatabaseConfig{Path: "x"},
+			Checklists: ChecklistsConfig{Directory: "y"},
+			Log:        LogConfig{RotationHours: 24},
+			Escalation: EscalationConfig{IntervalMinutes: 15},
+			Anthropic:  AnthropicConfig{APIKey: "sk-x", MaxTokens: 2048, TimeoutSec: 30},
+		}
+	}
+
+	c := base()
+	c.Anthropic.MaxTokens = 0
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "max_tokens") {
+		t.Errorf("max_tokens 0 with API key should be rejected, got %v", err)
+	}
+
+	c = base()
+	c.Anthropic.TimeoutSec = 0
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "timeout_seconds") {
+		t.Errorf("timeout_seconds 0 with API key should be rejected, got %v", err)
+	}
+
+	// bad values are ignored when no API key is set
+	c = base()
+	c.Anthropic = AnthropicConfig{MaxTokens: 0, TimeoutSec: 0}
+	if err := c.Validate(); err != nil {
+		t.Errorf("no API key should not trip anthropic validation: %v", err)
+	}
+}
+
+func TestValidate_LogRotation(t *testing.T) {
+	base := func() *Config {
+		return &Config{
+			HTTP:       HTTPConfig{Port: 8080},
+			Database:   DatabaseConfig{Path: "x"},
+			Checklists: ChecklistsConfig{Directory: "y"},
+			Log:        LogConfig{MaxAgeDays: 14, RotationHours: 24},
+			Escalation: EscalationConfig{IntervalMinutes: 15},
+		}
+	}
+
+	c := base()
+	c.Log.MaxAgeDays = -1
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "max_age_days") {
+		t.Errorf("negative max_age_days should be rejected, got %v", err)
+	}
+
+	c = base()
+	c.Log.RotationHours = 0
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "rotation_hours") {
+		t.Errorf("rotation_hours 0 should be rejected, got %v", err)
+	}
+
+	// MaxAgeDays 0 is accepted by Validate (the rotator then applies its 7-day default)
+	c = base()
+	c.Log.MaxAgeDays = 0
+	if err := c.Validate(); err != nil {
+		t.Errorf("max_age_days 0 should be accepted: %v", err)
+	}
+}
+
+func TestMaxMessageBytes(t *testing.T) {
+	if got := (IMAPConfig{MaxMessageMB: 0}).MaxMessageBytes(); got != 0 {
+		t.Errorf("0 MB: got %d, want 0", got)
+	}
+	if got := (IMAPConfig{MaxMessageMB: 32}).MaxMessageBytes(); got != 32<<20 {
+		t.Errorf("32 MB: got %d, want %d", got, 32<<20)
 	}
 }
 
@@ -154,13 +292,13 @@ func TestParse_ReadsEnvOverrides(t *testing.T) {
 }
 
 func TestParse_SMTPFromName(t *testing.T) {
-	// Defaults when unset.
+	// defaults when unset
 	cfg := parseEnv(t, map[string]string{})
 	if cfg.SMTP.FromName != "Submission Triage" {
 		t.Errorf("smtp.from_name default: got %q", cfg.SMTP.FromName)
 	}
 
-	// An explicit SMTP from-name wins.
+	// an explicit SMTP from-name wins
 	cfg = parseEnv(t, map[string]string{"SMTP_FROM_NAME": "Acme Sender"})
 	if cfg.SMTP.FromName != "Acme Sender" {
 		t.Errorf("smtp.from_name explicit: got %q", cfg.SMTP.FromName)

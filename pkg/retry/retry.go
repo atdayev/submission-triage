@@ -10,13 +10,17 @@ import (
 	"github.com/atdayev/submission-triage/pkg/logger"
 )
 
-const MaxDelay = 30 * time.Second // cap the doubling
-const jitterFactor = 0.2          // ±20%, avoids a thundering herd
+// MaxDelay caps the backoff doubling.
+const MaxDelay = 30 * time.Second
 
+const jitterFactor = 0.2 // ±20%, avoids a thundering herd
+
+// Permanent wraps an error that retries must not be applied to.
 type Permanent struct {
 	Err error
 }
 
+// MarkPermanent wraps err so Do returns it immediately instead of retrying.
 func MarkPermanent(err error) error {
 	if err == nil {
 		return nil
@@ -34,6 +38,14 @@ var jitter = func(d time.Duration) time.Duration {
 	return d + time.Duration(offset)
 }
 
+func capDelay(d time.Duration) time.Duration {
+	if d > MaxDelay {
+		return MaxDelay
+	}
+	return d
+}
+
+// Do calls fn until it succeeds, ctx ends, or attempts are exhausted, backing off with jitter between tries.
 func Do(ctx context.Context, attempts int, baseDelay time.Duration, fn func(ctx context.Context) error) error {
 	if attempts <= 0 {
 		attempts = 1
@@ -65,7 +77,7 @@ func Do(ctx context.Context, attempts int, baseDelay time.Duration, fn func(ctx 
 			break
 		}
 
-		sleep := jitter(delay)
+		sleep := capDelay(jitter(delay))
 		log.WithError(err).
 			WithField("attempt", i+1).
 			WithField("delay", sleep.String()).
@@ -86,6 +98,7 @@ func Do(ctx context.Context, attempts int, baseDelay time.Duration, fn func(ctx 
 	return fmt.Errorf("retry exhausted after %d attempts: %w", attempts, lastErr)
 }
 
+// Error returns the wrapped error's message.
 func (p *Permanent) Error() string {
 	if p.Err == nil {
 		return "permanent error"
@@ -93,4 +106,5 @@ func (p *Permanent) Error() string {
 	return p.Err.Error()
 }
 
+// Unwrap returns the wrapped error.
 func (p *Permanent) Unwrap() error { return p.Err }

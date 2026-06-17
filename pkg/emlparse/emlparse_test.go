@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -130,5 +131,139 @@ body
 	}
 	if headers["References"] != "<root@x> <reply1@x>" {
 		t.Errorf("References: got %q", headers["References"])
+	}
+}
+
+const namedTextAfterBody = `From: a@x
+To: b@x
+Subject: named after body
+Message-ID: <nab@x>
+Date: Mon, 19 May 2026 09:00:00 -0400
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="b"
+
+--b
+Content-Type: text/plain
+
+real email body
+--b
+Content-Type: text/plain; name="data.csv"
+
+a,b,c
+--b--
+`
+
+func TestParse_NamedTextAfterBodyIsAttachment(t *testing.T) {
+	p, err := FromFile(writeTemp(t, namedTextAfterBody))
+	if err != nil {
+		t.Fatalf("FromFile: %v", err)
+	}
+	if !strings.Contains(p.TextBody, "real email body") {
+		t.Errorf("body lost: %q", p.TextBody)
+	}
+	// the named text part after the body must be kept as an attachment, not dropped
+	if len(p.Attachments) != 1 || p.Attachments[0].Name != "data.csv" {
+		t.Fatalf("named text part after body should be an attachment, got %+v", p.Attachments)
+	}
+	decoded, _ := base64.StdEncoding.DecodeString(p.Attachments[0].Content)
+	if !strings.Contains(string(decoded), "a,b,c") {
+		t.Errorf("attachment content lost: %q", decoded)
+	}
+}
+
+const noBoundaryMultipart = `From: a@x
+To: b@x
+Subject: no boundary
+Message-ID: <nb@x>
+Date: Mon, 19 May 2026 09:00:00 -0400
+MIME-Version: 1.0
+Content-Type: multipart/mixed
+
+This is the body that must not be lost.
+`
+
+func TestParse_EmptyBoundaryRecoversBody(t *testing.T) {
+	p, err := FromFile(writeTemp(t, noBoundaryMultipart))
+	if err != nil {
+		t.Fatalf("FromFile: %v", err)
+	}
+	if !strings.Contains(p.TextBody, "must not be lost") {
+		t.Errorf("body lost on empty boundary: got %q", p.TextBody)
+	}
+}
+
+const namedInlineText = `From: a@x
+To: b@x
+Subject: named text
+Message-ID: <nt@x>
+Date: Mon, 19 May 2026 09:00:00 -0400
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="b"
+
+--b
+Content-Type: text/plain; name="note.txt"
+
+the only body text
+--b--
+`
+
+func TestParse_NamedInlineTextIsBody(t *testing.T) {
+	p, err := FromFile(writeTemp(t, namedInlineText))
+	if err != nil {
+		t.Fatalf("FromFile: %v", err)
+	}
+	if !strings.Contains(p.TextBody, "the only body text") {
+		t.Errorf("named text part should be body: got %q", p.TextBody)
+	}
+	if len(p.Attachments) != 0 {
+		t.Errorf("named text part wrongly captured as attachment: %+v", p.Attachments)
+	}
+}
+
+const typelessPart = `From: a@x
+To: b@x
+Subject: typeless
+Message-ID: <tl@x>
+Date: Mon, 19 May 2026 09:00:00 -0400
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="b"
+
+--b
+Content-Transfer-Encoding: 7bit
+
+typeless body content
+--b--
+`
+
+func TestParse_TypelessPartIsBody(t *testing.T) {
+	p, err := FromFile(writeTemp(t, typelessPart))
+	if err != nil {
+		t.Fatalf("FromFile: %v", err)
+	}
+	if !strings.Contains(p.TextBody, "typeless body content") {
+		t.Errorf("typeless part should default to text body: got %q", p.TextBody)
+	}
+}
+
+const crlfSubject = `From: a@x
+To: b@x
+Subject: =?UTF-8?Q?a=0D=0AInjected?=
+Message-ID: <cs@x>
+Date: Mon, 19 May 2026 09:00:00 -0400
+Content-Type: text/plain
+
+body
+`
+
+func TestParse_StripsControlCharsFromSubject(t *testing.T) {
+	p, err := FromFile(writeTemp(t, crlfSubject))
+	if err != nil {
+		t.Fatalf("FromFile: %v", err)
+	}
+	if strings.ContainsAny(p.Subject, "\r\n") {
+		t.Errorf("subject leaked control chars: %q", p.Subject)
+	}
+	if p.Subject != "aInjected" {
+		t.Errorf("subject: got %q, want %q", p.Subject, "aInjected")
 	}
 }

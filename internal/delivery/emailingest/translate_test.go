@@ -49,6 +49,35 @@ func TestTranslate_SplitsReferencesHeader(t *testing.T) {
 	}
 }
 
+func TestTranslate_ReferencesSkipsGarbageTokens(t *testing.T) {
+	cases := map[string][]string{
+		"junk>more <real@x>": {"real@x"},
+		"a>b<c@x>":           {"c@x"},
+	}
+	for in, want := range cases {
+		p := samplePayload()
+		p.Headers[1].Value = in
+		r := Translate(p, "imap")
+		if len(r.References) != len(want) {
+			t.Fatalf("%q: got %+v, want %+v", in, r.References, want)
+		}
+		for i := range want {
+			if r.References[i] != want[i] {
+				t.Errorf("%q: got %+v, want %+v", in, r.References, want)
+			}
+		}
+	}
+}
+
+func TestTranslate_ReferencesFallbackKeepsOnlyMessageIDs(t *testing.T) {
+	p := samplePayload()
+	p.Headers[1].Value = "garbage root@x notanid"
+	r := Translate(p, "imap")
+	if len(r.References) != 1 || r.References[0] != "root@x" {
+		t.Fatalf("References: got %+v", r.References)
+	}
+}
+
 func TestTranslate_PopulatesFromAndTo(t *testing.T) {
 	r := Translate(samplePayload(), "imap")
 	if r.FromAddress != "alice@example.com" || r.FromName != "Alice" {
@@ -98,6 +127,27 @@ func TestTranslate_BadBase64AttachmentSkipped(t *testing.T) {
 	r := Translate(p, "imap")
 	if len(r.Attachments) != 0 {
 		t.Fatalf("expected attachment skipped, got %d", len(r.Attachments))
+	}
+}
+
+func TestTranslate_EmptyAttachmentSkipped(t *testing.T) {
+	p := samplePayload()
+	p.Attachments[0].Content = ""
+	r := Translate(p, "imap")
+	if len(r.Attachments) != 0 {
+		t.Fatalf("expected attachment skipped, got %d", len(r.Attachments))
+	}
+}
+
+func TestTranslate_NamedZeroOffsetZoneFallsBackToNow(t *testing.T) {
+	p := samplePayload()
+	p.Date = "Mon, 19 May 2026 09:00:00 EST"
+	r := Translate(p, "imap")
+	if r.ReceivedAt.Equal(time.Date(2026, 5, 19, 9, 0, 0, 0, time.UTC)) {
+		t.Fatal("named zone mis-stamped at +0000")
+	}
+	if r.ReceivedAt.IsZero() {
+		t.Fatal("ReceivedAt should default to now")
 	}
 }
 

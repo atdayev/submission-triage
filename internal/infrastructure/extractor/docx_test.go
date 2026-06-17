@@ -51,7 +51,7 @@ func TestDOCX_ParagraphSeparation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Each <w:p> emits a newline before its content.
+	// each <w:p> emits a newline before its content
 	if !strings.Contains(out, "alpha") || !strings.Contains(out, "beta") {
 		t.Fatalf("missing content: %q", out)
 	}
@@ -90,6 +90,33 @@ func TestDOCX_NoDocumentXML_ReturnsEmpty(t *testing.T) {
 	}
 	if out != "" {
 		t.Errorf("expected empty (no word/document.xml), got %q", out)
+	}
+}
+
+func TestDOCX_DuplicateDocumentParts_Bounded(t *testing.T) {
+	const n = 50
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	doc := `<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>dup</w:t></w:r></w:p></w:body></w:document>`
+	for i := 0; i < n; i++ {
+		w, err := zw.Create("word/document.xml")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write([]byte(doc)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := NewDOCX().Extract(buf.Bytes())
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if got := strings.Count(out, "dup"); got != 1 {
+		t.Errorf("processed %d document parts, want 1", got)
 	}
 }
 

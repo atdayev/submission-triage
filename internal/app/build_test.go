@@ -1,12 +1,33 @@
 package app
 
 import (
+	"context"
+	"path/filepath"
 	"testing"
 
 	"github.com/sirupsen/logrus"
 
 	"github.com/atdayev/submission-triage/internal/config"
 )
+
+func TestBuildPollerNilWhenIMAPUnconfigured(t *testing.T) {
+	log := logrus.NewEntry(logrus.New())
+	cfg := &config.Config{
+		Outbound:   config.OutboundConfig{Provider: "log"},
+		Database:   config.DatabaseConfig{Path: filepath.Join(t.TempDir(), "triage.db")},
+		Checklists: config.ChecklistsConfig{Directory: t.TempDir()},
+	}
+	built, err := Build(context.Background(), cfg, log, "../../migrations")
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	defer built.DB.Close()
+	defer built.Service.Shutdown()
+
+	if built.Poller != nil {
+		t.Error("Poller: got non-nil, want nil when IMAP unconfigured")
+	}
+}
 
 func TestChooseSender(t *testing.T) {
 	log := logrus.NewEntry(logrus.New())

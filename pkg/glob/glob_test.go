@@ -15,6 +15,8 @@ func TestMatchAny(t *testing.T) {
 		{[]string{"*loss*run*", "*claims*history*"}, "claims_history.pdf", true},
 		{[]string{}, "any.pdf", false},
 		{[]string{"*ACORD*"}, "random.pdf", false},
+		{[]string{"*ACORD*"}, "x/ACORD_125.pdf", true},
+		{[]string{"[*ACORD*"}, "ACORD_125.pdf", false},
 	}
 	for _, tc := range cases {
 		got := MatchAny(tc.patterns, tc.target)

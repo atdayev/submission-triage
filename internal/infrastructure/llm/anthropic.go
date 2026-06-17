@@ -9,7 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,6 +19,7 @@ import (
 
 	"github.com/atdayev/submission-triage/internal/config"
 	"github.com/atdayev/submission-triage/pkg/retry"
+	"github.com/atdayev/submission-triage/pkg/textutil"
 )
 
 const (
@@ -25,7 +28,7 @@ const (
 	maxTextSampleBytes = 2048
 )
 
-// USD per million tokens; estimate only. Unmapped model → cost 0 + a warn.
+// modelPricing maps model ID to USD per million tokens; unmapped model means cost 0.
 var modelPricing = map[string]pricing{
 	"claude-haiku-4-5":          {input: 1.0, output: 5.0},
 	"claude-haiku-4-5-20251001": {input: 1.0, output: 5.0},
@@ -38,11 +41,13 @@ type pricing struct {
 	output float64
 }
 
+// Client classifies documents and extracts fields via an LLM.
 type Client interface {
 	Classify(ctx context.Context, req ClassificationRequest) (ClassificationResponse, error)
 	ExtractField(ctx context.Context, req FieldExtractionRequest) (FieldExtractionResponse, error)
 }
 
+// ClassificationRequest is a document to match against candidate categories.
 type ClassificationRequest struct {
 	Filename    string
 	ContentType string
@@ -51,11 +56,13 @@ type ClassificationRequest struct {
 	PolicyType  string
 }
 
+// ClassificationCandidate is one category the document may be classified as.
 type ClassificationCandidate struct {
 	ID          string
 	Description string
 }
 
+// ClassificationResponse is the chosen candidate with confidence and reason.
 type ClassificationResponse struct {
 	CandidateID string  `json:"candidate_id"`
 	Confidence  float64 `json:"confidence"`
@@ -63,6 +70,7 @@ type ClassificationResponse struct {
 	Usage       Usage   `json:"-"`
 }
 
+// FieldExtractionRequest names a single field to pull from a document.
 type FieldExtractionRequest struct {
 	Filename         string
 	TextSample       string
@@ -71,6 +79,7 @@ type FieldExtractionRequest struct {
 	FieldType        string // "number" or "string"
 }
 
+// FieldExtractionResponse is the extracted value with confidence and reason.
 type FieldExtractionResponse struct {
 	Value      any
 	Confidence float64
@@ -78,6 +87,7 @@ type FieldExtractionResponse struct {
 	Usage      Usage
 }
 
+// Usage records per-call token counts, latency, and estimated cost.
 type Usage struct {
 	PromptHash       string
 	LatencyMs        int64
@@ -87,6 +97,7 @@ type Usage struct {
 	Model            string
 }
 
+// AnthropicClient is a Client backed by the Anthropic messages API.
 type AnthropicClient struct {
 	cfg           config.AnthropicConfig
 	httpClient    *http.Client
@@ -141,6 +152,7 @@ type anthropicResponse struct {
 	} `json:"error,omitempty"`
 }
 
+// NewAnthropicClient returns an AnthropicClient and warns when the model has no pricing entry.
 func NewAnthropicClient(cfg config.AnthropicConfig, retryAttempts int, retryBase time.Duration, log *logrus.Entry) *AnthropicClient {
 	if _, ok := modelPricing[cfg.Model]; !ok && log != nil {
 		log.WithField("model", cfg.Model).
@@ -155,6 +167,7 @@ func NewAnthropicClient(cfg config.AnthropicConfig, retryAttempts int, retryBase
 	}
 }
 
+// Classify asks the model to pick the candidate that best matches the document.
 func (c *AnthropicClient) Classify(ctx context.Context, req ClassificationRequest) (ClassificationResponse, error) {
 	var resp ClassificationResponse
 	if len(req.Candidates) == 0 {
@@ -186,10 +199,12 @@ func (c *AnthropicClient) Classify(ctx context.Context, req ClassificationReques
 	if err := json.Unmarshal([]byte(extractJSON(raw)), &resp); err != nil {
 		return resp, fmt.Errorf("anthropic: parse classify response: %w", err)
 	}
+	resp.Confidence = clampConfidence(resp.Confidence)
 	resp.Usage = usage
 	return resp, nil
 }
 
+// ExtractField asks the model to extract one field via the report_field tool.
 func (c *AnthropicClient) ExtractField(ctx context.Context, req FieldExtractionRequest) (FieldExtractionResponse, error) {
 	if req.FieldName == "" {
 		return FieldExtractionResponse{}, errors.New("anthropic: field name required")
@@ -198,6 +213,27 @@ func (c *AnthropicClient) ExtractField(ctx context.Context, req FieldExtractionR
 	if fieldType != "number" && fieldType != "string" {
 		fieldType = "string"
 	}
+	prompt, tool := buildFieldExtractionPrompt(req, fieldType)
+
+	body, usage, err := c.callMessages(ctx, anthropicRequest{
+		Model:     c.cfg.Model,
+		MaxTokens: c.cfg.MaxTokens,
+		System:    "You extract structured fields from insurance documents. Use the report_field tool.",
+		Messages:  []anthropicMessage{{Role: "user", Content: prompt}},
+		Tools:     []anthropicTool{tool},
+		ToolChoice: &anthropicToolChoice{
+			Type: "tool",
+			Name: "report_field",
+		},
+	}, prompt)
+	if err != nil {
+		return FieldExtractionResponse{Usage: usage}, err
+	}
+	return decodeFieldExtraction(body, fieldType, usage), nil
+}
+
+// buildFieldExtractionPrompt builds the extraction prompt and report_field tool for the given field type.
+func buildFieldExtractionPrompt(req FieldExtractionRequest, fieldType string) (string, anthropicTool) {
 	prompt := fmt.Sprintf(
 		"Extract the field %q (%s) from the following document.\n"+
 			"Description: %s\nFilename: %s\nText sample:\n%s\n\n"+
@@ -219,20 +255,14 @@ func (c *AnthropicClient) ExtractField(ctx context.Context, req FieldExtractionR
 			"required": []string{"value"},
 		},
 	}
+	return prompt, tool
+}
 
-	body, usage, err := c.callMessages(ctx, anthropicRequest{
-		Model:     c.cfg.Model,
-		MaxTokens: c.cfg.MaxTokens,
-		System:    "You extract structured fields from insurance documents. Use the report_field tool.",
-		Messages:  []anthropicMessage{{Role: "user", Content: prompt}},
-		Tools:     []anthropicTool{tool},
-		ToolChoice: &anthropicToolChoice{
-			Type: "tool",
-			Name: "report_field",
-		},
-	}, prompt)
-	if err != nil {
-		return FieldExtractionResponse{Usage: usage}, err
+// decodeFieldExtraction parses the tool body, coercing numeric strings, into a FieldExtractionResponse.
+func decodeFieldExtraction(body, fieldType string, usage Usage) FieldExtractionResponse {
+	// no tool_use block: treat the field as not present, not an error
+	if strings.TrimSpace(body) == "" {
+		return FieldExtractionResponse{Usage: usage}
 	}
 	var parsed struct {
 		Value      any     `json:"value"`
@@ -240,16 +270,27 @@ func (c *AnthropicClient) ExtractField(ctx context.Context, req FieldExtractionR
 		Reason     string  `json:"reason"`
 	}
 	if err := json.Unmarshal([]byte(body), &parsed); err != nil {
-		return FieldExtractionResponse{Usage: usage}, fmt.Errorf("anthropic: parse extract response: %w", err)
+		return FieldExtractionResponse{Usage: usage}
+	}
+	value := parsed.Value
+	if fieldType == "number" {
+		if s, ok := value.(string); ok {
+			if f, err := strconv.ParseFloat(strings.TrimSpace(s), 64); err == nil {
+				value = f
+			} else {
+				value = nil
+			}
+		}
 	}
 	return FieldExtractionResponse{
-		Value:      parsed.Value,
-		Confidence: parsed.Confidence,
+		Value:      value,
+		Confidence: clampConfidence(parsed.Confidence),
 		Reason:     parsed.Reason,
 		Usage:      usage,
-	}, nil
+	}
 }
 
+// callMessages posts the request with retry and returns the response text plus usage.
 func (c *AnthropicClient) callMessages(ctx context.Context, body anthropicRequest, promptForHash string) (string, Usage, error) {
 	usage := Usage{Model: c.cfg.Model}
 	if c.cfg.APIKey == "" {
@@ -266,13 +307,10 @@ func (c *AnthropicClient) callMessages(ctx context.Context, body anthropicReques
 
 	var text string
 	err = retry.Do(ctx, c.retryAttempts, c.retryBase, func(ctx context.Context) error {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(payload))
+		req, err := c.newRequest(ctx, payload)
 		if err != nil {
 			return retry.MarkPermanent(err)
 		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("x-api-key", c.cfg.APIKey)
-		req.Header.Set("anthropic-version", anthropicVersion)
 
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
@@ -286,19 +324,8 @@ func (c *AnthropicClient) callMessages(ctx context.Context, body anthropicReques
 		}
 
 		// status decides retry/permanent before decoding; a 4xx/5xx body may not be JSON
-		if resp.StatusCode >= 500 {
-			return fmt.Errorf("anthropic: server error %d", resp.StatusCode)
-		}
-		if resp.StatusCode == http.StatusTooManyRequests {
-			return fmt.Errorf("anthropic: rate limited %d", resp.StatusCode)
-		}
-		if resp.StatusCode >= 400 {
-			msg := ""
-			var errResp anthropicResponse
-			if json.Unmarshal(respBody, &errResp) == nil && errResp.Error != nil {
-				msg = errResp.Error.Message
-			}
-			return retry.MarkPermanent(fmt.Errorf("anthropic: client error %d: %s", resp.StatusCode, msg))
+		if err := classifyHTTPStatus(resp.StatusCode, respBody); err != nil {
+			return err
 		}
 
 		var parsed anthropicResponse
@@ -309,25 +336,8 @@ func (c *AnthropicClient) callMessages(ctx context.Context, body anthropicReques
 		usage.InputTokens = parsed.Usage.InputTokens
 		usage.OutputTokens = parsed.Usage.OutputTokens
 
-		// Prefer tool_use block if present; otherwise concatenate text blocks.
-		for _, block := range parsed.Content {
-			if block.Type == "tool_use" && block.Input != nil {
-				toolJSON, err := json.Marshal(block.Input)
-				if err != nil {
-					return retry.MarkPermanent(fmt.Errorf("anthropic: re-encode tool_use: %w", err))
-				}
-				text = string(toolJSON)
-				return nil
-			}
-		}
-		var b strings.Builder
-		for _, block := range parsed.Content {
-			if block.Type == "text" {
-				b.WriteString(block.Text)
-			}
-		}
-		text = b.String()
-		return nil
+		text, err = extractResponseText(parsed)
+		return err
 	})
 	usage.LatencyMs = time.Since(start).Milliseconds()
 	if p, ok := modelPricing[c.cfg.Model]; ok {
@@ -339,18 +349,113 @@ func (c *AnthropicClient) callMessages(ctx context.Context, body anthropicReques
 	return text, usage, nil
 }
 
+// newRequest builds the POST request with the Anthropic auth headers.
+func (c *AnthropicClient) newRequest(ctx context.Context, payload []byte) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", c.cfg.APIKey)
+	req.Header.Set("anthropic-version", anthropicVersion)
+	return req, nil
+}
+
+// classifyHTTPStatus maps an Anthropic HTTP status to nil (ok), a retryable
+// error, or a permanent error.
+func classifyHTTPStatus(code int, respBody []byte) error {
+	if code >= 500 {
+		return fmt.Errorf("anthropic: server error %d", code)
+	}
+	if code == http.StatusTooManyRequests {
+		return fmt.Errorf("anthropic: rate limited %d", code)
+	}
+	if code >= 400 {
+		msg := ""
+		var errResp anthropicResponse
+		if json.Unmarshal(respBody, &errResp) == nil && errResp.Error != nil {
+			msg = errResp.Error.Message
+		}
+		return retry.MarkPermanent(fmt.Errorf("anthropic: client error %d: %s", code, msg))
+	}
+	return nil
+}
+
+// extractResponseText returns the tool_use input JSON if present, else the concatenated text blocks.
+func extractResponseText(parsed anthropicResponse) (string, error) {
+	for _, block := range parsed.Content {
+		if block.Type == "tool_use" && block.Input != nil {
+			toolJSON, err := json.Marshal(block.Input)
+			if err != nil {
+				return "", retry.MarkPermanent(fmt.Errorf("anthropic: re-encode tool_use: %w", err))
+			}
+			return string(toolJSON), nil
+		}
+	}
+	var b strings.Builder
+	for _, block := range parsed.Content {
+		if block.Type == "text" {
+			b.WriteString(block.Text)
+		}
+	}
+	return b.String(), nil
+}
+
+// clampConfidence bounds c to [0,1]; NaN/Inf become 0.
+func clampConfidence(c float64) float64 {
+	if math.IsNaN(c) || math.IsInf(c, 0) {
+		return 0
+	}
+	if c < 0 {
+		return 0
+	}
+	if c > 1 {
+		return 1
+	}
+	return c
+}
+
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	return s[:n] + "...[truncated]"
+	return textutil.TruncateBytes(s, n) + "...[truncated]"
 }
 
+// extractJSON returns the first balanced top-level {...} object, ignoring braces
+// inside string literals. Falls back to s when none is found.
 func extractJSON(s string) string {
-	start := strings.Index(s, "{")
-	end := strings.LastIndex(s, "}")
-	if start < 0 || end < 0 || end <= start {
+	start := strings.IndexByte(s, '{')
+	if start < 0 {
 		return s
 	}
-	return s[start : end+1]
+	depth := 0
+	inStr := false
+	escaped := false
+	for i := start; i < len(s); i++ {
+		c := s[i]
+		if inStr {
+			switch {
+			case escaped:
+				escaped = false
+			case c == '\\':
+				escaped = true
+			case c == '"':
+				inStr = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inStr = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return s[start : i+1]
+			}
+		}
+	}
+	return s
 }

@@ -220,6 +220,37 @@ recovered text body
 	}
 }
 
+// flatManyAttachments builds a flat multipart with one text body and n named
+// attachment parts.
+func flatManyAttachments(n int) string {
+	var b strings.Builder
+	b.WriteString("From: a@x\nTo: b@x\nSubject: many\nMessage-ID: <many@x>\n")
+	b.WriteString("Date: Mon, 19 May 2026 09:00:00 -0400\nMIME-Version: 1.0\n")
+	b.WriteString("Content-Type: multipart/mixed; boundary=\"b\"\n\n")
+	b.WriteString("--b\nContent-Type: text/plain\n\nflat body\n\n")
+	for i := 0; i < n; i++ {
+		b.WriteString(fmt.Sprintf("--b\nContent-Type: application/octet-stream; name=\"a%d.bin\"\n", i))
+		b.WriteString(fmt.Sprintf("Content-Disposition: attachment; filename=\"a%d.bin\"\n", i))
+		b.WriteString("Content-Transfer-Encoding: base64\n\nAAAA\n\n")
+	}
+	b.WriteString("--b--\n")
+	return b.String()
+}
+
+func TestFromFile_AttachmentCap_BoundedAndBodySurvives(t *testing.T) {
+	// 150 attachment parts: the cap bounds the slice at 100 and the body still surfaces
+	p, err := FromFile(writeTemp(t, flatManyAttachments(150)))
+	if err != nil {
+		t.Fatalf("FromFile: %v", err)
+	}
+	if len(p.Attachments) != 100 {
+		t.Errorf("attachment cap: got %d, want 100", len(p.Attachments))
+	}
+	if !strings.Contains(p.TextBody, "flat body") {
+		t.Errorf("text body should still surface under the cap: %q", p.TextBody)
+	}
+}
+
 func TestFromFile_FirstTextPlainWins(t *testing.T) {
 	// two text/plain parts: the first one wins
 	twoText := `From: a@x

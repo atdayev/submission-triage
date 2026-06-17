@@ -14,23 +14,29 @@ import (
 )
 
 //go:generate mockery --name=OutboxRepository --output=mocks --outpkg=mocks --filename=OutboxRepository.go
+
+// OutboxRepository persists outbound replies awaiting delivery.
 type OutboxRepository interface {
 	Enqueue(ctx context.Context, e *model.OutboxEntry) error
-	// ListPending returns pending entries older than olderThan (so a row the
-	// online sender is still handling isn't swept), oldest first.
+	// ListPending returns pending entries whose last attempt was before olderThan
+	// (so a row the online sender just handled, or one just retried, isn't
+	// immediately re-swept), oldest first.
 	ListPending(ctx context.Context, olderThan time.Time, limit int) ([]model.OutboxEntry, error)
 	Update(ctx context.Context, id string, status model.OutboxStatus, attempts int, lastErr string) error
 }
 
+// OutboxRepositoryImpl is the SQLite-backed OutboxRepository.
 type OutboxRepositoryImpl struct {
 	db  *sql.DB
 	log *logrus.Entry
 }
 
+// NewOutboxRepository returns a SQLite-backed OutboxRepository.
 func NewOutboxRepository(db *sql.DB, log *logrus.Entry) *OutboxRepositoryImpl {
 	return &OutboxRepositoryImpl{db: db, log: log}
 }
 
+// Enqueue persists a pending outbound reply.
 func (r *OutboxRepositoryImpl) Enqueue(ctx context.Context, e *model.OutboxEntry) error {
 	return insertOutboxRow(ctx, r.db, e)
 }
@@ -72,13 +78,14 @@ func insertOutboxRow(ctx context.Context, ex execContext, e *model.OutboxEntry) 
 	return nil
 }
 
+// ListPending returns pending entries last touched before olderThan, oldest first.
 func (r *OutboxRepositoryImpl) ListPending(ctx context.Context, olderThan time.Time, limit int) ([]model.OutboxEntry, error) {
 	if limit <= 0 {
 		limit = 100
 	}
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT id, submission_id, reply_json, status, attempts, last_error, created_at, updated_at
-		FROM outbox WHERE status = ? AND created_at <= ?
+		FROM outbox WHERE status = ? AND updated_at <= ?
 		ORDER BY created_at ASC LIMIT ?`,
 		string(model.OutboxPending), olderThan.UnixNano(), limit,
 	)
@@ -87,7 +94,7 @@ func (r *OutboxRepositoryImpl) ListPending(ctx context.Context, olderThan time.T
 	}
 	defer rows.Close()
 
-	var out []model.OutboxEntry
+	var out, poison []model.OutboxEntry
 	for rows.Next() {
 		var (
 			e                 model.OutboxEntry
@@ -97,17 +104,29 @@ func (r *OutboxRepositoryImpl) ListPending(ctx context.Context, olderThan time.T
 		if err := rows.Scan(&e.ID, &e.SubmissionID, &replyJSON, &status, &e.Attempts, &e.LastError, &created, &updated); err != nil {
 			return nil, fmt.Errorf("outbox: scan: %w", err)
 		}
-		if err := json.Unmarshal([]byte(replyJSON), &e.Reply); err != nil {
-			return nil, fmt.Errorf("outbox: unmarshal reply %s: %w", e.ID, err)
-		}
 		e.Status = model.OutboxStatus(status)
 		e.CreatedAt = time.Unix(0, created).UTC()
 		e.UpdatedAt = time.Unix(0, updated).UTC()
+		if err := json.Unmarshal([]byte(replyJSON), &e.Reply); err != nil {
+			r.log.WithError(err).WithField("outbox_id", e.ID).Warn("outbox: undecodable reply; dead-lettering")
+			poison = append(poison, e)
+			continue
+		}
 		out = append(out, e)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return out, fmt.Errorf("outbox: rows: %w", err)
+	}
+	// one undecodable row must not head-of-line block the queue
+	for _, e := range poison {
+		if err := r.Update(ctx, e.ID, model.OutboxFailed, e.Attempts+1, "undecodable reply_json"); err != nil {
+			r.log.WithError(err).WithField("outbox_id", e.ID).Warn("outbox: dead-letter failed")
+		}
+	}
+	return out, nil
 }
 
+// Update sets the status, attempt count, and last error of an outbox entry.
 func (r *OutboxRepositoryImpl) Update(ctx context.Context, id string, status model.OutboxStatus, attempts int, lastErr string) error {
 	_, err := r.db.ExecContext(ctx, `
 		UPDATE outbox SET status = ?, attempts = ?, last_error = ?, updated_at = ? WHERE id = ?`,

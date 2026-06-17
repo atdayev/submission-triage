@@ -5,6 +5,7 @@ import (
 	"strings"
 )
 
+// Reply is an outbound email the service sends in-thread.
 type Reply struct {
 	SubmissionID string
 	ToAddress    string
@@ -14,6 +15,7 @@ type Reply struct {
 	References   []string
 }
 
+// BuildMissingItemsReply lists the outstanding documents for the sender.
 func BuildMissingItemsReply(s Submission, missing []MissingItem, lastInbound Email) Reply {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Hi %s,\n\n", greetingName(lastInbound))
@@ -44,6 +46,7 @@ func BuildPolicyUnknownReply(s Submission, lastInbound Email, knownTypes []strin
 	return newReply(s, body, lastInbound)
 }
 
+// BuildCompletionReply confirms the submission is complete.
 func BuildCompletionReply(s Submission, lastInbound Email) Reply {
 	body := fmt.Sprintf("Hi %s,\n\n"+
 		"Thanks — we now have everything we need on this submission. "+
@@ -75,7 +78,9 @@ func greetingName(e Email) string {
 	if e.FromName != "" {
 		parts := strings.Fields(e.FromName)
 		if len(parts) > 0 {
-			return parts[0]
+			if name := sanitizeGreeting(parts[0]); name != "" {
+				return name
+			}
 		}
 	}
 	if at := strings.Index(e.FromAddress, "@"); at > 0 {
@@ -86,6 +91,16 @@ func greetingName(e Email) string {
 	return "there"
 }
 
+// sanitizeGreeting drops control characters from a name.
+func sanitizeGreeting(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
+}
+
 var roleLocalParts = map[string]bool{
 	"submissions": true,
 	"info":        true,
@@ -94,12 +109,16 @@ var roleLocalParts = map[string]bool{
 	"support":     true,
 }
 
-// usableGreeting reports whether an email local-part reads as a first name.
-// Digit-bearing handles, very short ones, and role addresses fall back to
-// "there" rather than greeting "Hi noreply,".
+// usableGreeting reports whether an email local-part reads as a first name,
+// rejecting digit-bearing, very short, and role addresses.
 func usableGreeting(local string) bool {
 	if len(local) < 3 {
 		return false
+	}
+	for _, r := range local {
+		if r < 0x20 || r == 0x7f {
+			return false // control char from an unparseable From address
+		}
 	}
 	if strings.ContainsAny(local, "0123456789") {
 		return false

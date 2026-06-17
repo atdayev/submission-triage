@@ -1,3 +1,5 @@
+//go:build integration
+
 package imap
 
 import (
@@ -7,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	goimap "github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
 	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/emersion/go-imap/v2/imapserver/imapmemserver"
@@ -261,5 +264,17 @@ func TestIntegration_RealAdapter_SkipsOversized(t *testing.T) {
 	}
 	if !strings.Contains(string(msgs[0].Raw), "Message-ID: <m1@example.com>") {
 		t.Error("expected only the small message to come through")
+	}
+
+	// the over-cap message must be marked \Seen, not merely filtered, so it isn't
+	// re-probed every poll; only the (peeked) small message stays unseen
+	unseen, err := mb.(*imapMailbox).c.UIDSearch(&goimap.SearchCriteria{
+		NotFlag: []goimap.Flag{goimap.FlagSeen},
+	}, nil).Wait()
+	if err != nil {
+		t.Fatalf("re-search unseen: %v", err)
+	}
+	if n := len(unseen.AllUIDs()); n != 1 {
+		t.Fatalf("over-cap message left unread: %d unseen, want 1 (only the small message)", n)
 	}
 }

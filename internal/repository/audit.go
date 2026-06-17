@@ -14,20 +14,25 @@ import (
 )
 
 //go:generate mockery --name=AuditRepository --output=mocks --outpkg=mocks --filename=AuditRepository.go
+
+// AuditRepository persists and queries the audit log.
 type AuditRepository interface {
 	Append(ctx context.Context, e *model.AuditEntry) error
 	ListBySubmission(ctx context.Context, submissionID string) ([]model.AuditEntry, error)
 }
 
+// AuditRepositoryImpl is the SQLite-backed AuditRepository.
 type AuditRepositoryImpl struct {
 	db  *sql.DB
 	log *logrus.Entry
 }
 
+// NewAuditRepository returns a SQLite-backed AuditRepository.
 func NewAuditRepository(db *sql.DB, log *logrus.Entry) *AuditRepositoryImpl {
 	return &AuditRepositoryImpl{db: db, log: log}
 }
 
+// Append writes one audit entry, defaulting id and timestamp.
 func (r *AuditRepositoryImpl) Append(ctx context.Context, e *model.AuditEntry) error {
 	if e == nil {
 		return fmt.Errorf("audit: nil entry")
@@ -53,6 +58,7 @@ func (r *AuditRepositoryImpl) Append(ctx context.Context, e *model.AuditEntry) e
 	return nil
 }
 
+// ListBySubmission returns a submission's audit entries, oldest first.
 func (r *AuditRepositoryImpl) ListBySubmission(ctx context.Context, submissionID string) ([]model.AuditEntry, error) {
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT id, submission_id, event_type, payload, request_id, created_at

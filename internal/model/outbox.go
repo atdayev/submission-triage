@@ -2,6 +2,7 @@ package model
 
 import "time"
 
+// OutboxStatus is the delivery state of a queued reply.
 type OutboxStatus string
 
 const (
@@ -10,8 +11,7 @@ const (
 	OutboxFailed  OutboxStatus = "failed" // dead-lettered after max attempts
 )
 
-// OutboxEntry is a reply persisted for durable, at-least-once delivery: it
-// survives queue overflow, crashes, and provider outages.
+// OutboxEntry is a reply persisted for durable, at-least-once delivery.
 type OutboxEntry struct {
 	ID           string
 	SubmissionID string

@@ -10,6 +10,7 @@ import (
 	"github.com/atdayev/submission-triage/internal/delivery/http/handler"
 )
 
+// NewRouter builds the HTTP router with request-ID and recovery middleware.
 func NewRouter(db *sql.DB, log *logrus.Entry) http.Handler {
 	r := chi.NewRouter()
 	r.Use(withRequestID(log))

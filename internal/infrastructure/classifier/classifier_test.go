@@ -115,6 +115,18 @@ func TestClassify_LLMReturnsUnknown(t *testing.T) {
 	}
 }
 
+func TestClassify_LLMReturnsCandidateNotInChecklist(t *testing.T) {
+	stub := &stubLLM{resp: llm.ClassificationResponse{CandidateID: "acord_999", Confidence: 0.9}}
+	c := newTestClassifier(stub)
+	r, _ := c.Classify(context.Background(), Input{Filename: "x.pdf", Checklist: cglChecklist()})
+	if r.CandidateID != "" {
+		t.Fatalf("candidate not in checklist should become empty, got %+v", r)
+	}
+	if r.By != "llm" {
+		t.Fatalf("By: got %+v", r)
+	}
+}
+
 func TestClassify_LLMError(t *testing.T) {
 	stub := &stubLLM{err: errors.New("llm down")}
 	c := newTestClassifier(stub)

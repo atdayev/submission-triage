@@ -15,16 +15,20 @@ import (
 	"time"
 
 	"github.com/joho/godotenv"
+	"github.com/sirupsen/logrus"
 
 	"github.com/atdayev/submission-triage/internal/config"
 	"github.com/atdayev/submission-triage/internal/service"
 	"github.com/atdayev/submission-triage/pkg/logger"
-	"github.com/atdayev/submission-triage/pkg/telemetry"
+)
+
+const (
+	httpReadHeaderTimeout = 5 * time.Second // tighter slow-header bound than the full read timeout
+	httpIdleTimeout       = 60 * time.Second
+	httpMaxHeaderBytes    = 1 << 20
 )
 
 // buildInfo reports version and VCS revision from the embedded build info.
-// Plain `go build` reports version "(devel)"; a real version comes from
-// `go install module@version` or VCS tag stamping.
 func buildInfo() (version, revision string) {
 	version, revision = "dev", "unknown"
 	bi, ok := debug.ReadBuildInfo()
@@ -42,8 +46,9 @@ func buildInfo() (version, revision string) {
 	return version, revision
 }
 
+// Run loads config, builds the app, and serves until shutdown.
 func Run() error {
-	_ = godotenv.Load() // best-effort: .env into process env if present, never overrides existing vars
+	_ = godotenv.Load() // best-effort; never overrides existing env vars
 
 	migrateOnly := flag.Bool("migrate-only", false, "run migrations and exit")
 	flag.Parse()
@@ -66,58 +71,67 @@ func Run() error {
 	rootCtx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	telemetryShutdown, err := telemetry.Init(rootCtx, cfg.Service.Name, log)
-	if err != nil {
-		return fmt.Errorf("init telemetry: %w", err)
-	}
-	defer func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := telemetryShutdown(ctx); err != nil {
-			log.WithError(err).Warn("telemetry shutdown error")
-		}
-	}()
-
-	metrics, err := telemetry.NewMetrics()
-	if err != nil {
-		return fmt.Errorf("init metrics: %w", err)
-	}
-
-	built, err := Build(rootCtx, cfg, log, "migrations", metrics)
+	built, err := Build(rootCtx, cfg, log, "migrations")
 	if err != nil {
 		return err
 	}
 	defer built.DB.Close()
 
 	if *migrateOnly {
+		built.Service.Shutdown()
 		log.Info("migrations applied; exiting")
 		return nil
 	}
 
+	var wg sync.WaitGroup
+	server, listenErr := startHTTPServer(cfg, built.Router, log, &wg, cancel)
+	startWorkers(rootCtx, built, cfg, log, &wg)
+	awaitShutdownAndStop(rootCtx, server, built.Service, cfg, &wg, log)
+
+	// a fatal listen failure must exit non-zero, not 0
+	select {
+	case err := <-listenErr:
+		return fmt.Errorf("http server failed: %w", err)
+	default:
+		return nil
+	}
+}
+
+// startHTTPServer builds the http.Server and launches its listen goroutine.
+func startHTTPServer(cfg *config.Config, router httpstd.Handler, log *logrus.Entry, wg *sync.WaitGroup, cancel context.CancelFunc) (*httpstd.Server, <-chan error) {
 	server := &httpstd.Server{
-		Addr:         net.JoinHostPort("0.0.0.0", strconv.Itoa(cfg.HTTP.Port)),
-		Handler:      built.Router,
-		ReadTimeout:  cfg.HTTP.ReadTimeout(),
-		WriteTimeout: cfg.HTTP.WriteTimeout(),
+		Addr:              net.JoinHostPort("0.0.0.0", strconv.Itoa(cfg.HTTP.Port)),
+		Handler:           router,
+		ReadTimeout:       cfg.HTTP.ReadTimeout(),
+		ReadHeaderTimeout: httpReadHeaderTimeout,
+		WriteTimeout:      cfg.HTTP.WriteTimeout(),
+		IdleTimeout:       httpIdleTimeout,
+		MaxHeaderBytes:    httpMaxHeaderBytes,
 	}
 
-	var wg sync.WaitGroup
+	// buffered so a fatal listen error survives for Run to read after wg.Wait
+	listenErr := make(chan error, 1)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		log.WithField("addr", server.Addr).Info("http server listening")
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, httpstd.ErrServerClosed) {
 			log.WithError(err).Error("http server stopped")
+			listenErr <- err
 			cancel()
 		}
 	}()
 
+	return server, listenErr
+}
+
+// startWorkers launches the escalation worker and, if configured, the IMAP poller.
+func startWorkers(rootCtx context.Context, built *BuiltApp, cfg *config.Config, log *logrus.Entry, wg *sync.WaitGroup) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		service.NewEscalationWorker(built.Service, cfg.Escalation.Interval(), log).Run(rootCtx)
 	}()
-
 	if built.Poller != nil {
 		wg.Add(1)
 		go func() {
@@ -125,7 +139,10 @@ func Run() error {
 			built.Poller.Run(rootCtx)
 		}()
 	}
+}
 
+// awaitShutdownAndStop blocks until rootCtx is done, then gracefully stops the server and service.
+func awaitShutdownAndStop(rootCtx context.Context, server *httpstd.Server, svc *service.SubmissionsService, cfg *config.Config, wg *sync.WaitGroup, log *logrus.Entry) {
 	<-rootCtx.Done()
 	log.Info("shutdown signal received")
 
@@ -136,7 +153,6 @@ func Run() error {
 	}
 
 	wg.Wait()
-	built.Service.Shutdown()
+	svc.Shutdown()
 	log.Info("shutdown complete")
-	return nil
 }

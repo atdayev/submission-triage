@@ -3,6 +3,7 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sirupsen/logrus"
 
@@ -304,5 +306,116 @@ func TestAnthropic_NoCandidates_RejectedLocally(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "no candidates") {
 		t.Errorf("error should mention no candidates: %v", err)
+	}
+}
+
+func classifyText(t *testing.T, text string) (ClassificationResponse, error) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{
+			"content": []map[string]any{{"type": "text", "text": text}},
+			"usage":   map[string]int{"input_tokens": 1, "output_tokens": 1},
+		})
+	}))
+	defer srv.Close()
+	c := testClient(t, srv.URL)
+	return c.Classify(context.Background(), ClassificationRequest{
+		Candidates: []ClassificationCandidate{{ID: "x", Description: "y"}},
+	})
+}
+
+func TestAnthropic_Classify_NotJSON(t *testing.T) {
+	_, err := classifyText(t, "not json")
+	if err == nil {
+		t.Fatal("expected parse error for non-JSON output")
+	}
+}
+
+func TestAnthropic_Classify_TrailingProse(t *testing.T) {
+	resp, err := classifyText(t, `{"candidate_id":"acord_125","confidence":0.8} note: {x}`)
+	if err != nil {
+		t.Fatalf("Classify: %v", err)
+	}
+	if resp.CandidateID != "acord_125" || resp.Confidence != 0.8 {
+		t.Errorf("parsed wrong object: %+v", resp)
+	}
+}
+
+func TestAnthropic_Classify_ConfidenceClamped(t *testing.T) {
+	for _, tc := range []struct {
+		raw  float64
+		want float64
+	}{{5.0, 1.0}, {-1.0, 0.0}} {
+		resp, err := classifyText(t, fmt.Sprintf(`{"candidate_id":"x","confidence":%v}`, tc.raw))
+		if err != nil {
+			t.Fatalf("Classify(%v): %v", tc.raw, err)
+		}
+		if resp.Confidence != tc.want {
+			t.Errorf("confidence %v: got %v, want %v", tc.raw, resp.Confidence, tc.want)
+		}
+	}
+}
+
+func TestAnthropic_ExtractField_TextOnly_NilValue(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{
+			"content": []map[string]any{{"type": "text", "text": "I could not find the field."}},
+			"usage":   map[string]int{"input_tokens": 5, "output_tokens": 3},
+		})
+	}))
+	defer srv.Close()
+
+	c := testClient(t, srv.URL)
+	resp, err := c.ExtractField(context.Background(), FieldExtractionRequest{
+		FieldName: "years_covered",
+		FieldType: "number",
+	})
+	if err != nil {
+		t.Fatalf("ExtractField: %v", err)
+	}
+	if resp.Value != nil {
+		t.Errorf("value: got %v, want nil", resp.Value)
+	}
+	if resp.Usage.InputTokens != 5 {
+		t.Errorf("usage: %+v", resp.Usage)
+	}
+}
+
+func TestAnthropic_ExtractField_NumberFromString(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{
+			"content": []map[string]any{{
+				"type":  "tool_use",
+				"name":  "report_field",
+				"input": map[string]any{"value": "7", "confidence": 0.9},
+			}},
+			"usage": map[string]int{"input_tokens": 1, "output_tokens": 1},
+		})
+	}))
+	defer srv.Close()
+
+	c := testClient(t, srv.URL)
+	resp, err := c.ExtractField(context.Background(), FieldExtractionRequest{
+		FieldName: "years_covered",
+		FieldType: "number",
+	})
+	if err != nil {
+		t.Fatalf("ExtractField: %v", err)
+	}
+	if resp.Value != 7.0 {
+		t.Errorf("value: got %v (%T), want 7.0 (float64)", resp.Value, resp.Value)
+	}
+}
+
+func TestTruncate_RuneBoundary(t *testing.T) {
+	// 3-byte runes: the cut at maxTextSampleBytes (a power of two) lands mid-rune,
+	// so a byte-naive truncate would yield invalid UTF-8
+	s := strings.Repeat("世", 2000)
+	out := truncate(s, maxTextSampleBytes)
+	if !utf8.ValidString(out) {
+		t.Error("truncate split a multi-byte rune")
+	}
+	if !strings.HasSuffix(out, "...[truncated]") {
+		t.Error("missing truncation marker")
 	}
 }

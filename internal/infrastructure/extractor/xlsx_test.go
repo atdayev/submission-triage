@@ -71,7 +71,7 @@ func TestXLSX_NonXLSXBytes_Error(t *testing.T) {
 
 func TestXLSX_RowCapEnforced(t *testing.T) {
 	f := excelize.NewFile()
-	// Write more rows than the cap so extraction must truncate.
+	// write more rows than the cap so extraction must truncate
 	total := maxXLSXRows + 500
 	for i := 1; i <= total; i++ {
 		if err := f.SetCellValue("Sheet1", "A"+itoa(i), "row"); err != nil {

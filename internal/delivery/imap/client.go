@@ -14,12 +14,16 @@ import (
 	"github.com/atdayev/submission-triage/internal/config"
 )
 
-const imapDialTimeout = 20 * time.Second
+const (
+	imapDialTimeout = 20 * time.Second
+	maxProbeWindow  = 500      // max RFC822.SIZE probes per tick
+	maxBatchBytes   = 64 << 20 // max raw bytes fetched per poll
+)
 
-// fullMessage is BODY.PEEK[]: the whole message, PEEK so the server leaves \Seen alone
+// fullMessage is BODY.PEEK[]: whole message, no \Seen side effect.
 var fullMessage = &goimap.FetchItemBodySection{Peek: true}
 
-// dialClient opens the transport; a var so tests can swap in a plaintext dial.
+// dialClient opens the TLS transport.
 var dialClient = func(addr string) (*imapclient.Client, error) {
 	return imapclient.DialTLS(addr, &imapclient.Options{
 		Dialer: &net.Dialer{Timeout: imapDialTimeout},
@@ -43,7 +47,7 @@ func dialIMAP(cfg config.IMAPConfig, log *logrus.Entry) func(ctx context.Context
 			return nil, fmt.Errorf("imap dial: %w", err)
 		}
 		mb := &imapMailbox{c: c, maxBytes: cfg.MaxMessageBytes(), log: log, stop: make(chan struct{})}
-		// close the connection on ctx cancel so an in-flight command unblocks at shutdown
+		// close on ctx cancel to unblock an in-flight command at shutdown
 		go mb.closeOnCancel(ctx)
 		if err := c.Login(cfg.Username, cfg.Password).Wait(); err != nil {
 			_ = mb.Close()
@@ -65,6 +69,7 @@ func (m *imapMailbox) closeOnCancel(ctx context.Context) {
 	}
 }
 
+// FetchUnseen returns unseen messages, size-filtered and capped by limit.
 func (m *imapMailbox) FetchUnseen(ctx context.Context, limit int) ([]rawMessage, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -78,6 +83,10 @@ func (m *imapMailbox) FetchUnseen(ctx context.Context, limit int) ([]rawMessage,
 	uids := data.AllUIDs()
 	if len(uids) == 0 {
 		return nil, nil
+	}
+	// bound per-tick probe work on a large backlog
+	if len(uids) > maxProbeWindow {
+		uids = uids[:maxProbeWindow]
 	}
 
 	// filter by size before the limit so over-cap mail can't starve the batch
@@ -108,9 +117,8 @@ func (m *imapMailbox) FetchUnseen(ctx context.Context, limit int) ([]rawMessage,
 	return out, nil
 }
 
-// underCap returns the UIDs whose server-reported size is within maxBytes,
-// fetching only RFC822.SIZE (no bodies). A zero cap keeps everything. Over-cap
-// messages are marked seen so they don't recur every poll.
+// underCap returns the UIDs within maxBytes (probing RFC822.SIZE only); over-cap
+// messages are marked seen, and the kept set is bounded by maxBatchBytes.
 func (m *imapMailbox) underCap(ctx context.Context, uids []goimap.UID) []goimap.UID {
 	if m.maxBytes <= 0 {
 		return uids
@@ -124,23 +132,29 @@ func (m *imapMailbox) underCap(ctx context.Context, uids []goimap.UID) []goimap.
 		return uids
 	}
 	keep := make([]goimap.UID, 0, len(sizes))
+	var batchBytes int64
 	for _, s := range sizes {
 		if s.RFC822Size > m.maxBytes {
 			m.log.WithFields(logrus.Fields{
 				"uid":  uint32(s.UID),
 				"size": s.RFC822Size,
 				"max":  m.maxBytes,
-			}).Warn("imap: message over size cap; marking seen")
+			}).Warn("imap: message over size cap; marking read")
 			if err := m.MarkSeen(ctx, uint32(s.UID)); err != nil {
 				m.log.WithError(err).WithField("uid", uint32(s.UID)).Warn("imap: mark over-cap seen failed")
 			}
 			continue
 		}
+		if len(keep) > 0 && batchBytes+s.RFC822Size > maxBatchBytes {
+			break // defer the rest to the next poll to bound memory
+		}
+		batchBytes += s.RFC822Size
 		keep = append(keep, s.UID)
 	}
 	return keep
 }
 
+// MarkSeen adds the \Seen flag to the message with the given UID.
 func (m *imapMailbox) MarkSeen(_ context.Context, uid uint32) error {
 	return m.c.Store(goimap.UIDSetNum(goimap.UID(uid)), &goimap.StoreFlags{
 		Op:     goimap.StoreFlagsAdd,
@@ -149,6 +163,7 @@ func (m *imapMailbox) MarkSeen(_ context.Context, uid uint32) error {
 	}, nil).Close()
 }
 
+// Close logs out and tears down the connection.
 func (m *imapMailbox) Close() error {
 	m.stopOnce.Do(func() { close(m.stop) })
 	_ = m.c.Logout().Wait()

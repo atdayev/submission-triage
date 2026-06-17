@@ -11,14 +11,12 @@ import (
 	"github.com/atdayev/submission-triage/internal/model"
 	"github.com/atdayev/submission-triage/internal/repository"
 	repomocks "github.com/atdayev/submission-triage/internal/repository/mocks"
-	"github.com/atdayev/submission-triage/pkg/telemetry"
 )
 
 func outboxSvc(ob repository.OutboxRepository, mail *fakeMail, subs *repomocks.SubmissionRepository, aud *repomocks.AuditRepository, maxAttempts int) *SubmissionsService {
 	return &SubmissionsService{
 		repo:              &repository.Repository{Submissions: subs, Audit: aud, Outbox: ob},
 		mail:              mail,
-		metrics:           telemetry.NoopMetrics(),
 		now:               time.Now,
 		log:               logrus.NewEntry(logrus.New()),
 		outboxRetryAfter:  0,
@@ -79,6 +77,44 @@ func TestRedeliverOutbox_RetriesThenDeadLetters(t *testing.T) {
 	}
 	if !deadLettered {
 		t.Error("expected a dead-lettered reply.failed audit")
+	}
+}
+
+// The sweeper backs off entries updated within outboxRetryAfter so it can't
+// double-dispatch one the online sender just enqueued.
+func TestRedeliverOutbox_RetryWindowBacksOffRecentEntry(t *testing.T) {
+	ctx := context.Background()
+	ob := newFakeOutbox()
+	subs := repomocks.NewSubmissionRepository(t)
+	subs.On("UpsertEmail", mock.Anything, mock.Anything).Return(nil).Maybe()
+	aud := repomocks.NewAuditRepository(t)
+	aud.On("Append", mock.Anything, mock.Anything).Return(nil).Maybe()
+	mail := &fakeMail{}
+	svc := outboxSvc(ob, mail, subs, aud, 3)
+
+	// a controlled clock shared by the service and the fake outbox
+	base := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	nowVal := base
+	clk := func() time.Time { return nowVal }
+	svc.setClock(clk)
+	ob.now = clk
+	svc.outboxRetryAfter = 2 * time.Minute
+
+	_ = ob.Enqueue(ctx, &model.OutboxEntry{SubmissionID: "s1", Reply: model.Reply{ToAddress: "broker@x", Subject: "re"}})
+
+	if err := svc.RedeliverOutbox(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if mail.sentCount() != 0 {
+		t.Fatalf("sweeper sent a freshly-enqueued entry inside the retry window: %d", mail.sentCount())
+	}
+
+	nowVal = base.Add(3 * time.Minute) // past the window
+	if err := svc.RedeliverOutbox(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if mail.sentCount() != 1 {
+		t.Fatalf("sweeper should deliver after the retry window: got %d", mail.sentCount())
 	}
 }
 

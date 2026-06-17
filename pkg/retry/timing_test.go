@@ -17,8 +17,8 @@ func TestDo_BackoffDoubles(t *testing.T) {
 		attempts  = 4
 		baseDelay = 10 * time.Millisecond
 		minTotal  = 70 * time.Millisecond
-		// Flat-no-doubling would land at 30ms; we want to fail on regression.
-		// Upper bound allows scheduler slop on slow CI.
+		// flat-no-doubling would land at 30ms; we want to fail on regression
+		// upper bound allows scheduler slop on slow CI
 		maxTotal = 500 * time.Millisecond
 	)
 

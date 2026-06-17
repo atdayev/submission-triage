@@ -37,6 +37,54 @@ func TestRecovery_PanicReturns500AndLogs(t *testing.T) {
 	}
 }
 
+func TestRecovery_AbortHandlerRepanics(t *testing.T) {
+	aborter := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		panic(http.ErrAbortHandler)
+	})
+	chain := withRecovery()(aborter)
+
+	defer func() {
+		if rec := recover(); rec != http.ErrAbortHandler {
+			t.Fatalf("recovered = %v, want ErrAbortHandler re-panic", rec)
+		}
+	}()
+	chain.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/x", nil))
+}
+
+func TestRecovery_NoSuperfluousWriteHeaderAfterPartialWrite(t *testing.T) {
+	lg, _ := test.NewNullLogger()
+	log := logrus.NewEntry(lg)
+
+	partial := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("partial"))
+		panic("boom")
+	})
+	chain := withRequestID(log)(withRecovery()(partial))
+
+	rec := httptest.NewRecorder()
+	w := &headerCountWriter{ResponseWriter: rec}
+	chain.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/x", nil))
+
+	// the partial write already committed the response; recovery must skip the 500
+	// (an explicit WriteHeader here is the only one that reaches headerCountWriter)
+	if w.writeHeaders != 0 {
+		t.Errorf("WriteHeader(500) called after a partial write; expected it to be skipped (count=%d)", w.writeHeaders)
+	}
+	if rec.Body.String() != "partial" {
+		t.Errorf("partial body clobbered by recovery: %q", rec.Body.String())
+	}
+}
+
+type headerCountWriter struct {
+	http.ResponseWriter
+	writeHeaders int
+}
+
+func (h *headerCountWriter) WriteHeader(s int) {
+	h.writeHeaders++
+	h.ResponseWriter.WriteHeader(s)
+}
+
 func TestRequestID_ValidUUIDHonored(t *testing.T) {
 	lg := logrus.New()
 	lg.SetOutput(discardWriter{})
@@ -76,7 +124,7 @@ func TestRequestID_InvalidHeaderReplaced(t *testing.T) {
 	if strings.Contains(got, "drop table") {
 		t.Errorf("malicious header propagated: %q", got)
 	}
-	// Should be a regenerated UUID — 36 chars with hyphens at the right spots.
+	// should be a regenerated UUID — 36 chars with hyphens at the right spots
 	if len(got) != 36 || got[8] != '-' || got[13] != '-' || got[18] != '-' || got[23] != '-' {
 		t.Errorf("expected UUID-shape replacement, got %q", got)
 	}

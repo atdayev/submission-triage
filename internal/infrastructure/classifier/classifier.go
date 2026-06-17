@@ -9,10 +9,12 @@ import (
 	"github.com/atdayev/submission-triage/pkg/glob"
 )
 
+// Classifier maps a submission to a checklist item.
 type Classifier interface {
 	Classify(ctx context.Context, in Input) (Result, error)
 }
 
+// Input is a submission to classify against a policy checklist.
 type Input struct {
 	Filename    string
 	ContentType string
@@ -21,6 +23,7 @@ type Input struct {
 	Checklist   model.Checklist
 }
 
+// Result is the matched checklist item with confidence and source.
 type Result struct {
 	CandidateID string
 	Confidence  float64
@@ -29,14 +32,17 @@ type Result struct {
 	Usage       *llm.Usage
 }
 
+// HeuristicLLMClassifier matches by filename and content, then falls back to an LLM.
 type HeuristicLLMClassifier struct {
 	llmClient llm.Client
 }
 
+// NewHeuristicLLMClassifier returns a classifier that falls back to client when heuristics miss.
 func NewHeuristicLLMClassifier(client llm.Client) *HeuristicLLMClassifier {
 	return &HeuristicLLMClassifier{llmClient: client}
 }
 
+// Classify matches in against its checklist, using the LLM only when heuristics are ambiguous.
 func (c *HeuristicLLMClassifier) Classify(ctx context.Context, in Input) (Result, error) {
 	byName := matchByFilename(in)
 	if r, ok := singleMatch(byName, 0.95, "filename match"); ok {
@@ -64,8 +70,10 @@ func (c *HeuristicLLMClassifier) Classify(ctx context.Context, in Input) (Result
 
 func (c *HeuristicLLMClassifier) classifyByLLM(ctx context.Context, in Input) (Result, error) {
 	candidates := make([]llm.ClassificationCandidate, 0, len(in.Checklist.Required))
+	candidateIDs := make(map[string]bool, len(in.Checklist.Required))
 	for _, item := range in.Checklist.Required {
 		candidates = append(candidates, llm.ClassificationCandidate{ID: item.ID, Description: item.Description})
+		candidateIDs[item.ID] = true
 	}
 
 	resp, err := c.llmClient.Classify(ctx, llm.ClassificationRequest{
@@ -81,6 +89,9 @@ func (c *HeuristicLLMClassifier) classifyByLLM(ctx context.Context, in Input) (R
 	usage := resp.Usage
 	if resp.CandidateID == "" || resp.CandidateID == "unknown" {
 		return Result{Confidence: resp.Confidence, By: "llm", Reason: resp.Reason, Usage: &usage}, nil
+	}
+	if !candidateIDs[resp.CandidateID] {
+		return Result{Confidence: resp.Confidence, By: "llm", Reason: "llm returned unknown candidate id", Usage: &usage}, nil
 	}
 	return Result{CandidateID: resp.CandidateID, Confidence: resp.Confidence, By: "llm", Reason: resp.Reason, Usage: &usage}, nil
 }

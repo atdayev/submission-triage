@@ -23,10 +23,7 @@ import (
 	"github.com/atdayev/submission-triage/internal/model"
 	"github.com/atdayev/submission-triage/internal/repository"
 	"github.com/atdayev/submission-triage/pkg/logger"
-	"github.com/atdayev/submission-triage/pkg/telemetry"
-
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/metric"
+	"github.com/atdayev/submission-triage/pkg/textutil"
 )
 
 var policyAliases = []struct {
@@ -43,12 +40,14 @@ var policyAliases = []struct {
 	{"cyber", "cyber_liability"},
 }
 
+// TextExtractor extracts text from a document's raw bytes.
 type TextExtractor interface {
 	Extract(data []byte) (string, error)
 }
 
 type clock func() time.Time
 
+// Dependencies are the collaborators a SubmissionsService needs.
 type Dependencies struct {
 	Config         *config.Config
 	Repository     *repository.Repository
@@ -57,10 +56,10 @@ type Dependencies struct {
 	ChecklistStore checklist.Store
 	TextExtractors map[string]TextExtractor
 	LLM            llm.Client
-	Metrics        *telemetry.Metrics
 	Log            *logrus.Entry
 }
 
+// SubmissionsService ingests emails, evaluates checklists, and dispatches replies.
 type SubmissionsService struct {
 	cfg        *config.Config
 	repo       *repository.Repository
@@ -69,7 +68,6 @@ type SubmissionsService struct {
 	checklists checklist.Store
 	extractors map[string]TextExtractor
 	llm        llm.Client
-	metrics    *telemetry.Metrics
 	now        clock
 	log        *logrus.Entry
 	ingestSF   singleflight.Group
@@ -88,6 +86,9 @@ type SubmissionsService struct {
 
 	dispatchMu  sync.Mutex
 	dispatching map[string]struct{} // outbox ids in flight; the sweeper skips them
+
+	enqueueMu sync.RWMutex // serializes reply enqueue against Shutdown
+	closed    bool         // set at Shutdown; guards the replyJobs channel
 }
 
 const (
@@ -95,7 +96,10 @@ const (
 	defaultOutboxRetryAfter  = 2 * time.Minute
 	defaultOutboxMaxAttempts = 10
 	defaultOutboxBatch       = 100
+	markSentTimeout          = 2 * time.Second // detached mark-sent: bounds shutdown overrun
 )
+
+const maxExtractedTextBytes = 256 << 10 // bound stored per-document extracted text
 
 type replyJob struct {
 	ctx          context.Context
@@ -104,6 +108,7 @@ type replyJob struct {
 	outboxID     string
 }
 
+// IngestRequest is a single inbound email to ingest.
 type IngestRequest struct {
 	MessageID   string
 	InReplyTo   string
@@ -118,6 +123,7 @@ type IngestRequest struct {
 	Source      string
 }
 
+// IngestResult is the outcome of ingesting one email.
 type IngestResult struct {
 	SubmissionID string
 	State        model.State
@@ -126,6 +132,15 @@ type IngestResult struct {
 	ReplyQueued  bool
 }
 
+// auditCollector buffers an ingest's audit entries until the submission commits,
+// keeping a failed, retried ingest from leaving orphan rows.
+type auditCollector struct {
+	entries []*model.AuditEntry
+}
+
+type auditCollectorKey struct{}
+
+// NewSubmissionsService builds the service and starts its reply workers.
 func NewSubmissionsService(d Dependencies) *SubmissionsService {
 	workers := d.Config.Reply.Workers
 	if workers <= 0 {
@@ -135,10 +150,6 @@ func NewSubmissionsService(d Dependencies) *SubmissionsService {
 	if queue <= 0 {
 		queue = 64
 	}
-	metrics := d.Metrics
-	if metrics == nil {
-		metrics = telemetry.NoopMetrics()
-	}
 	s := &SubmissionsService{
 		cfg:         d.Config,
 		repo:        d.Repository,
@@ -147,7 +158,6 @@ func NewSubmissionsService(d Dependencies) *SubmissionsService {
 		checklists:  d.ChecklistStore,
 		extractors:  d.TextExtractors,
 		llm:         d.LLM,
-		metrics:     metrics,
 		now:         time.Now,
 		log:         d.Log,
 		replyJobs:   make(chan replyJob, queue),
@@ -195,7 +205,10 @@ func (s *SubmissionsService) dispatchOnline(job replyJob) {
 		s.audit(job.ctx, job.submissionID, model.EventReplyFailed, map[string]any{"error": err.Error()})
 		return
 	}
-	if err := s.repo.Outbox.Update(job.ctx, job.outboxID, model.OutboxSent, 0, ""); err != nil {
+	// record the send even if the request/shutdown ctx is canceled, else it resends
+	markCtx, cancel := context.WithTimeout(context.WithoutCancel(job.ctx), markSentTimeout)
+	defer cancel()
+	if err := s.repo.Outbox.Update(markCtx, job.outboxID, model.OutboxSent, 0, ""); err != nil {
 		s.log.WithError(err).WithField("outbox_id", job.outboxID).Warn("mark outbox sent failed")
 	}
 }
@@ -222,100 +235,60 @@ func (s *SubmissionsService) isDispatching(id string) bool {
 	return ok
 }
 
+// enqueueReply hands a job to the worker pool. Returns false if the pool is
+// shutting down or its queue is full, leaving the row for the outbox sweeper.
+func (s *SubmissionsService) enqueueReply(job replyJob) bool {
+	s.enqueueMu.RLock()
+	defer s.enqueueMu.RUnlock()
+	if s.closed {
+		return false
+	}
+	s.claimDispatch(job.outboxID)
+	s.inFlightWG.Add(1)
+	select {
+	case s.replyJobs <- job:
+		return true
+	default:
+		s.releaseDispatch(job.outboxID)
+		s.inFlightWG.Done()
+		return false
+	}
+}
+
 func (s *SubmissionsService) setClock(c clock) { s.now = c }
 
+// IngestEmail ingests one email, deduping concurrent deliveries of the same message.
 func (s *SubmissionsService) IngestEmail(ctx context.Context, req IngestRequest) (IngestResult, error) {
 	if req.ReceivedAt.IsZero() {
 		req.ReceivedAt = s.now()
 	}
 
 	emailID := computeEmailID(req.MessageID, req.BodyText, req.Attachments)
-	start := time.Now()
 
 	// collapse parallel deliveries of the same email, else duplicate rows
 	v, err, _ := s.ingestSF.Do(emailID, func() (any, error) {
 		return s.ingestEmailInner(ctx, req, emailID)
 	})
-
-	s.metrics.IngestDuration.Record(ctx, time.Since(start).Seconds())
 	if err != nil {
-		s.metrics.IngestTotal.Add(ctx, 1, metric.WithAttributes(
-			attribute.String("state", "error"),
-		))
 		return IngestResult{}, err
 	}
-	result := v.(IngestResult)
-	s.metrics.IngestTotal.Add(ctx, 1, metric.WithAttributes(
-		attribute.String("state", string(result.State)),
-		attribute.Bool("duplicate", result.IsDuplicate),
-	))
-	return result, nil
+	return v.(IngestResult), nil
 }
 
 func (s *SubmissionsService) ingestEmailInner(ctx context.Context, req IngestRequest, emailID string) (IngestResult, error) {
-	refs := cleanThreadRefs(req.MessageID, req.InReplyTo, req.References)
-	sub, ambiguous, err := s.repo.Submissions.FindByEmailReference(ctx, refs)
-	switch {
-	case err == nil:
-		for _, e := range sub.Emails {
-			if e.DeterministicID == emailID {
-				s.audit(ctx, sub.ID, model.EventEmailDuplicate, map[string]any{
-					"deterministic_id": emailID,
-					"source":           req.Source,
-				})
-				return IngestResult{
-					SubmissionID: sub.ID,
-					State:        sub.State,
-					IsDuplicate:  true,
-				}, nil
-			}
-		}
-		if ambiguous {
-			s.audit(ctx, sub.ID, model.EventThreadAmbiguous, map[string]any{
-				"refs": refs,
-			})
-		}
-		s.audit(ctx, sub.ID, model.EventThreadMatched, map[string]any{
-			"matched_by": "thread_headers",
-			"message_id": req.MessageID,
-		})
-	case errors.Is(err, model.ErrSubmissionNotFound):
-		// no thread headers: dedup on the deterministic id so a redelivered
-		// header-less email isn't reprocessed into a second submission/reply
-		if len(refs) == 0 {
-			if existing, dErr := s.repo.Submissions.FindByDeterministicID(ctx, emailID); dErr == nil {
-				s.audit(ctx, existing.ID, model.EventEmailDuplicate, map[string]any{
-					"deterministic_id": emailID,
-					"source":           req.Source,
-				})
-				return IngestResult{SubmissionID: existing.ID, State: existing.State, IsDuplicate: true}, nil
-			} else if !errors.Is(dErr, model.ErrSubmissionNotFound) {
-				return IngestResult{}, fmt.Errorf("dedup by deterministic id: %w", dErr)
-			}
-		}
-		sub, err = s.createSubmission(ctx, req)
-		if err != nil {
-			return IngestResult{}, fmt.Errorf("create submission: %w", err)
-		}
-	default:
-		return IngestResult{}, fmt.Errorf("find by reference: %w", err)
+	collector := &auditCollector{}
+	ctx = context.WithValue(ctx, auditCollectorKey{}, collector)
+
+	sub, dup, err := s.resolveSubmission(ctx, req, emailID)
+	if err != nil {
+		return IngestResult{}, err
+	}
+	if dup != nil {
+		s.flushAudit(ctx, collector)
+		return *dup, nil
 	}
 
-	inbound := model.Email{
-		DeterministicID: emailID,
-		SubmissionID:    sub.ID,
-		Direction:       model.DirectionInbound,
-		MessageID:       req.MessageID,
-		InReplyTo:       req.InReplyTo,
-		References:      req.References,
-		FromAddress:     req.FromAddress,
-		FromName:        req.FromName,
-		ToAddresses:     req.ToAddresses,
-		Subject:         req.Subject,
-		BodyText:        req.BodyText,
-		ReceivedAt:      req.ReceivedAt,
-		Attachments:     req.Attachments,
-	}
+	inbound := inboundEmail(req, emailID, sub.ID)
 	sub.AttachEmail(inbound)
 	sub.MarkAction(s.now())
 
@@ -326,55 +299,10 @@ func (s *SubmissionsService) ingestEmailInner(ctx context.Context, req IngestReq
 		"source":           req.Source,
 	})
 
-	checklistDef, hasChecklist := s.checklists.Get(sub.PolicyType)
-	policyUnknown := !hasChecklist
-	if policyUnknown {
-		sub.PolicyType = model.PolicyTypeUnknown
-		s.audit(ctx, sub.ID, model.EventPolicyUnknown, map[string]any{
-			"subject_hint": req.Subject,
-		})
-	} else {
-		docs := s.classifyAttachments(ctx, sub, inbound, checklistDef)
-		for _, d := range docs {
-			sub.AttachDocument(d)
-		}
-	}
+	missing, policyUnknown := s.evaluate(ctx, sub, inbound)
 
-	var missing []model.MissingItem
-	if !policyUnknown {
-		missing = model.EvaluateChecklist(*sub, checklistDef)
-	} else {
-		missing = []model.MissingItem{{
-			ID:          "policy_unknown",
-			Description: "Policy type not yet determined",
-			Reason:      "awaiting clarification from sender",
-		}}
-	}
-	sub.MissingItems = missing
-	missingIDs := make([]string, 0, len(missing))
-	for _, m := range missing {
-		missingIDs = append(missingIDs, m.ID)
-	}
-
-	s.audit(ctx, sub.ID, model.EventChecklistEvaluated, map[string]any{
-		"policy_type":   sub.PolicyType,
-		"missing_count": len(missing),
-		"missing_ids":   missingIDs,
-	})
-
-	prevState := sub.State
-	next := model.StateComplete
-	if len(missing) > 0 {
-		next = model.StateAwaiting
-	}
-	if err := sub.TransitionTo(next, s.now()); err != nil {
-		return IngestResult{}, fmt.Errorf("transition: %w", err)
-	}
-	if prevState != sub.State {
-		s.audit(ctx, sub.ID, model.EventStateTransitioned, map[string]any{
-			"from": string(prevState),
-			"to":   string(sub.State),
-		})
+	if err := s.transitionState(ctx, sub, len(missing) > 0); err != nil {
+		return IngestResult{}, err
 	}
 
 	result := IngestResult{
@@ -390,19 +318,127 @@ func (s *SubmissionsService) ingestEmailInner(ctx context.Context, req IngestReq
 		return IngestResult{}, fmt.Errorf("persist submission with reply: %w", err)
 	}
 	result.ReplyQueued = true
+	s.flushAudit(ctx, collector)
 
-	// best-effort immediate dispatch; if the channel is full the sweeper sends it
 	job := replyJob{ctx: s.replyJobContext(ctx), reply: reply, submissionID: sub.ID, outboxID: entry.ID}
-	s.claimDispatch(entry.ID)
-	s.inFlightWG.Add(1)
-	select {
-	case s.replyJobs <- job:
-	default:
-		s.releaseDispatch(entry.ID)
-		s.inFlightWG.Done()
-		s.metrics.ReplyDroppedTotal.Add(ctx, 1) // not lost: deferred to the outbox sweeper
-	}
+	// a full queue is not lost: the outbox sweeper redelivers it
+	_ = s.enqueueReply(job)
 	return result, nil
+}
+
+// resolveSubmission finds the submission this email belongs to, or creates one.
+// dup is non-nil when the email was already ingested; the caller returns it as-is.
+func (s *SubmissionsService) resolveSubmission(ctx context.Context, req IngestRequest, emailID string) (sub *model.Submission, dup *IngestResult, err error) {
+	refs := cleanThreadRefs(req.MessageID, req.InReplyTo, req.References)
+	found, ambiguous, ferr := s.repo.Submissions.FindByEmailReference(ctx, refs)
+	switch {
+	case ferr == nil:
+		for _, e := range found.Emails {
+			if e.DeterministicID == emailID {
+				s.audit(ctx, found.ID, model.EventEmailDuplicate, map[string]any{
+					"deterministic_id": emailID,
+					"source":           req.Source,
+				})
+				return nil, &IngestResult{SubmissionID: found.ID, State: found.State, IsDuplicate: true}, nil
+			}
+		}
+		if ambiguous {
+			s.audit(ctx, found.ID, model.EventThreadAmbiguous, map[string]any{"refs": refs})
+		}
+		s.audit(ctx, found.ID, model.EventThreadMatched, map[string]any{
+			"matched_by": "thread_headers",
+			"message_id": req.MessageID,
+		})
+		return found, nil, nil
+	case errors.Is(ferr, model.ErrSubmissionNotFound):
+		// dedup a redelivered email on its deterministic id before creating a new one
+		if existing, dErr := s.repo.Submissions.FindByDeterministicID(ctx, emailID); dErr == nil {
+			s.audit(ctx, existing.ID, model.EventEmailDuplicate, map[string]any{
+				"deterministic_id": emailID,
+				"source":           req.Source,
+			})
+			return nil, &IngestResult{SubmissionID: existing.ID, State: existing.State, IsDuplicate: true}, nil
+		} else if !errors.Is(dErr, model.ErrSubmissionNotFound) {
+			return nil, nil, fmt.Errorf("dedup by deterministic id: %w", dErr)
+		}
+		created, cerr := s.createSubmission(ctx, req)
+		if cerr != nil {
+			return nil, nil, fmt.Errorf("create submission: %w", cerr)
+		}
+		return created, nil, nil
+	default:
+		return nil, nil, fmt.Errorf("find by reference: %w", ferr)
+	}
+}
+
+// inboundEmail maps an ingest request to the stored inbound email record.
+func inboundEmail(req IngestRequest, emailID, submissionID string) model.Email {
+	return model.Email{
+		DeterministicID: emailID,
+		SubmissionID:    submissionID,
+		Direction:       model.DirectionInbound,
+		MessageID:       req.MessageID,
+		InReplyTo:       req.InReplyTo,
+		References:      req.References,
+		FromAddress:     req.FromAddress,
+		FromName:        req.FromName,
+		ToAddresses:     req.ToAddresses,
+		Subject:         req.Subject,
+		BodyText:        req.BodyText,
+		ReceivedAt:      req.ReceivedAt,
+		Attachments:     req.Attachments,
+	}
+}
+
+// evaluate classifies the inbound attachments, runs the checklist, and records
+// the result. policyUnknown means no checklist matched the policy type.
+func (s *SubmissionsService) evaluate(ctx context.Context, sub *model.Submission, inbound model.Email) (missing []model.MissingItem, policyUnknown bool) {
+	checklistDef, hasChecklist := s.checklists.Get(sub.PolicyType)
+	policyUnknown = !hasChecklist
+	if policyUnknown {
+		sub.PolicyType = model.PolicyTypeUnknown
+		s.audit(ctx, sub.ID, model.EventPolicyUnknown, map[string]any{"subject_hint": inbound.Subject})
+		missing = []model.MissingItem{{
+			ID:          "policy_unknown",
+			Description: "Policy type not yet determined",
+			Reason:      "awaiting clarification from sender",
+		}}
+	} else {
+		for _, d := range s.classifyAttachments(ctx, sub, inbound, checklistDef) {
+			sub.AttachDocument(d)
+		}
+		missing = model.EvaluateChecklist(*sub, checklistDef)
+	}
+	sub.MissingItems = missing
+	missingIDs := make([]string, 0, len(missing))
+	for _, m := range missing {
+		missingIDs = append(missingIDs, m.ID)
+	}
+	s.audit(ctx, sub.ID, model.EventChecklistEvaluated, map[string]any{
+		"policy_type":   sub.PolicyType,
+		"missing_count": len(missing),
+		"missing_ids":   missingIDs,
+	})
+	return missing, policyUnknown
+}
+
+// transitionState moves the submission to complete or awaiting and audits the change.
+func (s *SubmissionsService) transitionState(ctx context.Context, sub *model.Submission, hasMissing bool) error {
+	prev := sub.State
+	next := model.StateComplete
+	if hasMissing {
+		next = model.StateAwaiting
+	}
+	if err := sub.TransitionTo(next, s.now()); err != nil {
+		return fmt.Errorf("transition: %w", err)
+	}
+	if prev != sub.State {
+		s.audit(ctx, sub.ID, model.EventStateTransitioned, map[string]any{
+			"from": string(prev),
+			"to":   string(sub.State),
+		})
+	}
+	return nil
 }
 
 // Wait blocks until queued replies finish. Re-entrant; doesn't stop the pool.
@@ -411,6 +447,14 @@ func (s *SubmissionsService) Wait() { s.inFlightWG.Wait() }
 // Shutdown drains queued replies, then stops the workers. Call once. Past the
 // grace window, in-flight sends are canceled so the process still exits.
 func (s *SubmissionsService) Shutdown() {
+	s.enqueueMu.Lock()
+	if s.closed {
+		s.enqueueMu.Unlock()
+		return
+	}
+	s.closed = true
+	s.enqueueMu.Unlock()
+
 	defer s.replyCancel()
 	drained := make(chan struct{})
 	go func() {
@@ -455,10 +499,8 @@ func (s *SubmissionsService) buildReply(sub *model.Submission, missing []model.M
 func (s *SubmissionsService) deliver(ctx context.Context, reply model.Reply, submissionID string) error {
 	providerMsgID, err := s.mail.SendThreadedReply(ctx, reply)
 	if err != nil {
-		s.metrics.ReplySendTotal.Add(ctx, 1, metric.WithAttributes(attribute.String("status", "failed")))
 		return err
 	}
-	s.metrics.ReplySendTotal.Add(ctx, 1, metric.WithAttributes(attribute.String("status", "success")))
 	outbound := outboundEmail(reply, providerMsgID, s.now())
 	if err := s.repo.Submissions.UpsertEmail(ctx, &outbound); err != nil {
 		s.log.WithError(err).WithField("submission_id", submissionID).Warn("outbound email upsert failed")
@@ -473,8 +515,7 @@ func (s *SubmissionsService) deliver(ctx context.Context, reply model.Reply, sub
 }
 
 // RedeliverOutbox resends pending replies the online path didn't get out
-// (overflow, crash, provider outage). Entries are dead-lettered after
-// outboxMaxAttempts. Run periodically by the escalation worker.
+// (overflow, crash, outage), dead-lettering entries after outboxMaxAttempts.
 func (s *SubmissionsService) RedeliverOutbox(ctx context.Context) error {
 	cutoff := s.now().Add(-s.outboxRetryAfter)
 	rows, err := s.repo.Outbox.ListPending(ctx, cutoff, s.outboxBatch)
@@ -482,6 +523,9 @@ func (s *SubmissionsService) RedeliverOutbox(ctx context.Context) error {
 		return fmt.Errorf("outbox: list pending: %w", err)
 	}
 	for _, row := range rows {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if s.isDispatching(row.ID) {
 			continue
 		}
@@ -502,6 +546,7 @@ func (s *SubmissionsService) RedeliverOutbox(ctx context.Context) error {
 	return nil
 }
 
+// CheckEscalations escalates submissions idle past their policy's threshold.
 func (s *SubmissionsService) CheckEscalations(ctx context.Context) error {
 	now := s.now()
 	globalThreshold := s.cfg.Escalation.Threshold()
@@ -534,9 +579,6 @@ func (s *SubmissionsService) CheckEscalations(ctx context.Context) error {
 			s.log.WithError(err).WithField("submission_id", sub.ID).Warn("escalation upsert failed")
 			continue
 		}
-		s.metrics.EscalatedTotal.Add(ctx, 1, metric.WithAttributes(
-			attribute.String("policy_type", sub.PolicyType),
-		))
 		s.audit(ctx, sub.ID, model.EventEscalated, map[string]any{
 			"last_action_at": sub.LastActionAt,
 			"threshold":      threshold.String(),
@@ -545,6 +587,7 @@ func (s *SubmissionsService) CheckEscalations(ctx context.Context) error {
 	return nil
 }
 
+// CheckClosures auto-closes completed and escalated submissions gone quiet.
 func (s *SubmissionsService) CheckClosures(ctx context.Context) error {
 	autoClose := s.cfg.Escalation.AutoCloseAfter()
 	if autoClose <= 0 {
@@ -552,27 +595,42 @@ func (s *SubmissionsService) CheckClosures(ctx context.Context) error {
 	}
 	now := s.now()
 	cutoff := now.Add(-autoClose)
+
 	subs, err := s.repo.Submissions.ListCompletedBefore(ctx, cutoff.UnixNano(), 100)
 	if err != nil {
 		return fmt.Errorf("list completed-before: %w", err)
 	}
 	for i := range subs {
-		sub := &subs[i]
-		if err := sub.TransitionTo(model.StateClosed, now); err != nil {
-			s.log.WithError(err).WithField("submission_id", sub.ID).Warn("could not auto-close")
+		s.closeQuiet(ctx, &subs[i], "auto_close_after_complete", now)
+	}
+
+	// also retire escalated cases gone quiet past the same window
+	esc, err := s.repo.Submissions.ListEscalatedSince(ctx, 0, 500)
+	if err != nil {
+		return fmt.Errorf("list escalated: %w", err)
+	}
+	for i := range esc {
+		if esc[i].LastActionAt.After(cutoff) {
 			continue
 		}
-		if err := s.repo.Submissions.UpsertSubmission(ctx, sub); err != nil {
-			s.log.WithError(err).WithField("submission_id", sub.ID).Warn("auto-close upsert failed")
-			continue
-		}
-		s.metrics.ClosedTotal.Add(ctx, 1)
-		s.audit(ctx, sub.ID, model.EventClosed, map[string]any{
-			"reason":        "auto_close_after_complete",
-			"auto_close_at": now,
-		})
+		s.closeQuiet(ctx, &esc[i], "auto_close_after_escalation", now)
 	}
 	return nil
+}
+
+func (s *SubmissionsService) closeQuiet(ctx context.Context, sub *model.Submission, reason string, now time.Time) {
+	if err := sub.TransitionTo(model.StateClosed, now); err != nil {
+		s.log.WithError(err).WithField("submission_id", sub.ID).Warn("could not auto-close")
+		return
+	}
+	if err := s.repo.Submissions.UpsertSubmission(ctx, sub); err != nil {
+		s.log.WithError(err).WithField("submission_id", sub.ID).Warn("auto-close upsert failed")
+		return
+	}
+	s.audit(ctx, sub.ID, model.EventClosed, map[string]any{
+		"reason":        reason,
+		"auto_close_at": now,
+	})
 }
 
 // SendEscalationDigest no-ops without a recipient or any escalations.
@@ -605,9 +663,6 @@ func (s *SubmissionsService) SendEscalationDigest(ctx context.Context) error {
 	if _, err := s.mail.SendThreadedReply(ctx, reply); err != nil {
 		return fmt.Errorf("send digest: %w", err)
 	}
-	s.metrics.DigestSentTotal.Add(ctx, 1, metric.WithAttributes(
-		attribute.Int("count", len(subs)),
-	))
 	s.audit(ctx, "", model.EventDigestSent, map[string]any{
 		"recipient": recipient,
 		"count":     len(subs),
@@ -648,65 +703,70 @@ func (s *SubmissionsService) createSubmission(ctx context.Context, req IngestReq
 }
 
 func (s *SubmissionsService) classifyAttachments(ctx context.Context, sub *model.Submission, e model.Email, cl model.Checklist) []model.Document {
-	out := make([]model.Document, 0, len(e.Attachments))
 	itemByID := make(map[string]model.RequiredItem, len(cl.Required))
 	for _, item := range cl.Required {
 		itemByID[item.ID] = item
 	}
+	out := make([]model.Document, 0, len(e.Attachments))
 	for _, a := range e.Attachments {
-		text := s.extractText(a)
-		result, err := s.classifier.Classify(ctx, classifier.Input{
-			Filename:    a.Filename,
-			ContentType: a.ContentType,
-			BodyText:    text,
-			PolicyType:  cl.PolicyType,
-			Checklist:   cl,
-		})
-		if err != nil {
-			s.audit(ctx, sub.ID, model.EventLLMFailed, map[string]any{
-				"filename": a.Filename,
-				"op":       "classify",
-				"error":    err.Error(),
-			})
-		}
-		if result.Usage != nil {
-			s.auditLLMCall(ctx, sub.ID, "classify", a.Filename, *result.Usage)
-		}
-
-		doc := model.Document{
-			ID:            uuid.NewString(),
-			SubmissionID:  sub.ID,
-			EmailID:       e.DeterministicID,
-			Filename:      a.Filename,
-			ContentType:   a.ContentType,
-			SizeBytes:     a.Size,
-			SHA256:        a.SHA256,
-			ClassifiedAs:  result.CandidateID,
-			Confidence:    result.Confidence,
-			ClassifiedBy:  result.By,
-			ExtractedText: text,
-			CreatedAt:     s.now(),
-		}
-
-		s.audit(ctx, sub.ID, model.EventDocumentClassified, map[string]any{
-			"filename":      a.Filename,
-			"classified_as": result.CandidateID,
-			"confidence":    result.Confidence,
-			"by":            result.By,
-			"reason":        result.Reason,
-		})
-
-		if item, ok := itemByID[result.CandidateID]; ok && item.RequiresField != nil {
-			if extracted := s.extractField(ctx, sub.ID, a.Filename, text, item.RequiresField); extracted != nil {
-				doc.ExtractedFields = map[string]any{item.RequiresField.Name: extracted}
-			}
-		}
-		out = append(out, doc)
+		out = append(out, s.classifyAttachment(ctx, sub, e, cl, a, itemByID))
 	}
 	return out
 }
 
-// returns nil if no LLM or the call fails; the checklist then soft-passes.
+// classifyAttachment classifies one attachment and extracts its declared field.
+func (s *SubmissionsService) classifyAttachment(ctx context.Context, sub *model.Submission, e model.Email, cl model.Checklist, a model.Attachment, itemByID map[string]model.RequiredItem) model.Document {
+	text := s.extractText(a)
+	result, err := s.classifier.Classify(ctx, classifier.Input{
+		Filename:    a.Filename,
+		ContentType: a.ContentType,
+		BodyText:    text,
+		PolicyType:  cl.PolicyType,
+		Checklist:   cl,
+	})
+	if err != nil {
+		s.audit(ctx, sub.ID, model.EventLLMFailed, map[string]any{
+			"filename": a.Filename,
+			"op":       "classify",
+			"error":    err.Error(),
+		})
+	}
+	if result.Usage != nil {
+		s.auditLLMCall(ctx, sub.ID, "classify", a.Filename, *result.Usage)
+	}
+
+	doc := model.Document{
+		ID:            uuid.NewString(),
+		SubmissionID:  sub.ID,
+		EmailID:       e.DeterministicID,
+		Filename:      a.Filename,
+		ContentType:   a.ContentType,
+		SizeBytes:     a.Size,
+		SHA256:        a.SHA256,
+		ClassifiedAs:  result.CandidateID,
+		Confidence:    result.Confidence,
+		ClassifiedBy:  result.By,
+		ExtractedText: textutil.TruncateBytes(text, maxExtractedTextBytes),
+		CreatedAt:     s.now(),
+	}
+
+	s.audit(ctx, sub.ID, model.EventDocumentClassified, map[string]any{
+		"filename":      a.Filename,
+		"classified_as": result.CandidateID,
+		"confidence":    result.Confidence,
+		"by":            result.By,
+		"reason":        result.Reason,
+	})
+
+	if item, ok := itemByID[result.CandidateID]; ok && item.RequiresField != nil {
+		if extracted := s.extractField(ctx, sub.ID, a.Filename, text, item.RequiresField); extracted != nil {
+			doc.ExtractedFields = map[string]any{item.RequiresField.Name: extracted}
+		}
+	}
+	return doc
+}
+
+// extractField returns nil if no LLM or the call fails; the checklist then soft-passes.
 func (s *SubmissionsService) extractField(ctx context.Context, submissionID, filename, text string, rf *model.RequiresField) any {
 	if s.llm == nil {
 		return nil
@@ -741,14 +801,6 @@ func (s *SubmissionsService) extractField(ctx context.Context, submissionID, fil
 func (s *SubmissionsService) auditLLMCall(ctx context.Context, submissionID, op, filename string, u llm.Usage) {
 	if u.PromptHash == "" && u.InputTokens == 0 && u.OutputTokens == 0 {
 		return
-	}
-	s.metrics.LLMCallTotal.Add(ctx, 1, metric.WithAttributes(
-		attribute.String("model", u.Model),
-		attribute.String("op", op),
-		attribute.String("outcome", "success"),
-	))
-	if u.LatencyMs > 0 {
-		s.metrics.LLMCallDuration.Record(ctx, float64(u.LatencyMs)/1000.0)
 	}
 	s.audit(ctx, submissionID, model.EventLLMCall, map[string]any{
 		"op":                 op,
@@ -786,15 +838,29 @@ func (s *SubmissionsService) extractText(a model.Attachment) (text string) {
 }
 
 func (s *SubmissionsService) audit(ctx context.Context, submissionID string, evt model.EventType, payload map[string]any) {
-	requestID := logger.RequestIDFromContext(ctx)
-	if err := s.repo.Audit.Append(ctx, &model.AuditEntry{
+	entry := &model.AuditEntry{
 		SubmissionID: submissionID,
 		EventType:    evt,
 		Payload:      payload,
-		RequestID:    requestID,
-	}); err != nil {
+		RequestID:    logger.RequestIDFromContext(ctx),
+	}
+	if c, ok := ctx.Value(auditCollectorKey{}).(*auditCollector); ok && c != nil {
+		c.entries = append(c.entries, entry)
+		return
+	}
+	if err := s.repo.Audit.Append(ctx, entry); err != nil {
 		s.log.WithError(err).Warn("audit append failed")
 	}
+}
+
+// flushAudit writes the buffered entries; called only after a successful commit.
+func (s *SubmissionsService) flushAudit(ctx context.Context, c *auditCollector) {
+	for _, e := range c.entries {
+		if err := s.repo.Audit.Append(ctx, e); err != nil {
+			s.log.WithError(err).Warn("audit append failed")
+		}
+	}
+	c.entries = nil
 }
 
 func computeEmailID(messageID, body string, atts []model.Attachment) string {
@@ -856,7 +922,8 @@ func inferPolicyType(subject string, all []model.Checklist) string {
 }
 
 func outboundEmail(r model.Reply, providerMsgID string, now time.Time) model.Email {
-	det := sha256.Sum256([]byte(providerMsgID + r.Subject + r.ToAddress))
+	// stable across redeliveries so a resend upserts the same row, not a duplicate
+	det := sha256.Sum256([]byte(r.SubmissionID + "\x00" + r.ToAddress + "\x00" + r.Subject + "\x00" + r.BodyText))
 	return model.Email{
 		DeterministicID: hex.EncodeToString(det[:]),
 		SubmissionID:    r.SubmissionID,

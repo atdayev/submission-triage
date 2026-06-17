@@ -15,12 +15,13 @@ import (
 )
 
 //go:generate mockery --name=SubmissionRepository --output=mocks --outpkg=mocks --filename=SubmissionRepository.go
+
+// SubmissionRepository persists submissions and their emails.
 type SubmissionRepository interface {
 	UpsertSubmission(ctx context.Context, s *model.Submission) error
 	// UpsertSubmissionWithReply persists the submission and its reply in one tx.
 	UpsertSubmissionWithReply(ctx context.Context, s *model.Submission, reply *model.OutboxEntry) error
 	FindByEmailReference(ctx context.Context, messageIDs []string) (*model.Submission, bool, error)
-	// FindByDeterministicID finds the submission owning an email by deterministic id.
 	FindByDeterministicID(ctx context.Context, deterministicID string) (*model.Submission, error)
 	ListStale(ctx context.Context, olderThanUnixNano int64, limit int) ([]model.Submission, error)
 	ListCompletedBefore(ctx context.Context, olderThanUnixNano int64, limit int) ([]model.Submission, error)
@@ -32,15 +33,18 @@ type scanner interface {
 	Scan(dest ...any) error
 }
 
+// SubmissionRepositoryImpl is the SQLite-backed SubmissionRepository.
 type SubmissionRepositoryImpl struct {
 	db  *sql.DB
 	log *logrus.Entry
 }
 
+// NewSubmissionRepository returns a SQLite-backed SubmissionRepository.
 func NewSubmissionRepository(db *sql.DB, log *logrus.Entry) *SubmissionRepositoryImpl {
 	return &SubmissionRepositoryImpl{db: db, log: log}
 }
 
+// UpsertSubmission persists a submission with its emails and documents in one tx.
 func (r *SubmissionRepositoryImpl) UpsertSubmission(ctx context.Context, s *model.Submission) error {
 	if s == nil || s.ID == "" {
 		return errors.New("sqlite: UpsertSubmission requires non-empty id")
@@ -70,6 +74,7 @@ func (r *SubmissionRepositoryImpl) UpsertSubmission(ctx context.Context, s *mode
 	return nil
 }
 
+// UpsertSubmissionWithReply persists the submission and its reply in one tx.
 func (r *SubmissionRepositoryImpl) UpsertSubmissionWithReply(ctx context.Context, s *model.Submission, reply *model.OutboxEntry) error {
 	if s == nil || s.ID == "" {
 		return errors.New("sqlite: UpsertSubmissionWithReply requires non-empty id")
@@ -105,6 +110,7 @@ func (r *SubmissionRepositoryImpl) UpsertSubmissionWithReply(ctx context.Context
 	return nil
 }
 
+// GetByID loads a submission with its emails and documents.
 func (r *SubmissionRepositoryImpl) GetByID(ctx context.Context, id string) (*model.Submission, error) {
 	row := r.db.QueryRowContext(ctx, `
 		SELECT id, policy_type, state, subject_line, from_address, from_name,
@@ -134,6 +140,7 @@ func (r *SubmissionRepositoryImpl) GetByID(ctx context.Context, id string) (*mod
 	return s, nil
 }
 
+// FindByEmailReference finds the submission threaded to any of the given Message-IDs.
 func (r *SubmissionRepositoryImpl) FindByEmailReference(ctx context.Context, messageIDs []string) (*model.Submission, bool, error) {
 	refs := nonEmpty(messageIDs)
 	if len(refs) == 0 {
@@ -164,6 +171,7 @@ func (r *SubmissionRepositoryImpl) FindByEmailReference(ctx context.Context, mes
 	return s, ambiguous, nil
 }
 
+// FindByDeterministicID finds the submission owning the email with the given deterministic ID.
 func (r *SubmissionRepositoryImpl) FindByDeterministicID(ctx context.Context, deterministicID string) (*model.Submission, error) {
 	if deterministicID == "" {
 		return nil, model.ErrSubmissionNotFound
@@ -236,7 +244,7 @@ func nonEmpty(in []string) []string {
 	return out
 }
 
-// nanoOrNow avoids persisting a zero time (UnixNano of zero is year 1754).
+// nanoOrNow returns t as UnixNano, substituting now for a zero time (UnixNano of zero is year 1754).
 func nanoOrNow(t time.Time) int64 {
 	if t.IsZero() {
 		return time.Now().UTC().UnixNano()
@@ -251,6 +259,7 @@ func placeholderList(n int) string {
 	return strings.TrimRight(strings.Repeat("?,", n), ",")
 }
 
+// ListCompletedBefore returns completed submissions last updated before the given time.
 func (r *SubmissionRepositoryImpl) ListCompletedBefore(ctx context.Context, olderThanUnixNano int64, limit int) ([]model.Submission, error) {
 	if limit <= 0 {
 		limit = 100
@@ -279,6 +288,7 @@ func (r *SubmissionRepositoryImpl) ListCompletedBefore(ctx context.Context, olde
 	return out, rows.Err()
 }
 
+// ListEscalatedSince returns escalated submissions escalated at or after the given time.
 func (r *SubmissionRepositoryImpl) ListEscalatedSince(ctx context.Context, sinceUnixNano int64, limit int) ([]model.Submission, error) {
 	if limit <= 0 {
 		limit = 100
@@ -307,6 +317,7 @@ func (r *SubmissionRepositoryImpl) ListEscalatedSince(ctx context.Context, since
 	return out, rows.Err()
 }
 
+// ListStale returns awaiting submissions with no action since the given time.
 func (r *SubmissionRepositoryImpl) ListStale(ctx context.Context, olderThanUnixNano int64, limit int) ([]model.Submission, error) {
 	if limit <= 0 {
 		limit = 100
@@ -335,6 +346,7 @@ func (r *SubmissionRepositoryImpl) ListStale(ctx context.Context, olderThanUnixN
 	return out, rows.Err()
 }
 
+// UpsertEmail persists a single email in its own tx.
 func (r *SubmissionRepositoryImpl) UpsertEmail(ctx context.Context, e *model.Email) error {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -493,7 +505,7 @@ func scanSubmission(s scanner, log *logrus.Entry) (*model.Submission, error) {
 	return &sub, nil
 }
 
-// accepts both the current []MissingItem and the legacy []string shapes.
+// decodeMissingItems accepts both the current []MissingItem and the legacy []string shapes.
 func decodeMissingItems(raw, submissionID string, log *logrus.Entry) []model.MissingItem {
 	var items []model.MissingItem
 	if err := json.Unmarshal([]byte(raw), &items); err == nil {
