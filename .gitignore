@@ -21,6 +21,7 @@ data/
 # Local config / secrets
 .env
 .env.local
+.deploy.env
 
 # Go workspace (local only)
 go.work

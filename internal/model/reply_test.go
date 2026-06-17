@@ -45,7 +45,7 @@ func TestGreetingName(t *testing.T) {
 		{"single-token display name", Email{FromName: "Dana"}, "Dana"},
 		{"clean local-part when no display name", Email{FromAddress: "dana@agency.example"}, "dana"},
 		{"display name beats messy local-part", Email{FromName: "Dana Smith", FromAddress: "noreply@agency.example"}, "Dana"},
-		{"local-part with digits falls back", Email{FromAddress: "atdayevdemo2@gmail.com"}, "there"},
+		{"local-part with digits falls back", Email{FromAddress: "broker2@agency.example"}, "there"},
 		{"short local-part falls back", Email{FromAddress: "ab@x.example"}, "there"},
 		{"role submissions falls back", Email{FromAddress: "submissions@agency.example"}, "there"},
 		{"role info falls back", Email{FromAddress: "info@agency.example"}, "there"},
