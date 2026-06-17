@@ -9,6 +9,7 @@ import (
 
 	"github.com/atdayev/submission-triage/internal/config"
 	"github.com/atdayev/submission-triage/internal/delivery/emailingest"
+	"github.com/atdayev/submission-triage/internal/model"
 	"github.com/atdayev/submission-triage/internal/service"
 	"github.com/atdayev/submission-triage/pkg/emlparse"
 	"github.com/atdayev/submission-triage/pkg/logger"
@@ -26,6 +27,7 @@ type rawMessage struct {
 type mailbox interface {
 	FetchUnseen(ctx context.Context, limit int) ([]rawMessage, error)
 	MarkSeen(ctx context.Context, uid uint32) error
+	Label(ctx context.Context, uid uint32, name string) error
 	Close() error
 }
 
@@ -36,23 +38,25 @@ type ingester interface {
 
 // Poller polls an IMAP inbox for new mail and ingests it.
 type Poller struct {
-	dial       func(ctx context.Context) (mailbox, error)
-	ingest     ingester
-	interval   time.Duration
-	batchLimit int
-	mailbox    string
-	log        *logrus.Entry
+	dial          func(ctx context.Context) (mailbox, error)
+	ingest        ingester
+	interval      time.Duration
+	batchLimit    int
+	mailbox       string
+	completeLabel string
+	log           *logrus.Entry
 }
 
 // NewPoller returns a Poller configured from cfg.
 func NewPoller(cfg config.IMAPConfig, svc ingester, log *logrus.Entry) *Poller {
 	return &Poller{
-		dial:       dialIMAP(cfg, log),
-		ingest:     svc,
-		interval:   cfg.PollInterval(),
-		batchLimit: defaultBatchLimit,
-		mailbox:    cfg.Mailbox,
-		log:        log,
+		dial:          dialIMAP(cfg, log),
+		ingest:        svc,
+		interval:      cfg.PollInterval(),
+		batchLimit:    defaultBatchLimit,
+		mailbox:       cfg.Mailbox,
+		completeLabel: cfg.CompleteLabel,
+		log:           log,
 	}
 }
 
@@ -135,6 +139,12 @@ func (p *Poller) process(ctx context.Context, mb mailbox, m rawMessage) {
 		"state":         res.State,
 		"duplicate":     res.IsDuplicate,
 	}).Info("imap: message ingested")
+
+	if p.completeLabel != "" && !res.IsDuplicate && res.State == model.StateComplete {
+		if err := mb.Label(ctx, m.UID, p.completeLabel); err != nil {
+			log.WithError(err).WithField("label", p.completeLabel).Warn("imap: label failed")
+		}
+	}
 
 	if err := mb.MarkSeen(ctx, m.UID); err != nil {
 		log.WithError(err).Warn("imap: mark-seen failed")

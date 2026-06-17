@@ -12,9 +12,15 @@ import (
 	"github.com/atdayev/submission-triage/internal/service"
 )
 
+type labelOp struct {
+	uid  uint32
+	name string
+}
+
 type fakeMailbox struct {
 	msgs       []rawMessage
 	seen       []uint32
+	labels     []labelOp
 	fetchLimit int
 	fetchErr   error
 	closed     bool
@@ -30,6 +36,11 @@ func (f *fakeMailbox) MarkSeen(_ context.Context, uid uint32) error {
 	return nil
 }
 
+func (f *fakeMailbox) Label(_ context.Context, uid uint32, name string) error {
+	f.labels = append(f.labels, labelOp{uid: uid, name: name})
+	return nil
+}
+
 func (f *fakeMailbox) Close() error {
 	f.closed = true
 	return nil
@@ -38,6 +49,7 @@ func (f *fakeMailbox) Close() error {
 type fakeIngester struct {
 	reqs []service.IngestRequest
 	fn   func(service.IngestRequest) error
+	res  *service.IngestResult // returned when set; defaults to awaiting
 }
 
 func (f *fakeIngester) IngestEmail(_ context.Context, req service.IngestRequest) (service.IngestResult, error) {
@@ -46,6 +58,9 @@ func (f *fakeIngester) IngestEmail(_ context.Context, req service.IngestRequest)
 		if err := f.fn(req); err != nil {
 			return service.IngestResult{}, err
 		}
+	}
+	if f.res != nil {
+		return *f.res, nil
 	}
 	return service.IngestResult{SubmissionID: "sub-1", State: model.StateAwaiting}, nil
 }
@@ -117,6 +132,57 @@ func TestPoller_MarksUnparseableSeenToSkip(t *testing.T) {
 	}
 	if len(mb.seen) != 1 || mb.seen[0] != 3 {
 		t.Errorf("poison message should be marked seen: got %v", mb.seen)
+	}
+}
+
+const readyLabel = "Ready for Underwriting"
+
+func completePoller(mb mailbox, ing ingester) *Poller {
+	p := testPoller(mb, ing)
+	p.completeLabel = readyLabel
+	return p
+}
+
+func TestPoller_LabelsConversationOnComplete(t *testing.T) {
+	mb := &fakeMailbox{msgs: []rawMessage{{UID: 7, Raw: []byte(validEML)}}}
+	ing := &fakeIngester{res: &service.IngestResult{SubmissionID: "sub-1", State: model.StateComplete}}
+	completePoller(mb, ing).pollOnce(context.Background())
+
+	if len(mb.labels) != 1 || mb.labels[0] != (labelOp{uid: 7, name: readyLabel}) {
+		t.Errorf("labels: got %v, want [{7 %q}]", mb.labels, readyLabel)
+	}
+	if len(mb.seen) != 1 || mb.seen[0] != 7 {
+		t.Errorf("marked seen: got %v, want [7]", mb.seen)
+	}
+}
+
+func TestPoller_NoLabelWhenIncomplete(t *testing.T) {
+	mb := &fakeMailbox{msgs: []rawMessage{{UID: 7, Raw: []byte(validEML)}}}
+	ing := &fakeIngester{} // defaults to awaiting
+	completePoller(mb, ing).pollOnce(context.Background())
+
+	if len(mb.labels) != 0 {
+		t.Errorf("awaiting submission should not be labeled: got %v", mb.labels)
+	}
+}
+
+func TestPoller_NoLabelOnDuplicate(t *testing.T) {
+	mb := &fakeMailbox{msgs: []rawMessage{{UID: 7, Raw: []byte(validEML)}}}
+	ing := &fakeIngester{res: &service.IngestResult{SubmissionID: "sub-1", State: model.StateComplete, IsDuplicate: true}}
+	completePoller(mb, ing).pollOnce(context.Background())
+
+	if len(mb.labels) != 0 {
+		t.Errorf("a duplicate redelivery should not re-label: got %v", mb.labels)
+	}
+}
+
+func TestPoller_NoLabelWhenDisabled(t *testing.T) {
+	mb := &fakeMailbox{msgs: []rawMessage{{UID: 7, Raw: []byte(validEML)}}}
+	ing := &fakeIngester{res: &service.IngestResult{SubmissionID: "sub-1", State: model.StateComplete}}
+	testPoller(mb, ing).pollOnce(context.Background()) // completeLabel empty
+
+	if len(mb.labels) != 0 {
+		t.Errorf("empty IMAP_COMPLETE_LABEL must disable labeling: got %v", mb.labels)
 	}
 }
 

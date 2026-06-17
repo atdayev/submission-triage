@@ -64,6 +64,7 @@ type IMAPConfig struct {
 	Mailbox             string `env:"IMAP_MAILBOX" envDefault:"INBOX"`
 	PollIntervalSeconds int    `env:"IMAP_POLL_INTERVAL_SECONDS" envDefault:"30"`
 	MaxMessageMB        int    `env:"IMAP_MAX_MESSAGE_MB" envDefault:"32"`
+	CompleteLabel       string `env:"IMAP_COMPLETE_LABEL" envDefault:"Ready for Underwriting"`
 }
 
 // SMTPConfig drives the optional SMTP outbound sender.

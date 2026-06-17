@@ -156,6 +156,45 @@ func TestIntegration_RealAdapter_FetchMarkSeenRefetch(t *testing.T) {
 	}
 }
 
+func TestIntegration_RealAdapter_LabelCreatesAndFiles(t *testing.T) {
+	addr := startMemServer(t, validEML)
+	useInsecureDial(t)
+	ctx := context.Background()
+
+	mb, err := dialIMAP(cfgFor(addr), testLog())(ctx)
+	if err != nil {
+		t.Fatalf("dialIMAP: %v", err)
+	}
+	defer mb.Close()
+
+	msgs, err := mb.FetchUnseen(ctx, 50)
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("FetchUnseen: got %d (err %v), want 1", len(msgs), err)
+	}
+
+	const label = "Ready for Underwriting"
+	// label-mailbox doesn't exist yet: this must create it, then copy into it
+	if err := mb.Label(ctx, msgs[0].UID, label); err != nil {
+		t.Fatalf("Label (create+copy): %v", err)
+	}
+	// idempotent: a second completion in the same label must still succeed
+	if err := mb.Label(ctx, msgs[0].UID, label); err != nil {
+		t.Fatalf("Label (existing): %v", err)
+	}
+
+	c := mb.(*imapMailbox).c
+	if _, err := c.Select(label, nil).Wait(); err != nil {
+		t.Fatalf("select label mailbox %q: %v", label, err)
+	}
+	found, err := c.UIDSearch(&goimap.SearchCriteria{}, nil).Wait()
+	if err != nil {
+		t.Fatalf("search label mailbox: %v", err)
+	}
+	if n := len(found.AllUIDs()); n < 1 {
+		t.Errorf("message not filed under %q: %d found, want >=1", label, n)
+	}
+}
+
 func TestIntegration_RealAdapter_RespectsBatchLimit(t *testing.T) {
 	addr := startMemServer(t, validEML, secondEML)
 	useInsecureDial(t)

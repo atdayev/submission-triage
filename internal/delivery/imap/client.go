@@ -163,6 +163,18 @@ func (m *imapMailbox) MarkSeen(_ context.Context, uid uint32) error {
 	}, nil).Close()
 }
 
+// Label files the message under name, creating the label-mailbox on first use.
+func (m *imapMailbox) Label(_ context.Context, uid uint32, name string) error {
+	set := goimap.UIDSetNum(goimap.UID(uid))
+	if _, err := m.c.Copy(set, name).Wait(); err != nil {
+		_ = m.c.Create(name, nil).Wait()
+		if _, err := m.c.Copy(set, name).Wait(); err != nil {
+			return fmt.Errorf("imap label %q: %w", name, err)
+		}
+	}
+	return nil
+}
+
 // Close logs out and tears down the connection.
 func (m *imapMailbox) Close() error {
 	m.stopOnce.Do(func() { close(m.stop) })
