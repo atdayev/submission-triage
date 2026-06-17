@@ -1,6 +1,7 @@
 package http
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -44,7 +45,8 @@ func TestRecovery_AbortHandlerRepanics(t *testing.T) {
 	chain := withRecovery()(aborter)
 
 	defer func() {
-		if rec := recover(); rec != http.ErrAbortHandler {
+		rec := recover()
+		if err, ok := rec.(error); !ok || !errors.Is(err, http.ErrAbortHandler) {
 			t.Fatalf("recovered = %v, want ErrAbortHandler re-panic", rec)
 		}
 	}()
