@@ -38,4 +38,3 @@ required_items:
         - "Incident History"
 escalation:
   threshold_hours: 48
-  action: email_digest

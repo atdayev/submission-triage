@@ -21,9 +21,7 @@ required_items:
     match:
       filename_patterns: ["*loss*run*"]
 escalation:
-  threshold_hours: 72
-  action: email_digest
-`
+  threshold_hours: 72`
 
 const bopYAML = `name: BOP
 policy_type: bop
