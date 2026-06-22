@@ -39,7 +39,6 @@ type MatchRules struct {
 // EscalationPolicy controls when a stalled submission escalates.
 type EscalationPolicy struct {
 	ThresholdHours  int
-	Action          string
 	DigestRecipient string
 }
 

@@ -45,4 +45,3 @@ required_items:
         - "Schedule of Locations"
 escalation:
   threshold_hours: 72
-  action: email_digest

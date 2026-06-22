@@ -58,7 +58,6 @@ type rawRequiresField struct {
 
 type rawEscalation struct {
 	ThresholdHours  int    `yaml:"threshold_hours"`
-	Action          string `yaml:"action"`
 	DigestRecipient string `yaml:"digest_recipient"`
 }
 
@@ -165,7 +164,6 @@ func (r rawChecklist) toModel() model.Checklist {
 		PolicyType: r.PolicyType,
 		Escalation: model.EscalationPolicy{
 			ThresholdHours:  r.Escalation.ThresholdHours,
-			Action:          r.Escalation.Action,
 			DigestRecipient: r.Escalation.DigestRecipient,
 		},
 	}

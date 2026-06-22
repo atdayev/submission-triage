@@ -25,13 +25,6 @@ Five lines of business ship today, each with its own checklist: **Commercial
 General Liability, Business Owners Policy (BOP), Workers' Compensation,
 Commercial Property, and Cyber Liability**.
 
-Honest gaps, up front:
-
-- **Auth is Gmail App Password (basic auth over TLS) only.** No OAuth2/XOAUTH2,
-  so Microsoft 365 tenants that disabled basic auth are not supported yet.
-- **No production deployments yet.** This is new and self-hosted; you'd be
-  early. Treat it accordingly.
-
 ## How it works
 
 For each unread message in the watched mailbox:
@@ -52,8 +45,9 @@ For each unread message in the watched mailbox:
 
 Reliability: replies are written to a durable outbox in the same transaction
 as the submission and redelivered until sent (surviving crashes and provider
-outages), and ingest is idempotent on Message-ID plus a content hash, so the
-same message seen twice is processed once.
+outages), or dead-lettered after repeated failures. Ingest is idempotent on a
+content hash over the Message-ID, body, and attachments, so the same message
+seen twice is processed once.
 
 ## Quickstart (~15 minutes)
 
@@ -102,6 +96,11 @@ attach an ACORD 125. Within the poll interval (default 30s) plus normal mail
 delivery, you'll get a threaded reply listing whatever the CGL checklist still
 wants. Reply with the missing documents and it continues the thread; when the
 file is complete it sends a "moving to underwriting" note.
+
+**7. Run it in production.** Keep it always-on under a process manager — it's a
+long-lived IMAP poller and escalation worker, not a request-driven service. A
+ready systemd unit (install steps in its header) lives at
+[`deploy/systemd/submission-triage.service`](deploy/systemd/submission-triage.service).
 
 ## Configuration
 
@@ -186,7 +185,6 @@ required_items:
       unit: years              # noun used in the customer-facing reply
 escalation:
   threshold_hours: 72          # overrides the global threshold for this line
-  action: email_digest
 ```
 
 `requires_field` is the **only** rule beyond "is the document present", and it
@@ -194,41 +192,17 @@ needs the LLM enabled to extract the value (without a key it passes on
 presence). Wording like "5 years" in the other four checklists is descriptive
 text only — it is not enforced. Unknown YAML keys are rejected at startup.
 
-## Hosting
-
-It's one static binary (~22 MB, no CGO, no external database) plus a SQLite
-file, so it runs comfortably on a **GCP e2-micro free-tier VM** — estimated
-~30–80 MB RAM at agency volume. SQLite stores submission metadata, extracted
-text, and the audit log (raw attachment bytes are not retained), so disk growth
-is modest.
-
-A ready systemd unit lives at
-[`deploy/systemd/submission-triage.service`](deploy/systemd/submission-triage.service)
-with `Restart=always`, a dedicated service user, and an `EnvironmentFile` — the
-file header lists the install steps. Run it always-on: the IMAP poller and
-escalation timers need a long-lived process, not a request-driven one.
-
-## Limitations
-
-- No web UI — only a local `GET /health` endpoint.
-- No AMS/CRM write-back (Applied Epic, HawkSoft, etc.).
-- Single-tenant — one mailbox, one agency per instance.
-- Gmail App Password auth only; no Microsoft 365 / OAuth2.
-- Email only — no SMS, Slack, or Teams.
-
-## Costs
-
-- **Hosting:** $0/month on a GCP e2-micro free-tier VM at typical agency
-  volume.
-- **LLM:** optional. On Claude Haiku 4.5 a classification or field-extraction
-  call is well under a cent, and many submissions never call it (the filename
-  heuristics resolve them). Leave `ANTHROPIC_API_KEY` blank to spend nothing.
-
 ## Help
 
 Questions, bugs, or "would this work for my agency?" — open a
 [GitHub issue](https://github.com/atdayev/submission-triage/issues) or DM the
 maintainer on LinkedIn.
+
+## Contributing
+
+Issues and pull requests are welcome — for anything non-trivial, open an issue
+first to discuss the approach. CI runs gofmt, golangci-lint, and `go test -race`
+on every PR; keep it green.
 
 ## License
 

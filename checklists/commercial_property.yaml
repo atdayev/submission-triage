@@ -45,4 +45,3 @@ required_items:
         - "Loss Run"
 escalation:
   threshold_hours: 72
-  action: email_digest
