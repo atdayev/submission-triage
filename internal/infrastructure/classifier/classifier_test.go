@@ -38,7 +38,28 @@ func newTestClassifier(client llm.Client) *HeuristicLLMClassifier {
 	return NewHeuristicLLMClassifier(client)
 }
 
-func TestClassify_UniqueFilenameMatch_NoLLM(t *testing.T) {
+func TestClassify_SpendCapFallsBackToHeuristic(t *testing.T) {
+	c := newTestClassifier(&stubLLM{err: llm.ErrSpendCapReached})
+	// an unhelpful filename → heuristics miss → reaches the (capped) LLM
+	r, err := c.Classify(context.Background(), Input{
+		Filename:  "scan0001.pdf",
+		Checklist: cglChecklist(),
+	})
+	if err != nil {
+		t.Fatalf("spend cap must not error the attachment: %v", err)
+	}
+	if !r.Capped {
+		t.Error("expected Capped=true on a spend-capped classify")
+	}
+	if r.CandidateID != "" {
+		t.Errorf("no confident classification expected, got %q", r.CandidateID)
+	}
+	if r.By != model.ClassifiedByHeuristic {
+		t.Errorf("capped result should degrade to heuristic, got %q", r.By)
+	}
+}
+
+func TestClassify_UniqueFilenameMatch_RecordsFilename(t *testing.T) {
 	c := newTestClassifier(nil)
 	r, err := c.Classify(context.Background(), Input{
 		Filename:  "ACORD_125_Acme.pdf",
@@ -47,12 +68,12 @@ func TestClassify_UniqueFilenameMatch_NoLLM(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.CandidateID != "acord_125" || r.By != "heuristic" || r.Confidence != 0.95 {
-		t.Fatalf("got %+v", r)
+	if r.CandidateID != "acord_125" || r.By != model.ClassifiedByFilename || r.Confidence != confidenceFilename {
+		t.Fatalf("filename-only match should record %q, got %+v", model.ClassifiedByFilename, r)
 	}
 }
 
-func TestClassify_ContentMatchOnly(t *testing.T) {
+func TestClassify_ContentMatchOnly_RecordsKeyword(t *testing.T) {
 	c := newTestClassifier(nil)
 	r, err := c.Classify(context.Background(), Input{
 		Filename:  "random.pdf",
@@ -62,8 +83,23 @@ func TestClassify_ContentMatchOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.CandidateID != "loss_runs" || r.Confidence != 0.85 {
-		t.Fatalf("got %+v", r)
+	if r.CandidateID != "loss_runs" || r.By != model.ClassifiedByKeyword || r.Confidence != confidenceKeyword {
+		t.Fatalf("keyword-only match should record %q, got %+v", model.ClassifiedByKeyword, r)
+	}
+}
+
+func TestClassify_FilenameAndContentMatch_RecordsBoth(t *testing.T) {
+	c := newTestClassifier(nil)
+	r, err := c.Classify(context.Background(), Input{
+		Filename:  "ACORD_125_Acme.pdf",
+		BodyText:  "cover sheet for ACORD 125",
+		Checklist: cglChecklist(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.CandidateID != "acord_125" || r.By != model.ClassifiedByFilenameKeyword {
+		t.Fatalf("corroborated match should record %q, got %+v", model.ClassifiedByFilenameKeyword, r)
 	}
 }
 
@@ -98,7 +134,7 @@ func TestClassify_FallsBackToLLM(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.CandidateID != "acord_125" || r.By != "llm" {
+	if r.CandidateID != "acord_125" || r.By != model.ClassifiedByLLM {
 		t.Fatalf("got %+v", r)
 	}
 }
@@ -110,7 +146,7 @@ func TestClassify_LLMReturnsUnknown(t *testing.T) {
 	if r.CandidateID != "" {
 		t.Fatalf("unknown candidate should become empty, got %+v", r)
 	}
-	if r.By != "llm" {
+	if r.By != model.ClassifiedByLLM {
 		t.Fatalf("By: got %+v", r)
 	}
 }
@@ -122,7 +158,7 @@ func TestClassify_LLMReturnsCandidateNotInChecklist(t *testing.T) {
 	if r.CandidateID != "" {
 		t.Fatalf("candidate not in checklist should become empty, got %+v", r)
 	}
-	if r.By != "llm" {
+	if r.By != model.ClassifiedByLLM {
 		t.Fatalf("By: got %+v", r)
 	}
 }
@@ -134,7 +170,7 @@ func TestClassify_LLMError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error to bubble from llm failure")
 	}
-	if r.By != "llm" {
+	if r.By != model.ClassifiedByLLM {
 		t.Fatalf("By should be llm even on error, got %+v", r)
 	}
 }

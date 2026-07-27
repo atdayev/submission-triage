@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"mime"
 	"sort"
 	"strings"
 	"sync"
@@ -80,7 +81,8 @@ type SubmissionsService struct {
 	replyCancel context.CancelFunc
 	drainGrace  time.Duration
 
-	outboxRetryAfter  time.Duration // only sweep entries older than this, so the online sender isn't double-dispatched
+	coalesceWindow    time.Duration // per-submission reply spacing
+	outboxRetryAfter  time.Duration // only retry attempted entries older than this, so the online sender isn't double-dispatched
 	outboxMaxAttempts int
 	outboxBatch       int
 
@@ -89,6 +91,9 @@ type SubmissionsService struct {
 
 	enqueueMu sync.RWMutex // serializes reply enqueue against Shutdown
 	closed    bool         // set at Shutdown; guards the replyJobs channel
+
+	cappedMu  sync.Mutex // guards cappedDay
+	cappedDay string     // UTC day the llm.capped audit was last emitted
 }
 
 const (
@@ -97,6 +102,7 @@ const (
 	defaultOutboxMaxAttempts = 10
 	defaultOutboxBatch       = 100
 	markSentTimeout          = 2 * time.Second // detached mark-sent: bounds shutdown overrun
+	defaultDigestMaxRows     = 500             // fallback when DIGEST_MAX_ROWS is unset
 )
 
 const maxExtractedTextBytes = 256 << 10 // bound stored per-document extracted text
@@ -106,6 +112,7 @@ type replyJob struct {
 	reply        model.Reply
 	submissionID string
 	outboxID     string
+	version      time.Time // outbox row updated_at at enqueue; guards mark-sent against a supersede
 }
 
 // IngestRequest is a single inbound email to ingest.
@@ -121,15 +128,32 @@ type IngestRequest struct {
 	ReceivedAt  time.Time
 	Attachments []model.Attachment
 	Source      string
+	// AutoSubmitted marks mail from an automated agent (out-of-office, bulk,
+	// list, bounce); such mail is stored but never replied to.
+	AutoSubmitted bool
+	// AutoResponseHeaders are the auto-response headers seen on the message,
+	// recorded when a reply is suppressed.
+	AutoResponseHeaders map[string]string
 }
 
 // IngestResult is the outcome of ingesting one email.
 type IngestResult struct {
-	SubmissionID string
-	State        model.State
-	IsDuplicate  bool
-	MissingItems []model.MissingItem
-	ReplyQueued  bool
+	SubmissionID  string
+	State         model.State
+	IsDuplicate   bool
+	PolicyUnknown bool
+	NeedsReview   bool // a human should look; the poller flags the mail \Flagged
+	MissingItems  []model.MissingItem
+	ReplyQueued   bool
+}
+
+// AuditFileFailed records that filing a processed message into its status folder
+// failed. Cosmetic (status lives in the DB + digest); the poller doesn't fail on it.
+func (s *SubmissionsService) AuditFileFailed(ctx context.Context, submissionID, folder, reason string) {
+	s.audit(ctx, submissionID, model.EventMailFileFailed, map[string]any{
+		"folder": folder,
+		"error":  reason,
+	})
 }
 
 // auditCollector buffers an ingest's audit entries until the submission commits,
@@ -168,6 +192,7 @@ func NewSubmissionsService(d Dependencies) *SubmissionsService {
 	if s.drainGrace <= 0 {
 		s.drainGrace = defaultReplyDrainGrace
 	}
+	s.coalesceWindow = d.Config.Reply.CoalesceWindow()
 	s.outboxRetryAfter = defaultOutboxRetryAfter
 	s.outboxMaxAttempts = defaultOutboxMaxAttempts
 	s.outboxBatch = defaultOutboxBatch
@@ -205,10 +230,11 @@ func (s *SubmissionsService) dispatchOnline(job replyJob) {
 		s.audit(job.ctx, job.submissionID, model.EventReplyFailed, map[string]any{"error": err.Error()})
 		return
 	}
-	// record the send even if the request/shutdown ctx is canceled, else it resends
+	// record the send even if the request/shutdown ctx is canceled, else it resends.
+	// guard on the version so a follow-up that coalesced into this row isn't marked sent.
 	markCtx, cancel := context.WithTimeout(context.WithoutCancel(job.ctx), markSentTimeout)
 	defer cancel()
-	if err := s.repo.Outbox.Update(markCtx, job.outboxID, model.OutboxSent, 0, ""); err != nil {
+	if err := s.repo.Outbox.MarkSent(markCtx, job.outboxID, job.version); err != nil {
 		s.log.WithError(err).WithField("outbox_id", job.outboxID).Warn("mark outbox sent failed")
 	}
 }
@@ -290,7 +316,10 @@ func (s *SubmissionsService) ingestEmailInner(ctx context.Context, req IngestReq
 
 	inbound := inboundEmail(req, emailID, sub.ID)
 	sub.AttachEmail(inbound)
-	sub.MarkAction(s.now())
+	// an automated sender's action doesn't advance the escalation clock
+	if !req.AutoSubmitted {
+		sub.MarkAction(s.now())
+	}
 
 	s.audit(ctx, sub.ID, model.EventEmailReceived, map[string]any{
 		"deterministic_id": emailID,
@@ -301,29 +330,112 @@ func (s *SubmissionsService) ingestEmailInner(ctx context.Context, req IngestReq
 
 	missing, policyUnknown := s.evaluate(ctx, sub, inbound)
 
-	if err := s.transitionState(ctx, sub, len(missing) > 0); err != nil {
+	// the review flag and the broker reply are decided independently: an unreadable
+	// file doesn't suppress the request for the documents that are genuinely absent
+	prevReview := sub.NeedsReview
+	sub.NeedsReview = model.RequiresReview(missing)
+	if sub.NeedsReview && !prevReview {
+		s.audit(ctx, sub.ID, model.EventNeedsReview, map[string]any{
+			"documents": s.reviewDocs(sub),
+		})
+	}
+
+	if err := s.transitionState(ctx, sub, missing); err != nil {
 		return IngestResult{}, err
 	}
 
 	result := IngestResult{
-		SubmissionID: sub.ID,
-		State:        sub.State,
-		MissingItems: missing,
+		SubmissionID:  sub.ID,
+		State:         sub.State,
+		NeedsReview:   sub.NeedsReview,
+		MissingItems:  missing,
+		PolicyUnknown: policyUnknown,
+	}
+
+	if req.AutoSubmitted {
+		return s.persistSuppressed(ctx, sub, collector, req.AutoResponseHeaders, result)
+	}
+	reply, sendReply := s.buildReply(sub, missing, inbound, policyUnknown)
+	if !sendReply {
+		// nothing to ask the broker (flagged-only): persist the submission alone.
+		return s.persistNoReply(ctx, sub, collector, result)
 	}
 	// submission and reply commit in one tx: an inbound email without an outbox
 	// row is unrecoverable (dedup blocks the retry). On failure the poller retries.
-	reply := s.buildReply(sub, missing, inbound, policyUnknown)
-	entry := &model.OutboxEntry{ID: uuid.NewString(), SubmissionID: sub.ID, Reply: reply, Status: model.OutboxPending}
+	now := s.now()
+	notBefore := s.replyNotBefore(sub, now)
+	entry := &model.OutboxEntry{ID: uuid.NewString(), SubmissionID: sub.ID, Reply: reply, Status: model.OutboxPending, NotBefore: notBefore}
 	if err := s.repo.Submissions.UpsertSubmissionWithReply(ctx, sub, entry); err != nil {
 		return IngestResult{}, fmt.Errorf("persist submission with reply: %w", err)
 	}
 	result.ReplyQueued = true
 	s.flushAudit(ctx, collector)
 
-	job := replyJob{ctx: s.replyJobContext(ctx), reply: reply, submissionID: sub.ID, outboxID: entry.ID}
-	// a full queue is not lost: the outbox sweeper redelivers it
-	_ = s.enqueueReply(job)
+	// dispatch online only when due now (the first reply, or once the coalesce
+	// window has elapsed); otherwise the flush sweeper sends it after not_before
+	if !notBefore.After(now) {
+		job := replyJob{ctx: s.replyJobContext(ctx), reply: reply, submissionID: sub.ID, outboxID: entry.ID, version: entry.UpdatedAt}
+		_ = s.enqueueReply(job)
+	}
 	return result, nil
+}
+
+// replyNotBefore enforces per-submission spacing: the first reply (no prior)
+// goes now; a follow-up waits until coalesceWindow after the previous send.
+func (s *SubmissionsService) replyNotBefore(sub *model.Submission, now time.Time) time.Time {
+	if sub.LastReplyAt.IsZero() {
+		return now
+	}
+	if scheduled := sub.LastReplyAt.Add(s.coalesceWindow); scheduled.After(now) {
+		return scheduled
+	}
+	return now
+}
+
+// persistSuppressed commits an auto-submitted email without queuing a reply.
+// The single-tx invariant is relaxed here on purpose: with no reply to recover,
+// committing the email alone is safe.
+func (s *SubmissionsService) persistSuppressed(ctx context.Context, sub *model.Submission, collector *auditCollector, headers map[string]string, result IngestResult) (IngestResult, error) {
+	if err := s.repo.Submissions.UpsertSubmission(ctx, sub); err != nil {
+		return IngestResult{}, fmt.Errorf("persist suppressed submission: %w", err)
+	}
+	s.audit(ctx, sub.ID, model.EventReplySuppressed, map[string]any{
+		"reason":  "auto_submitted",
+		"headers": headers,
+	})
+	s.flushAudit(ctx, collector)
+	return result, nil
+}
+
+// persistNoReply commits a submission with no broker reply: everything outstanding
+// is flagged agency-side, so there is nothing to ask and no reply to recover.
+func (s *SubmissionsService) persistNoReply(ctx context.Context, sub *model.Submission, collector *auditCollector, result IngestResult) (IngestResult, error) {
+	if err := s.repo.Submissions.UpsertSubmission(ctx, sub); err != nil {
+		return IngestResult{}, fmt.Errorf("persist submission: %w", err)
+	}
+	s.flushAudit(ctx, collector)
+	return result, nil
+}
+
+// reviewDocs lists the classified documents that need a human — unreadable, or
+// below the confidence floor.
+func (s *SubmissionsService) reviewDocs(sub *model.Submission) []map[string]any {
+	floor := s.cfg.Classifier.ConfidenceFloor
+	var out []map[string]any
+	for i := range sub.Documents {
+		d := &sub.Documents[i]
+		if d.ClassifiedAs == "" || (!d.Unreadable && d.Confidence >= floor) {
+			continue
+		}
+		out = append(out, map[string]any{
+			"document_id":   d.ID,
+			"filename":      d.Filename,
+			"classified_as": d.ClassifiedAs,
+			"confidence":    d.Confidence,
+			"unreadable":    d.Unreadable,
+		})
+	}
+	return out
 }
 
 // resolveSubmission finds the submission this email belongs to, or creates one.
@@ -407,7 +519,9 @@ func (s *SubmissionsService) evaluate(ctx context.Context, sub *model.Submission
 		for _, d := range s.classifyAttachments(ctx, sub, inbound, checklistDef) {
 			sub.AttachDocument(d)
 		}
-		missing = model.EvaluateChecklist(*sub, checklistDef)
+		missing = model.EvaluateChecklist(*sub, checklistDef, model.ChecklistOptions{
+			ConfidenceFloor: s.cfg.Classifier.ConfidenceFloor,
+		})
 	}
 	sub.MissingItems = missing
 	missingIDs := make([]string, 0, len(missing))
@@ -422,11 +536,12 @@ func (s *SubmissionsService) evaluate(ctx context.Context, sub *model.Submission
 	return missing, policyUnknown
 }
 
-// transitionState moves the submission to complete or awaiting and audits the change.
-func (s *SubmissionsService) transitionState(ctx context.Context, sub *model.Submission, hasMissing bool) error {
+// transitionState moves the submission to complete (nothing outstanding) or
+// awaiting and audits the change; the review flag is set separately.
+func (s *SubmissionsService) transitionState(ctx context.Context, sub *model.Submission, missing []model.MissingItem) error {
 	prev := sub.State
 	next := model.StateComplete
-	if hasMissing {
+	if len(missing) > 0 {
 		next = model.StateAwaiting
 	}
 	if err := sub.TransitionTo(next, s.now()); err != nil {
@@ -483,14 +598,19 @@ func (s *SubmissionsService) knownChecklistNames() []string {
 	return out
 }
 
-func (s *SubmissionsService) buildReply(sub *model.Submission, missing []model.MissingItem, inbound model.Email, policyUnknown bool) model.Reply {
+// buildReply decides the outbound reply, if any: policy-unknown clarification,
+// completion note, missing-items request, or none when only flagged items remain.
+func (s *SubmissionsService) buildReply(sub *model.Submission, missing []model.MissingItem, inbound model.Email, policyUnknown bool) (model.Reply, bool) {
 	switch {
 	case policyUnknown:
-		return model.BuildPolicyUnknownReply(*sub, inbound, s.knownChecklistNames())
-	case len(missing) > 0:
-		return model.BuildMissingItemsReply(*sub, missing, inbound)
+		return model.BuildPolicyUnknownReply(*sub, inbound, s.knownChecklistNames()), true
+	case len(missing) == 0:
+		return model.BuildCompletionReply(*sub, inbound), true
 	default:
-		return model.BuildCompletionReply(*sub, inbound)
+		if broker := model.BrokerActionable(missing); len(broker) > 0 {
+			return model.BuildMissingItemsReply(*sub, broker, inbound), true
+		}
+		return model.Reply{}, false
 	}
 }
 
@@ -505,6 +625,14 @@ func (s *SubmissionsService) deliver(ctx context.Context, reply model.Reply, sub
 	if err := s.repo.Submissions.UpsertEmail(ctx, &outbound); err != nil {
 		s.log.WithError(err).WithField("submission_id", submissionID).Warn("outbound email upsert failed")
 	}
+	// record the send time so the next reply on this submission is spaced by the
+	// window; detached from cancellation like mark-sent so a send during shutdown
+	// still records (else the next reply skips the window once after restart)
+	lrCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), markSentTimeout)
+	defer cancel()
+	if err := s.repo.Submissions.SetLastReplyAt(lrCtx, submissionID, s.now()); err != nil {
+		s.log.WithError(err).WithField("submission_id", submissionID).Warn("set last_reply_at failed")
+	}
 	s.audit(ctx, submissionID, model.EventReplySent, map[string]any{
 		"provider_msg_id": providerMsgID,
 		"to":              reply.ToAddress,
@@ -517,8 +645,9 @@ func (s *SubmissionsService) deliver(ctx context.Context, reply model.Reply, sub
 // RedeliverOutbox resends pending replies the online path didn't get out
 // (overflow, crash, outage), dead-lettering entries after outboxMaxAttempts.
 func (s *SubmissionsService) RedeliverOutbox(ctx context.Context) error {
-	cutoff := s.now().Add(-s.outboxRetryAfter)
-	rows, err := s.repo.Outbox.ListPending(ctx, cutoff, s.outboxBatch)
+	now := s.now()
+	cutoff := now.Add(-s.outboxRetryAfter)
+	rows, err := s.repo.Outbox.ListPending(ctx, now, cutoff, s.outboxBatch)
 	if err != nil {
 		return fmt.Errorf("outbox: list pending: %w", err)
 	}
@@ -541,7 +670,9 @@ func (s *SubmissionsService) RedeliverOutbox(ctx context.Context) error {
 			}
 			continue
 		}
-		_ = s.repo.Outbox.Update(ctx, row.ID, model.OutboxSent, row.Attempts, "")
+		// guard on the version read from ListPending: a follow-up that coalesced
+		// into this row since then stays pending for the next sweep, not lost
+		_ = s.repo.Outbox.MarkSent(ctx, row.ID, row.UpdatedAt)
 	}
 	return nil
 }
@@ -569,6 +700,11 @@ func (s *SubmissionsService) CheckEscalations(ctx context.Context) error {
 			threshold = time.Duration(cl.Escalation.ThresholdHours) * time.Hour
 		}
 		if now.Sub(sub.LastActionAt) < threshold {
+			continue
+		}
+		// only nudge the broker when they can act; a submission blocked solely on
+		// an unreadable/low-confidence file is the agency's problem, not theirs.
+		if len(model.BrokerActionable(sub.MissingItems)) == 0 {
 			continue
 		}
 		if err := sub.TransitionTo(model.StateEscalated, now); err != nil {
@@ -633,39 +769,52 @@ func (s *SubmissionsService) closeQuiet(ctx context.Context, sub *model.Submissi
 	})
 }
 
-// SendEscalationDigest no-ops without a recipient or any escalations.
-func (s *SubmissionsService) SendEscalationDigest(ctx context.Context) error {
-	interval := s.cfg.Escalation.DigestInterval()
+// SendDigest emails the agency a daily status digest of every open submission.
+// No-ops without a recipient/interval, or when nothing is open (an empty digest
+// trains the agency to ignore the address).
+func (s *SubmissionsService) SendDigest(ctx context.Context) error {
+	interval := s.cfg.Digest.Interval()
 	recipient := s.firstDigestRecipient()
 	if recipient == "" || interval <= 0 {
 		return nil
 	}
-	// all currently-escalated cases; a failed send just retries next tick
-	subs, err := s.repo.Submissions.ListEscalatedSince(ctx, 0, 500)
+	maxRows := s.cfg.Digest.MaxRows
+	if maxRows <= 0 {
+		maxRows = defaultDigestMaxRows
+	}
+	subs, err := s.repo.Submissions.ListOpen(ctx, maxRows)
 	if err != nil {
-		return fmt.Errorf("list escalated: %w", err)
+		return fmt.Errorf("list open: %w", err)
 	}
 	if len(subs) == 0 {
 		return nil
 	}
-
-	var body strings.Builder
-	body.WriteString("Currently escalated submissions:\n\n")
-	for _, sub := range subs {
-		fmt.Fprintf(&body, "  - %s | %s | from %s | last action %s\n",
-			sub.ID, sub.PolicyType, sub.FromAddress, sub.LastActionAt.UTC().Format(time.RFC3339))
+	omitted := 0
+	if len(subs) == maxRows { // cap possibly hit; get the exact overflow
+		if total, cerr := s.repo.Submissions.CountOpen(ctx); cerr == nil && total > maxRows {
+			omitted = total - maxRows
+		}
+	}
+	ids := make([]string, len(subs))
+	for i := range subs {
+		ids[i] = subs[i].ID
+	}
+	flaggedIDs, err := s.repo.Submissions.FilenameOnlyItems(ctx, ids)
+	if err != nil {
+		return fmt.Errorf("filename-only items: %w", err)
 	}
 	reply := model.Reply{
 		ToAddress: recipient,
-		Subject:   fmt.Sprintf("[submission-triage] Escalation digest (%d cases)", len(subs)),
-		BodyText:  body.String(),
+		Subject:   fmt.Sprintf("[submission-triage] Daily digest (%d open)", len(subs)+omitted),
+		BodyText:  model.BuildDigest(subs, s.resolveFilenameOnly(subs, flaggedIDs), omitted, s.now()),
 	}
 	if _, err := s.mail.SendThreadedReply(ctx, reply); err != nil {
 		return fmt.Errorf("send digest: %w", err)
 	}
 	s.audit(ctx, "", model.EventDigestSent, map[string]any{
 		"recipient": recipient,
-		"count":     len(subs),
+		"open":      len(subs),
+		"omitted":   omitted,
 	})
 	return nil
 }
@@ -676,7 +825,49 @@ func (s *SubmissionsService) firstDigestRecipient() string {
 			return c.Escalation.DigestRecipient
 		}
 	}
-	return s.cfg.Escalation.DigestRecipient
+	return s.cfg.Digest.Recipient
+}
+
+// resolveFilenameOnly maps each submission's filename-only item ids to their
+// human descriptions, dropping any the checklist still reports missing (e.g. a
+// filename match that turned out unreadable is not a satisfied match).
+func (s *SubmissionsService) resolveFilenameOnly(subs []model.Submission, byID map[string][]string) map[string][]string {
+	if len(byID) == 0 {
+		return nil
+	}
+	out := make(map[string][]string, len(byID))
+	for i := range subs {
+		sub := &subs[i]
+		itemIDs := byID[sub.ID]
+		if len(itemIDs) == 0 {
+			continue
+		}
+		cl, ok := s.checklists.Get(sub.PolicyType)
+		if !ok {
+			continue
+		}
+		desc := make(map[string]string, len(cl.Required))
+		for _, it := range cl.Required {
+			desc[it.ID] = it.Description
+		}
+		missing := make(map[string]bool, len(sub.MissingItems))
+		for _, m := range sub.MissingItems {
+			missing[m.ID] = true
+		}
+		var names []string
+		for _, id := range itemIDs {
+			if missing[id] {
+				continue
+			}
+			if d := desc[id]; d != "" {
+				names = append(names, d)
+			}
+		}
+		if len(names) > 0 {
+			out[sub.ID] = names
+		}
+	}
+	return out
 }
 
 func (s *SubmissionsService) createSubmission(ctx context.Context, req IngestRequest) (*model.Submission, error) {
@@ -717,6 +908,7 @@ func (s *SubmissionsService) classifyAttachments(ctx context.Context, sub *model
 // classifyAttachment classifies one attachment and extracts its declared field.
 func (s *SubmissionsService) classifyAttachment(ctx context.Context, sub *model.Submission, e model.Email, cl model.Checklist, a model.Attachment, itemByID map[string]model.RequiredItem) model.Document {
 	text := s.extractText(a)
+	unreadable := s.isUnreadable(a, text)
 	result, err := s.classifier.Classify(ctx, classifier.Input{
 		Filename:    a.Filename,
 		ContentType: a.ContentType,
@@ -724,6 +916,9 @@ func (s *SubmissionsService) classifyAttachment(ctx context.Context, sub *model.
 		PolicyType:  cl.PolicyType,
 		Checklist:   cl,
 	})
+	if result.Capped {
+		s.auditCapOnce(ctx)
+	}
 	if err != nil {
 		s.audit(ctx, sub.ID, model.EventLLMFailed, map[string]any{
 			"filename": a.Filename,
@@ -747,6 +942,7 @@ func (s *SubmissionsService) classifyAttachment(ctx context.Context, sub *model.
 		Confidence:    result.Confidence,
 		ClassifiedBy:  result.By,
 		ExtractedText: textutil.TruncateBytes(text, maxExtractedTextBytes),
+		Unreadable:    unreadable,
 		CreatedAt:     s.now(),
 	}
 
@@ -757,6 +953,15 @@ func (s *SubmissionsService) classifyAttachment(ctx context.Context, sub *model.
 		"by":            result.By,
 		"reason":        result.Reason,
 	})
+
+	if unreadable {
+		s.log.WithField("filename", a.Filename).Warn("document appears unreadable (scanned); no text extracted")
+		s.audit(ctx, sub.ID, model.EventDocumentUnreadable, map[string]any{
+			"filename":        a.Filename,
+			"size_bytes":      a.Size,
+			"extracted_chars": len(strings.TrimSpace(text)),
+		})
+	}
 
 	if item, ok := itemByID[result.CandidateID]; ok && item.RequiresField != nil {
 		if extracted := s.extractField(ctx, sub.ID, a.Filename, text, item.RequiresField); extracted != nil {
@@ -779,6 +984,10 @@ func (s *SubmissionsService) extractField(ctx context.Context, submissionID, fil
 		FieldType:        string(rf.Type),
 	})
 	s.auditLLMCall(ctx, submissionID, "extract_field", filename, resp.Usage)
+	if errors.Is(err, llm.ErrSpendCapReached) {
+		s.auditCapOnce(ctx)
+		return nil // soft-pass: extraction not run
+	}
 	if err != nil {
 		s.audit(ctx, submissionID, model.EventLLMFailed, map[string]any{
 			"filename":   filename,
@@ -798,6 +1007,32 @@ func (s *SubmissionsService) extractField(ctx context.Context, submissionID, fil
 	return resp.Value
 }
 
+// auditCapOnce emits the llm.capped audit at most once per UTC day. It writes
+// directly, bypassing the ingest's audit collector: the spend cap is a global
+// daily event that must be recorded even if this ingest later fails to commit.
+func (s *SubmissionsService) auditCapOnce(ctx context.Context) {
+	day := s.now().UTC().Format("2006-01-02")
+	s.cappedMu.Lock()
+	if s.cappedDay == day {
+		s.cappedMu.Unlock()
+		return
+	}
+	s.cappedDay = day // claim now to dedupe; roll back below if the write fails
+	s.cappedMu.Unlock()
+
+	entry := &model.AuditEntry{
+		EventType: model.EventLLMCapped,
+		Payload:   map[string]any{"day": day},
+		RequestID: logger.RequestIDFromContext(ctx),
+	}
+	if err := s.repo.Audit.Append(ctx, entry); err != nil {
+		s.cappedMu.Lock()
+		s.cappedDay = "" // let a later ingest retry the audit
+		s.cappedMu.Unlock()
+		s.log.WithError(err).Warn("llm.capped audit append failed")
+	}
+}
+
 func (s *SubmissionsService) auditLLMCall(ctx context.Context, submissionID, op, filename string, u llm.Usage) {
 	if u.PromptHash == "" && u.InputTokens == 0 && u.OutputTokens == 0 {
 		return
@@ -814,12 +1049,50 @@ func (s *SubmissionsService) auditLLMCall(ctx context.Context, submissionID, op,
 	})
 }
 
+// isUnreadable flags a document we can't verify: a type with no extractor (image,
+// opaque binary; never text/*), or a PDF big enough to be a form yet near-empty.
+func (s *SubmissionsService) isUnreadable(a model.Attachment, text string) bool {
+	ct := normalizeContentType(a.ContentType)
+	if strings.HasPrefix(ct, "text/") {
+		return false
+	}
+	if _, ok := s.extractors[ct]; !ok {
+		return true
+	}
+	if !isPDF(a.ContentType) {
+		return false
+	}
+	if int64(a.Size) < s.cfg.Document.UnreadableMinSizeBytes {
+		return false
+	}
+	return len(strings.TrimSpace(text)) < s.cfg.Document.UnreadableMinChars
+}
+
+// isPDF reports a PDF content type, ignoring any MIME parameters.
+func isPDF(contentType string) bool {
+	ct := normalizeContentType(contentType)
+	return ct == "application/pdf" || ct == "application/x-pdf"
+}
+
+// normalizeContentType strips MIME parameters and lowercases so a lookup keyed on
+// the bare media type still matches "text/csv; charset=utf-8".
+func normalizeContentType(contentType string) string {
+	if mt, _, err := mime.ParseMediaType(contentType); err == nil {
+		return mt // ParseMediaType lowercases the media type
+	}
+	return strings.ToLower(strings.TrimSpace(contentType))
+}
+
 func (s *SubmissionsService) extractText(a model.Attachment) (text string) {
 	if len(a.Content) == 0 {
 		return ""
 	}
-	ext, ok := s.extractors[strings.ToLower(a.ContentType)]
+	ct := normalizeContentType(a.ContentType)
+	ext, ok := s.extractors[ct]
 	if !ok || ext == nil {
+		if strings.HasPrefix(ct, "text/") {
+			return string(a.Content) // plain text reads directly, no extractor needed
+		}
 		return ""
 	}
 	// a malformed document must not crash the poller

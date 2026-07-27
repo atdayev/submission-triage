@@ -21,6 +21,19 @@ const (
 	maxAttachments    = 100 // bound per-message attachment count
 )
 
+// autoResponseHeaders are surfaced on Payload.Headers so the pipeline can
+// detect automated mail (out-of-office, bulk, list, bounces) and record why a
+// reply was suppressed. Not every header drives detection (see detectAutoSubmitted);
+// X-Auto-Response-Suppress is kept only for the suppression audit trail.
+var autoResponseHeaders = []string{
+	"Auto-Submitted",
+	"Precedence",
+	"List-Id",
+	"List-Unsubscribe",
+	"X-Auto-Response-Suppress",
+	"Return-Path",
+}
+
 // Address is a parsed email address with optional display name.
 type Address struct {
 	Email string
@@ -98,6 +111,11 @@ func FromReader(r io.Reader) (Payload, error) {
 	p.Headers = []Header{
 		{Name: "In-Reply-To", Value: inReplyTo},
 		{Name: "References", Value: references},
+	}
+	for _, name := range autoResponseHeaders {
+		if v := strings.TrimSpace(msg.Header.Get(name)); v != "" {
+			p.Headers = append(p.Headers, Header{Name: name, Value: stripControl(v)})
+		}
 	}
 	p.Attachments = atts
 	return p, nil

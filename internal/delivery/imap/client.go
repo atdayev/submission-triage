@@ -30,35 +30,79 @@ var dialClient = func(addr string) (*imapclient.Client, error) {
 	})
 }
 
+// filer performs the low-level move/copy operations behind File. The real one
+// wraps imapclient; a fake drives the capability-ladder tests.
+type filer interface {
+	caps() goimap.CapSet
+	create(mailbox string) error
+	move(uid goimap.UID, mailbox string) error
+	copy(uid goimap.UID, mailbox string) error
+	markDeleted(uid goimap.UID) error
+	uidExpunge(uid goimap.UID) error
+}
+
 type imapMailbox struct {
-	c        *imapclient.Client
-	maxBytes int64
-	log      *logrus.Entry
-	stop     chan struct{}
-	stopOnce sync.Once
+	c            *imapclient.Client
+	maxBytes     int64
+	log          *logrus.Entry
+	stop         chan struct{}
+	stopOnce     sync.Once
+	filer        filer
+	folderPrefix string
+	delim        string
+	warnNoMove   func() // called once per process when the server can't MOVE or UID EXPUNGE
 }
 
 // dialIMAP returns a connect-per-tick factory: each poll opens a fresh
-// logged-in, mailbox-selected connection.
-func dialIMAP(cfg config.IMAPConfig, log *logrus.Entry) func(ctx context.Context) (mailbox, error) {
+// authenticated, mailbox-selected connection.
+func dialIMAP(cfg config.IMAPConfig, auth Authenticator, log *logrus.Entry) func(ctx context.Context) (mailbox, error) {
+	// process-level: warn at most once if the server can't MOVE or UID EXPUNGE
+	var warnOnce sync.Once
+	warnNoMove := func() {
+		warnOnce.Do(func() {
+			log.Warn("imap: server advertises neither MOVE nor UIDPLUS; filed messages will be DUPLICATED (the original stays in the inbox)")
+		})
+	}
 	return func(ctx context.Context) (mailbox, error) {
 		c, err := dialClient(net.JoinHostPort(cfg.Host, cfg.Port))
 		if err != nil {
 			return nil, fmt.Errorf("imap dial: %w", err)
 		}
-		mb := &imapMailbox{c: c, maxBytes: cfg.MaxMessageBytes(), log: log, stop: make(chan struct{})}
+		mb := &imapMailbox{
+			c: c, maxBytes: cfg.MaxMessageBytes(), log: log, stop: make(chan struct{}),
+			filer: clientFiler{c: c}, folderPrefix: cfg.FolderPrefix, warnNoMove: warnNoMove,
+		}
 		// close on ctx cancel to unblock an in-flight command at shutdown
 		go mb.closeOnCancel(ctx)
-		if err := c.Login(cfg.Username, cfg.Password).Wait(); err != nil {
+		if err := auth(ctx, c); err != nil {
 			_ = mb.Close()
-			return nil, fmt.Errorf("imap login: %w", err)
+			return nil, fmt.Errorf("imap auth: %w", err)
 		}
 		if _, err := c.Select(cfg.Mailbox, nil).Wait(); err != nil {
 			_ = mb.Close()
 			return nil, fmt.Errorf("imap select %q: %w", cfg.Mailbox, err)
 		}
+		// refresh caps post-auth: MOVE/UIDPLUS are often advertised only after login
+		if _, err := c.Capability().Wait(); err != nil {
+			log.WithError(err).Debug("imap: capability refresh failed; using cached caps")
+		}
+		mb.delim = discoverDelim(c)
 		return mb, nil
 	}
+}
+
+// discoverDelim reads the server's hierarchy delimiter from LIST "" "" (`/` on
+// Gmail, `\` on some Exchange configs), defaulting to `/` if unavailable.
+func discoverDelim(c *imapclient.Client) string {
+	data, err := c.List("", "", nil).Collect()
+	if err == nil {
+		for _, d := range data {
+			if d.Delim != 0 {
+				return string(d.Delim)
+			}
+		}
+	}
+	return "/"
 }
 
 func (m *imapMailbox) closeOnCancel(ctx context.Context) {
@@ -154,7 +198,6 @@ func (m *imapMailbox) underCap(ctx context.Context, uids []goimap.UID) []goimap.
 	return keep
 }
 
-// MarkSeen adds the \Seen flag to the message with the given UID.
 func (m *imapMailbox) MarkSeen(_ context.Context, uid uint32) error {
 	return m.c.Store(goimap.UIDSetNum(goimap.UID(uid)), &goimap.StoreFlags{
 		Op:     goimap.StoreFlagsAdd,
@@ -163,16 +206,90 @@ func (m *imapMailbox) MarkSeen(_ context.Context, uid uint32) error {
 	}, nil).Close()
 }
 
-// Label files the message under name, creating the label-mailbox on first use.
-func (m *imapMailbox) Label(_ context.Context, uid uint32, name string) error {
-	set := goimap.UIDSetNum(goimap.UID(uid))
-	if _, err := m.c.Copy(set, name).Wait(); err != nil {
-		_ = m.c.Create(name, nil).Wait()
-		if _, err := m.c.Copy(set, name).Wait(); err != nil {
-			return fmt.Errorf("imap label %q: %w", name, err)
+// Flag adds the \Flagged flag, marking the message for human review. Set before
+// filing — MOVE invalidates the source UID, so flags must go on the original.
+func (m *imapMailbox) Flag(_ context.Context, uid uint32) error {
+	return m.c.Store(goimap.UIDSetNum(goimap.UID(uid)), &goimap.StoreFlags{
+		Op:     goimap.StoreFlagsAdd,
+		Flags:  []goimap.Flag{goimap.FlagFlagged},
+		Silent: true,
+	}, nil).Close()
+}
+
+// File moves the message into its per-status folder, creating the folder on
+// first use. The caller marks \Seen first — MOVE removes the source UID, so
+// mark-seen must happen before filing.
+func (m *imapMailbox) File(_ context.Context, uid uint32, folder string) error {
+	return fileByLadder(m.filer, goimap.UID(uid), m.folderPath(folder), m.warnNoMove)
+}
+
+// folderPath joins the configured prefix and the status folder with the server's
+// hierarchy delimiter (e.g. "Triage/Waiting on Broker").
+func (m *imapMailbox) folderPath(leaf string) string {
+	if m.folderPrefix == "" {
+		return leaf
+	}
+	return m.folderPrefix + m.delim + leaf
+}
+
+// fileByLadder files uid into folder using the strongest capability the server
+// offers: MOVE (RFC 6851); else UIDPLUS copy + flag-deleted + targeted UID
+// EXPUNGE (never a bare EXPUNGE, which would remove other \Deleted messages we
+// never touched); else a bare COPY that duplicates the message, warned once.
+func fileByLadder(f filer, uid goimap.UID, folder string, warnNoMove func()) error {
+	switch caps := f.caps(); {
+	case caps.Has(goimap.CapMove):
+		return withCreate(f, folder, func() error { return f.move(uid, folder) })
+	case caps.Has(goimap.CapUIDPlus):
+		if err := withCreate(f, folder, func() error { return f.copy(uid, folder) }); err != nil {
+			return err
 		}
+		if err := f.markDeleted(uid); err != nil {
+			return fmt.Errorf("imap: flag deleted: %w", err)
+		}
+		if err := f.uidExpunge(uid); err != nil {
+			return fmt.Errorf("imap: uid expunge: %w", err)
+		}
+		return nil
+	default:
+		warnNoMove()
+		return withCreate(f, folder, func() error { return f.copy(uid, folder) })
+	}
+}
+
+// withCreate runs op, creating the destination folder and retrying once on failure.
+func withCreate(f filer, folder string, op func() error) error {
+	if err := op(); err != nil {
+		_ = f.create(folder)
+		return op()
 	}
 	return nil
+}
+
+// clientFiler is the imapclient-backed filer.
+type clientFiler struct{ c *imapclient.Client }
+
+func (f clientFiler) caps() goimap.CapSet         { return f.c.Caps() }
+func (f clientFiler) create(mailbox string) error { return f.c.Create(mailbox, nil).Wait() }
+
+func (f clientFiler) move(uid goimap.UID, mailbox string) error {
+	_, err := f.c.Move(goimap.UIDSetNum(uid), mailbox).Wait()
+	return err
+}
+
+func (f clientFiler) copy(uid goimap.UID, mailbox string) error {
+	_, err := f.c.Copy(goimap.UIDSetNum(uid), mailbox).Wait()
+	return err
+}
+
+func (f clientFiler) markDeleted(uid goimap.UID) error {
+	return f.c.Store(goimap.UIDSetNum(uid), &goimap.StoreFlags{
+		Op: goimap.StoreFlagsAdd, Flags: []goimap.Flag{goimap.FlagDeleted}, Silent: true,
+	}, nil).Close()
+}
+
+func (f clientFiler) uidExpunge(uid goimap.UID) error {
+	return f.c.UIDExpunge(goimap.UIDSetNum(uid)).Close()
 }
 
 // Close logs out and tears down the connection.

@@ -17,6 +17,7 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/atdayev/submission-triage/internal/config"
+	"github.com/atdayev/submission-triage/internal/infrastructure/oauth"
 	"github.com/atdayev/submission-triage/internal/model"
 	"github.com/atdayev/submission-triage/pkg/retry"
 )
@@ -34,6 +35,10 @@ const (
 // smtpSendFn performs the network send; swapped out in tests.
 type smtpSendFn func(ctx context.Context, cfg config.SMTPConfig, from string, to []string, msg []byte) error
 
+// AuthMech builds the SMTP auth for one send; oauth mints a fresh token per
+// attempt. Nil selects password auth derived from the SMTP config.
+type AuthMech func(ctx context.Context) (smtp.Auth, error)
+
 // SMTPSender sends threaded replies over SMTP with retries.
 type SMTPSender struct {
 	cfg           config.SMTPConfig
@@ -43,15 +48,54 @@ type SMTPSender struct {
 	retryBase     time.Duration
 }
 
-// NewSMTPSender returns an SMTPSender using the real network send.
-func NewSMTPSender(cfg config.SMTPConfig, retryAttempts int, retryBase time.Duration, log *logrus.Entry) *SMTPSender {
+// NewSMTPSender returns an SMTPSender using the real network send. auth is nil
+// for password mode (PlainAuth from cfg) or an XOAUTH2 mechanism for oauth mode.
+func NewSMTPSender(cfg config.SMTPConfig, auth AuthMech, retryAttempts int, retryBase time.Duration, log *logrus.Entry) *SMTPSender {
 	return &SMTPSender{
-		cfg:           cfg,
-		send:          realSMTPSend,
+		cfg: cfg,
+		send: func(ctx context.Context, cfg config.SMTPConfig, from string, to []string, msg []byte) error {
+			return realSMTPSend(ctx, cfg, auth, from, to, msg)
+		},
 		log:           log,
 		retryAttempts: retryAttempts,
 		retryBase:     retryBase,
 	}
+}
+
+// XOAUTH2Auth builds an AuthMech that mints a fresh XOAUTH2 auth per send.
+func XOAUTH2Auth(user string, ts oauth.TokenSource) AuthMech {
+	return func(ctx context.Context) (smtp.Auth, error) {
+		token, err := ts.Token(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return xoauth2Auth{user: user, token: token}, nil
+	}
+}
+
+// xoauth2Auth implements smtp.Auth for XOAUTH2 (net/smtp ships only PLAIN and
+// CRAM-MD5).
+type xoauth2Auth struct {
+	user  string
+	token string
+}
+
+func (a xoauth2Auth) Start(server *smtp.ServerInfo) (string, []byte, error) {
+	// a bearer token must not cross the wire in the clear; loopback is exempt, as
+	// the STARTTLS negotiation is for the in-process test server
+	if !server.TLS && !isLocalhost(server.Name) {
+		return "", nil, retry.MarkPermanent(errors.New("smtp: XOAUTH2 requires a TLS connection"))
+	}
+	return "XOAUTH2", oauth.XOAUTH2Payload(a.user, a.token), nil
+}
+
+// Next only runs when the server rejects the token and sends a base64 error
+// challenge; answering it is pointless, so rejecting it aborts the exchange.
+func (a xoauth2Auth) Next(fromServer []byte, more bool) ([]byte, error) {
+	if more {
+		return nil, errors.New("smtp: unexpected XOAUTH2 server challenge")
+	}
+	return nil, nil
 }
 
 // Name reports the outbound channel.
@@ -104,6 +148,8 @@ func (s *SMTPSender) buildMessage(r model.Reply, msgID string) []byte {
 	if refs := buildRefs(r.References); refs != "" {
 		fmt.Fprintf(&h, "References: %s\r\n", refs)
 	}
+	// RFC 3834: mark our replies auto-generated so a well-behaved MTA suppresses its autoresponder
+	h.WriteString("Auto-Submitted: auto-generated\r\n")
 	h.WriteString("MIME-Version: 1.0\r\n")
 	h.WriteString("Content-Type: text/plain; charset=utf-8\r\n")
 	h.WriteString("\r\n")
@@ -194,8 +240,8 @@ func replyMessageID(r model.Reply) string {
 	return hex.EncodeToString(sum[:16])
 }
 
-func realSMTPSend(ctx context.Context, cfg config.SMTPConfig, from string, to []string, msg []byte) error {
-	client, cleanup, err := dialSMTP(ctx, cfg)
+func realSMTPSend(ctx context.Context, cfg config.SMTPConfig, auth AuthMech, from string, to []string, msg []byte) error {
+	client, cleanup, err := dialSMTP(ctx, cfg, auth)
 	if err != nil {
 		return err
 	}
@@ -226,7 +272,7 @@ func realSMTPSend(ctx context.Context, cfg config.SMTPConfig, from string, to []
 
 // dialSMTP dials, negotiates implicit TLS or STARTTLS, authenticates, and
 // returns the connected client plus a cleanup that closes it.
-func dialSMTP(ctx context.Context, cfg config.SMTPConfig) (*smtp.Client, func(), error) {
+func dialSMTP(ctx context.Context, cfg config.SMTPConfig, auth AuthMech) (*smtp.Client, func(), error) {
 	addr := net.JoinHostPort(cfg.Host, cfg.Port)
 	tlsCfg := &tls.Config{ServerName: cfg.Host}
 
@@ -274,14 +320,30 @@ func dialSMTP(ctx context.Context, cfg config.SMTPConfig) (*smtp.Client, func(),
 			return nil, nil, retry.MarkPermanent(fmt.Errorf("smtp: %s does not offer STARTTLS; refusing to send over plaintext", cfg.Host))
 		}
 	}
-	if cfg.Username != "" {
-		auth := smtp.PlainAuth("", cfg.Username, cfg.Password, cfg.Host)
-		if err := client.Auth(auth); err != nil {
+	mech, err := smtpAuth(ctx, cfg, auth)
+	if err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+	if mech != nil {
+		if err := client.Auth(mech); err != nil {
 			cleanup()
 			return nil, nil, retry.MarkPermanent(err) // bad credentials won't fix on retry
 		}
 	}
 	return client, cleanup, nil
+}
+
+// smtpAuth resolves the auth mechanism: the injected oauth AuthMech when set,
+// otherwise password PlainAuth when a username is configured, else none.
+func smtpAuth(ctx context.Context, cfg config.SMTPConfig, auth AuthMech) (smtp.Auth, error) {
+	if auth != nil {
+		return auth(ctx)
+	}
+	if cfg.Username != "" {
+		return smtp.PlainAuth("", cfg.Username, cfg.Password, cfg.Host), nil
+	}
+	return nil, nil
 }
 
 // classifySMTP marks 5xx permanent; other errors stay transient for retry.

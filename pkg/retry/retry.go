@@ -106,5 +106,4 @@ func (p *Permanent) Error() string {
 	return p.Err.Error()
 }
 
-// Unwrap returns the wrapped error.
 func (p *Permanent) Unwrap() error { return p.Err }

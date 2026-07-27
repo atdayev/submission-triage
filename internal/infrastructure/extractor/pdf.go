@@ -18,7 +18,6 @@ const (
 // PDF extracts plain text from PDF documents.
 type PDF struct{}
 
-// NewPDF returns a PDF text extractor.
 func NewPDF() *PDF { return &PDF{} }
 
 // Extract returns the plain text of a PDF, capped by page and byte limits.

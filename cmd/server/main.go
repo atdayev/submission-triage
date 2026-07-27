@@ -1,4 +1,3 @@
-// Server entry point. Runtime logic lives in internal/app.
 package main
 
 import (

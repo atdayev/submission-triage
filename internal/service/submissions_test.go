@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -36,6 +37,16 @@ func newFakeOutbox() *fakeOutbox {
 func (f *fakeOutbox) Enqueue(_ context.Context, e *model.OutboxEntry) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// coalesce: one pending row per submission (mirrors the partial unique index)
+	for _, ex := range f.entries {
+		if ex.Status == model.OutboxPending && ex.SubmissionID == e.SubmissionID {
+			ex.Reply = e.Reply
+			ex.NotBefore = e.NotBefore
+			ex.UpdatedAt = f.now()
+			e.ID = ex.ID // RETURNING id
+			return nil
+		}
+	}
 	if e.ID == "" {
 		f.seq++
 		e.ID = fmt.Sprintf("ob-%d", f.seq)
@@ -51,16 +62,23 @@ func (f *fakeOutbox) Enqueue(_ context.Context, e *model.OutboxEntry) error {
 	return nil
 }
 
-// ListPending returns pending entries last updated at or before olderThan,
-// mirroring the SQL retry-window filter.
-func (f *fakeOutbox) ListPending(_ context.Context, olderThan time.Time, _ int) ([]model.OutboxEntry, error) {
+// ListPending mirrors the SQL gate: due when not_before <= now, and for already-
+// attempted rows only, when the retry backoff has elapsed (updated_at <= cutoff).
+func (f *fakeOutbox) ListPending(_ context.Context, now, retryCutoff time.Time, _ int) ([]model.OutboxEntry, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out []model.OutboxEntry
 	for _, e := range f.entries {
-		if e.Status == model.OutboxPending && !e.UpdatedAt.After(olderThan) {
-			out = append(out, *e)
+		if e.Status != model.OutboxPending {
+			continue
 		}
+		if e.NotBefore.After(now) {
+			continue
+		}
+		if e.Attempts > 0 && e.UpdatedAt.After(retryCutoff) {
+			continue
+		}
+		out = append(out, *e)
 	}
 	return out, nil
 }
@@ -70,6 +88,17 @@ func (f *fakeOutbox) Update(_ context.Context, id string, status model.OutboxSta
 	defer f.mu.Unlock()
 	if e, ok := f.entries[id]; ok {
 		e.Status, e.Attempts, e.LastError = status, attempts, lastErr
+		e.UpdatedAt = f.now()
+	}
+	return nil
+}
+
+// MarkSent marks the row sent only if unchanged since version (mirrors the CAS).
+func (f *fakeOutbox) MarkSent(_ context.Context, id string, version time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if e, ok := f.entries[id]; ok && e.Status == model.OutboxPending && e.UpdatedAt.Equal(version) {
+		e.Status = model.OutboxSent
 		e.UpdatedAt = f.now()
 	}
 	return nil
@@ -117,10 +146,28 @@ type filenameClassifier struct {
 func (f *filenameClassifier) Classify(_ context.Context, in classifier.Input) (classifier.Result, error) {
 	for _, item := range f.checklist.Required {
 		if glob.MatchAny(item.Match.FilenamePatterns, in.Filename) {
-			return classifier.Result{CandidateID: item.ID, Confidence: 0.95, By: "heuristic"}, nil
+			return classifier.Result{CandidateID: item.ID, Confidence: 0.95, By: model.ClassifiedByFilename}, nil
 		}
 	}
-	return classifier.Result{By: "heuristic"}, nil
+	return classifier.Result{By: model.ClassifiedByHeuristic}, nil
+}
+
+// fixedConfidenceClassifier classifies every attachment to id at a fixed confidence.
+type fixedConfidenceClassifier struct {
+	id         string
+	confidence float64
+}
+
+func (f *fixedConfidenceClassifier) Classify(_ context.Context, _ classifier.Input) (classifier.Result, error) {
+	return classifier.Result{CandidateID: f.id, Confidence: f.confidence, By: "llm"}, nil
+}
+
+// cappedClassifier mimics the classifier degrading to heuristics when the LLM
+// spend cap is reached: no candidate, Capped set.
+type cappedClassifier struct{}
+
+func (cappedClassifier) Classify(_ context.Context, _ classifier.Input) (classifier.Result, error) {
+	return classifier.Result{By: "heuristic", Capped: true}, nil
 }
 
 func smallChecklist() model.Checklist {
@@ -134,6 +181,18 @@ func smallChecklist() model.Checklist {
 	}
 }
 
+// oneItemChecklist has a single required item, so a single flagged document
+// leaves nothing broker-actionable — the flag-only path.
+func oneItemChecklist() model.Checklist {
+	return model.Checklist{
+		Name:       "Test",
+		PolicyType: "cgl",
+		Required: []model.RequiredItem{
+			{ID: "acord_125", Description: "ACORD 125", Match: model.MatchRules{FilenamePatterns: []string{"*ACORD*125*"}}},
+		},
+	}
+}
+
 func newSvc(t *testing.T, subs *repomocks.SubmissionRepository, aud *repomocks.AuditRepository, mail *fakeMail, cl model.Checklist) *SubmissionsService {
 	t.Helper()
 	return newSvcWithClassifier(t, subs, aud, mail, cl, &filenameClassifier{checklist: cl})
@@ -143,6 +202,8 @@ func newSvcWithClassifier(t *testing.T, subs *repomocks.SubmissionRepository, au
 	t.Helper()
 	// the new-submission path dedups by deterministic id; default to "not found"
 	subs.On("FindByDeterministicID", mock.Anything, mock.Anything).Return(nil, model.ErrSubmissionNotFound).Maybe()
+	subs.On("SetLastReplyAt", mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+	subs.On("FilenameOnlyItems", mock.Anything, mock.Anything).Return(map[string][]string(nil), nil).Maybe()
 	log := logrus.NewEntry(logrus.New())
 	repo := &repository.Repository{Submissions: subs, Audit: aud, Outbox: newFakeOutbox()}
 	return NewSubmissionsService(Dependencies{
@@ -319,6 +380,537 @@ func TestIngestEmail_PersistFailureReturnsError(t *testing.T) {
 	aud.AssertNotCalled(t, "Append", mock.Anything, mock.Anything)
 }
 
+func TestIngestEmail_AutoSubmitted_SuppressesReply(t *testing.T) {
+	subs := repomocks.NewSubmissionRepository(t)
+	aud := repomocks.NewAuditRepository(t)
+	mail := &fakeMail{}
+	cl := smallChecklist()
+
+	priorAction := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
+	existing := &model.Submission{
+		ID:           "sub-ooo",
+		PolicyType:   "cgl",
+		State:        model.StateAwaiting,
+		LastActionAt: priorAction,
+		UpdatedAt:    priorAction,
+		Emails:       []model.Email{{DeterministicID: "first", MessageID: "first-msg"}},
+		Documents:    []model.Document{{ID: "doc-125", ClassifiedAs: "acord_125"}},
+		MissingItems: []model.MissingItem{{ID: "acord_126", Description: "ACORD 126"}},
+	}
+	subs.On("FindByEmailReference", mock.Anything, mock.Anything).Return(existing, false, nil)
+
+	var captured *model.Submission
+	subs.On("UpsertSubmission", mock.Anything, mock.Anything).Return(nil).Run(func(args mock.Arguments) {
+		captured = args.Get(1).(*model.Submission)
+	})
+
+	suppressed := false
+	aud.On("Append", mock.Anything, mock.Anything).Return(nil).Run(func(args mock.Arguments) {
+		if args.Get(1).(*model.AuditEntry).EventType == model.EventReplySuppressed {
+			suppressed = true
+		}
+	})
+
+	svc := newSvc(t, subs, aud, mail, cl)
+	svc.setClock(func() time.Time { return time.Date(2026, 5, 20, 9, 0, 0, 0, time.UTC) })
+
+	res, err := svc.IngestEmail(context.Background(), IngestRequest{
+		MessageID:           "ooo-msg",
+		InReplyTo:           "first-msg",
+		FromAddress:         "broker@example.com",
+		Subject:             "Re: CGL Submission",
+		AutoSubmitted:       true,
+		AutoResponseHeaders: map[string]string{"auto-submitted": "auto-replied"},
+	})
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if res.ReplyQueued {
+		t.Error("auto-submitted mail must not queue a reply")
+	}
+	svc.Wait()
+	if mail.sentCount() != 0 {
+		t.Fatalf("no reply should be sent for auto-submitted mail, got %d", mail.sentCount())
+	}
+	if !suppressed {
+		t.Fatal("expected reply.suppressed audit entry")
+	}
+	if captured == nil {
+		t.Fatal("submission never persisted")
+	}
+	if !captured.LastActionAt.Equal(priorAction) {
+		t.Errorf("last_action_at advanced on auto-submitted mail: got %v, want %v", captured.LastActionAt, priorAction)
+	}
+	subs.AssertNotCalled(t, "UpsertSubmissionWithReply", mock.Anything, mock.Anything, mock.Anything)
+}
+
+func TestIngestEmail_AutoSubmitted_PersistFailureReturnsError(t *testing.T) {
+	subs := repomocks.NewSubmissionRepository(t)
+	aud := repomocks.NewAuditRepository(t)
+	mail := &fakeMail{}
+	cl := smallChecklist()
+
+	subs.On("FindByEmailReference", mock.Anything, mock.Anything).Return(nil, false, model.ErrSubmissionNotFound)
+	subs.On("UpsertSubmission", mock.Anything, mock.Anything).Return(errors.New("db down"))
+	aud.On("Append", mock.Anything, mock.Anything).Return(nil).Maybe()
+
+	svc := newSvc(t, subs, aud, mail, cl)
+	_, err := svc.IngestEmail(context.Background(), IngestRequest{
+		MessageID:           "auto-persist-fail",
+		Subject:             "New Submission - CGL",
+		AutoSubmitted:       true,
+		AutoResponseHeaders: map[string]string{"precedence": "bulk"},
+	})
+	if err == nil {
+		t.Fatal("expected a suppressed-persist failure to return an error so the poller retries")
+	}
+	svc.Wait()
+	if mail.sentCount() != 0 {
+		t.Fatalf("no reply should be sent for suppressed mail, got %d", mail.sentCount())
+	}
+	// a failed persist must leave no orphan audit rows; they would duplicate on retry
+	aud.AssertNotCalled(t, "Append", mock.Anything, mock.Anything)
+}
+
+func TestIngestEmail_FlagOnly_NoReplyWhenNothingToAsk(t *testing.T) {
+	subs := repomocks.NewSubmissionRepository(t)
+	aud := repomocks.NewAuditRepository(t)
+	mail := &fakeMail{}
+	cl := oneItemChecklist()
+	lowConf := &fixedConfidenceClassifier{id: "acord_125", confidence: 0.60}
+
+	subs.On("FindByEmailReference", mock.Anything, mock.Anything).Return(nil, false, model.ErrSubmissionNotFound)
+	var captured *model.Submission
+	subs.On("UpsertSubmission", mock.Anything, mock.Anything).Return(nil).Run(func(args mock.Arguments) {
+		captured = args.Get(1).(*model.Submission)
+	})
+
+	needsReviewAudited := false
+	aud.On("Append", mock.Anything, mock.Anything).Return(nil).Run(func(args mock.Arguments) {
+		if args.Get(1).(*model.AuditEntry).EventType == model.EventNeedsReview {
+			needsReviewAudited = true
+		}
+	})
+
+	svc := newSvcWithClassifier(t, subs, aud, mail, cl, lowConf)
+	svc.cfg.Classifier.ConfidenceFloor = 0.80
+
+	res, err := svc.IngestEmail(context.Background(), IngestRequest{
+		MessageID: "low-conf", Subject: "New Submission - CGL",
+		Attachments: []model.Attachment{{Filename: "mystery.pdf", ContentType: "application/pdf", Content: []byte("x")}},
+	})
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	// review is a flag, not a state: the submission stays awaiting, flagged.
+	if res.State != model.StateAwaiting {
+		t.Fatalf("state: got %s, want awaiting", res.State)
+	}
+	if !res.NeedsReview {
+		t.Error("expected the submission to be flagged for review")
+	}
+	if res.ReplyQueued {
+		t.Error("a flag-only submission must not queue a broker reply")
+	}
+	svc.Wait()
+	if mail.sentCount() != 0 {
+		t.Fatalf("no reply expected when everything outstanding is flagged, got %d", mail.sentCount())
+	}
+	if !needsReviewAudited {
+		t.Error("expected submission.needs_review audit entry")
+	}
+	if captured == nil || !captured.NeedsReview || captured.State != model.StateAwaiting {
+		t.Fatalf("submission should persist awaiting+flagged, got %+v", captured)
+	}
+	subs.AssertNotCalled(t, "UpsertSubmissionWithReply", mock.Anything, mock.Anything, mock.Anything)
+}
+
+// the headline Fix Spec 3 case: an unverifiable document flags the submission
+// but must not suppress the request for the documents that are genuinely absent.
+func TestIngestEmail_LowConfidence_FlagsButStillRequestsAbsent(t *testing.T) {
+	subs := repomocks.NewSubmissionRepository(t)
+	aud := repomocks.NewAuditRepository(t)
+	mail := &fakeMail{}
+	cl := smallChecklist() // acord_125 + acord_126
+	lowConf := &fixedConfidenceClassifier{id: "acord_125", confidence: 0.60}
+
+	subs.On("FindByEmailReference", mock.Anything, mock.Anything).Return(nil, false, model.ErrSubmissionNotFound)
+	var captured *model.Submission
+	subs.On("UpsertSubmissionWithReply", mock.Anything, mock.Anything, mock.Anything).Return(nil).Run(func(args mock.Arguments) {
+		captured = args.Get(1).(*model.Submission)
+	})
+	subs.On("UpsertEmail", mock.Anything, mock.Anything).Return(nil).Maybe()
+	aud.On("Append", mock.Anything, mock.Anything).Return(nil)
+
+	svc := newSvcWithClassifier(t, subs, aud, mail, cl, lowConf)
+	svc.cfg.Classifier.ConfidenceFloor = 0.80
+
+	res, err := svc.IngestEmail(context.Background(), IngestRequest{
+		MessageID: "low-conf-mixed", Subject: "New Submission - CGL", FromAddress: "b@x",
+		Attachments: []model.Attachment{{Filename: "mystery.pdf", ContentType: "application/pdf", Content: []byte("x")}},
+	})
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if res.State != model.StateAwaiting || !res.NeedsReview || !res.ReplyQueued {
+		t.Fatalf("want awaiting+flagged+reply, got state=%s review=%v queued=%v", res.State, res.NeedsReview, res.ReplyQueued)
+	}
+	if captured == nil || !captured.NeedsReview {
+		t.Fatalf("submission should persist flagged, got %+v", captured)
+	}
+	svc.Wait()
+	if mail.sentCount() != 1 {
+		t.Fatalf("expected the absent item to be requested, got %d replies", mail.sentCount())
+	}
+	body := mail.sent[0].BodyText
+	if !contains(body, "ACORD 126") {
+		t.Errorf("reply should ask for the genuinely-absent ACORD 126:\n%s", body)
+	}
+	if contains(body, "ACORD 125") {
+		t.Errorf("reply must not mention the flagged (low-confidence) ACORD 125:\n%s", body)
+	}
+}
+
+func TestIngestEmail_SpendCapped_AuditsOnceAndFallsBack(t *testing.T) {
+	subs := repomocks.NewSubmissionRepository(t)
+	aud := repomocks.NewAuditRepository(t)
+	mail := &fakeMail{}
+	cl := smallChecklist()
+
+	subs.On("FindByEmailReference", mock.Anything, mock.Anything).Return(nil, false, model.ErrSubmissionNotFound)
+	subs.On("UpsertSubmissionWithReply", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+	subs.On("UpsertEmail", mock.Anything, mock.Anything).Return(nil).Maybe()
+
+	cappedCount := 0
+	aud.On("Append", mock.Anything, mock.Anything).Return(nil).Run(func(args mock.Arguments) {
+		if args.Get(1).(*model.AuditEntry).EventType == model.EventLLMCapped {
+			cappedCount++
+		}
+	})
+
+	svc := newSvcWithClassifier(t, subs, aud, mail, cl, cappedClassifier{})
+	res, err := svc.IngestEmail(context.Background(), IngestRequest{
+		MessageID: "capped", Subject: "New Submission - CGL",
+		Attachments: []model.Attachment{
+			{Filename: "a.pdf", ContentType: "application/pdf", Content: []byte("a")},
+			{Filename: "b.pdf", ContentType: "application/pdf", Content: []byte("b")},
+			{Filename: "c.pdf", ContentType: "application/pdf", Content: []byte("c")},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	// classification degraded to heuristics: nothing classified, so items are missing
+	if res.State != model.StateAwaiting {
+		t.Fatalf("state: got %s, want awaiting", res.State)
+	}
+	if cappedCount != 1 {
+		t.Fatalf("llm.capped should be audited exactly once across attachments, got %d", cappedCount)
+	}
+	svc.Wait()
+}
+
+// an escalated submission whose only outstanding item is flagged de-escalates to
+// awaiting (broker has nothing to do) and sets the review flag — no reply.
+func TestIngestEmail_EscalatedThenLowConfidence_FlagsAndDeEscalates(t *testing.T) {
+	subs := repomocks.NewSubmissionRepository(t)
+	aud := repomocks.NewAuditRepository(t)
+	mail := &fakeMail{}
+	cl := oneItemChecklist()
+	lowConf := &fixedConfidenceClassifier{id: "acord_125", confidence: 0.60}
+
+	existing := &model.Submission{
+		ID: "esc-1", PolicyType: "cgl", State: model.StateEscalated,
+		Emails: []model.Email{{DeterministicID: "first", MessageID: "first-msg"}},
+	}
+	subs.On("FindByEmailReference", mock.Anything, mock.Anything).Return(existing, false, nil)
+	var captured *model.Submission
+	subs.On("UpsertSubmission", mock.Anything, mock.Anything).Return(nil).Run(func(args mock.Arguments) {
+		captured = args.Get(1).(*model.Submission)
+	})
+	aud.On("Append", mock.Anything, mock.Anything).Return(nil)
+
+	svc := newSvcWithClassifier(t, subs, aud, mail, cl, lowConf)
+	svc.cfg.Classifier.ConfidenceFloor = 0.80
+
+	res, err := svc.IngestEmail(context.Background(), IngestRequest{
+		MessageID:   "reply-msg",
+		InReplyTo:   "first-msg",
+		FromAddress: "broker@example.com",
+		Subject:     "Re: CGL",
+		Attachments: []model.Attachment{{Filename: "mystery.pdf", ContentType: "application/pdf", Content: []byte("x")}},
+	})
+	if err != nil {
+		t.Fatalf("ingest must not fail on escalated+low-confidence: %v", err)
+	}
+	if res.State != model.StateAwaiting || !res.NeedsReview {
+		t.Fatalf("want awaiting+flagged, got state=%s review=%v", res.State, res.NeedsReview)
+	}
+	if captured == nil || captured.State != model.StateAwaiting || !captured.NeedsReview {
+		t.Fatalf("submission must persist awaiting+flagged, got %+v", captured)
+	}
+	svc.Wait()
+	subs.AssertNotCalled(t, "UpsertSubmissionWithReply", mock.Anything, mock.Anything, mock.Anything)
+}
+
+func TestIngestEmail_LowConfidence_PersistFailureReturnsError(t *testing.T) {
+	subs := repomocks.NewSubmissionRepository(t)
+	aud := repomocks.NewAuditRepository(t)
+	mail := &fakeMail{}
+	cl := oneItemChecklist()
+	lowConf := &fixedConfidenceClassifier{id: "acord_125", confidence: 0.60}
+
+	subs.On("FindByEmailReference", mock.Anything, mock.Anything).Return(nil, false, model.ErrSubmissionNotFound)
+	subs.On("UpsertSubmission", mock.Anything, mock.Anything).Return(errors.New("db down"))
+	aud.On("Append", mock.Anything, mock.Anything).Return(nil).Maybe()
+
+	svc := newSvcWithClassifier(t, subs, aud, mail, cl, lowConf)
+	svc.cfg.Classifier.ConfidenceFloor = 0.80
+
+	_, err := svc.IngestEmail(context.Background(), IngestRequest{
+		MessageID:   "lc-fail",
+		Subject:     "New Submission - CGL",
+		Attachments: []model.Attachment{{Filename: "mystery.pdf", ContentType: "application/pdf", Content: []byte("x")}},
+	})
+	if err == nil {
+		t.Fatal("expected a needs-review persist failure to return an error so the poller retries")
+	}
+	svc.Wait()
+	if mail.sentCount() != 0 {
+		t.Fatalf("no reply for needs_review, got %d", mail.sentCount())
+	}
+	// audits must not flush before a successful commit
+	aud.AssertNotCalled(t, "Append", mock.Anything, mock.Anything)
+}
+
+func TestSendDigest_RendersOpenSubmissions(t *testing.T) {
+	subs := repomocks.NewSubmissionRepository(t)
+	aud := repomocks.NewAuditRepository(t)
+	mail := &fakeMail{}
+	cl := smallChecklist()
+	store := &multiStore{byType: map[string]model.Checklist{"cgl": cl}}
+
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	open := []model.Submission{
+		{ID: "a1", PolicyType: "cgl", State: model.StateAwaiting, NeedsReview: true, SubjectLine: "New Sub A", FromAddress: "a@x",
+			CreatedAt: now.Add(-2 * time.Hour), LastActionAt: now.Add(-time.Hour),
+			MissingItems: []model.MissingItem{{ID: "acord_125", Description: "ACORD 125", Reason: "received but not confidently identified", Code: model.ReasonLowConfidence}}},
+		{ID: "b1", PolicyType: "cgl", State: model.StateAwaiting, SubjectLine: "New Sub B", FromAddress: "b@x",
+			CreatedAt: now.Add(-3 * time.Hour), LastActionAt: now.Add(-3 * time.Hour),
+			MissingItems: []model.MissingItem{{ID: "acord_126", Description: "ACORD 126", Reason: "document not provided", Code: model.ReasonNotProvided}}},
+	}
+	subs.On("ListOpen", mock.Anything, mock.Anything).Return(open, nil)
+
+	digestSent := false
+	aud.On("Append", mock.Anything, mock.Anything).Return(nil).Run(func(args mock.Arguments) {
+		if args.Get(1).(*model.AuditEntry).EventType == model.EventDigestSent {
+			digestSent = true
+		}
+	})
+
+	svc := newSvcWith(t, subs, aud, mail, store, nil)
+	svc.setClock(func() time.Time { return now })
+
+	if err := svc.SendDigest(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if mail.sentCount() != 1 {
+		t.Fatalf("expected 1 digest email, got %d", mail.sentCount())
+	}
+	if mail.sent[0].ToAddress != "ops@example.com" {
+		t.Errorf("recipient: got %q", mail.sent[0].ToAddress)
+	}
+	body := mail.sent[0].BodyText
+	for _, want := range []string{"New Sub A", "New Sub B", "1 submission(s) need review", "[needs review]", "Awaiting"} {
+		if !contains(body, want) {
+			t.Errorf("digest missing %q:\n%s", want, body)
+		}
+	}
+	if contains(body, "acord_125") || contains(body, "acord_126") {
+		t.Errorf("digest leaked internal item ids:\n%s", body)
+	}
+	if !digestSent {
+		t.Fatal("expected EventDigestSent audit entry")
+	}
+}
+
+func TestSendDigest_FlagsFilenameOnlyMatches(t *testing.T) {
+	subs := repomocks.NewSubmissionRepository(t)
+	aud := repomocks.NewAuditRepository(t)
+	mail := &fakeMail{}
+	cl := smallChecklist()
+	store := &multiStore{byType: map[string]model.Checklist{"cgl": cl}}
+
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	open := []model.Submission{
+		{ID: "done", PolicyType: "cgl", State: model.StateComplete, SubjectLine: "Complete Sub", FromAddress: "d@x",
+			CreatedAt: now.Add(-2 * time.Hour), LastActionAt: now.Add(-time.Hour)},
+	}
+	subs.On("ListOpen", mock.Anything, mock.Anything).Return(open, nil)
+	// the repo flags acord_125 as filename-only; the service resolves its human name
+	subs.On("FilenameOnlyItems", mock.Anything, mock.Anything).Return(map[string][]string{"done": {"acord_125"}}, nil)
+	aud.On("Append", mock.Anything, mock.Anything).Return(nil).Maybe()
+
+	svc := newSvcWith(t, subs, aud, mail, store, nil)
+	svc.setClock(func() time.Time { return now })
+
+	if err := svc.SendDigest(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	body := mail.sent[0].BodyText
+	if !contains(body, "Matched on filename only, content not verified: ACORD 125") {
+		t.Errorf("digest missing the filename-only flag with the resolved item name:\n%s", body)
+	}
+	if contains(body, "acord_125") {
+		t.Errorf("digest leaked the internal item id:\n%s", body)
+	}
+}
+
+func TestIngestEmail_FirstReplyImmediateDespiteWindow(t *testing.T) {
+	subs := repomocks.NewSubmissionRepository(t)
+	aud := repomocks.NewAuditRepository(t)
+	mail := &fakeMail{}
+	cl := smallChecklist()
+
+	subs.On("FindByEmailReference", mock.Anything, mock.Anything).Return(nil, false, model.ErrSubmissionNotFound)
+	subs.On("UpsertSubmissionWithReply", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+	subs.On("UpsertEmail", mock.Anything, mock.Anything).Return(nil).Maybe()
+	aud.On("Append", mock.Anything, mock.Anything).Return(nil)
+
+	svc := newSvc(t, subs, aud, mail, cl)
+	svc.coalesceWindow = 2 * time.Minute // a window is set, but this is the first reply
+
+	_, err := svc.IngestEmail(context.Background(), IngestRequest{
+		MessageID: "m1", FromAddress: "broker@example.com", Subject: "New Submission - CGL",
+		Attachments: []model.Attachment{
+			{Filename: "ACORD_125.pdf", ContentType: "application/pdf", Content: []byte("a125")},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	svc.Wait()
+	if mail.sentCount() != 1 {
+		t.Fatalf("the first reply must send immediately even with a coalesce window, got %d", mail.sentCount())
+	}
+}
+
+func TestIngestEmail_RecordsLastReplyAtOnSend(t *testing.T) {
+	subs := repomocks.NewSubmissionRepository(t)
+	aud := repomocks.NewAuditRepository(t)
+	mail := &fakeMail{}
+	cl := smallChecklist()
+
+	// register a counting SetLastReplyAt BEFORE newSvc's .Maybe() so it wins
+	var lastReplyCalls int32
+	var gotID string
+	subs.On("SetLastReplyAt", mock.Anything, mock.Anything, mock.Anything).Return(nil).Run(func(args mock.Arguments) {
+		atomic.AddInt32(&lastReplyCalls, 1)
+		gotID = args.Get(1).(string)
+	})
+	subs.On("FindByEmailReference", mock.Anything, mock.Anything).Return(nil, false, model.ErrSubmissionNotFound)
+	subs.On("UpsertSubmissionWithReply", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+	subs.On("UpsertEmail", mock.Anything, mock.Anything).Return(nil).Maybe()
+	aud.On("Append", mock.Anything, mock.Anything).Return(nil)
+
+	svc := newSvc(t, subs, aud, mail, cl)
+	res, err := svc.IngestEmail(context.Background(), IngestRequest{
+		MessageID: "m1", FromAddress: "broker@example.com", Subject: "New Submission - CGL",
+		Attachments: []model.Attachment{{Filename: "ACORD_125.pdf", ContentType: "application/pdf", Content: []byte("a125")}},
+	})
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	svc.Wait()
+	if mail.sentCount() != 1 {
+		t.Fatalf("expected the reply to send, got %d", mail.sentCount())
+	}
+	if atomic.LoadInt32(&lastReplyCalls) != 1 {
+		t.Fatalf("a successful send must record last_reply_at exactly once, got %d", lastReplyCalls)
+	}
+	if gotID != res.SubmissionID {
+		t.Errorf("last_reply_at recorded for %q, want submission %q", gotID, res.SubmissionID)
+	}
+}
+
+func TestIngestEmail_FollowupAfterWindowSendsImmediately(t *testing.T) {
+	subs := repomocks.NewSubmissionRepository(t)
+	aud := repomocks.NewAuditRepository(t)
+	mail := &fakeMail{}
+	cl := smallChecklist()
+
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	existing := &model.Submission{
+		ID: "sub-1", PolicyType: "cgl", State: model.StateAwaiting,
+		LastReplyAt:  now.Add(-3 * time.Minute), // replied 3 min ago; window is 2 min
+		Emails:       []model.Email{{DeterministicID: "first", MessageID: "first-msg"}},
+		Documents:    []model.Document{{ID: "d125", ClassifiedAs: "acord_125"}},
+		MissingItems: []model.MissingItem{{ID: "acord_126", Description: "ACORD 126"}},
+	}
+	subs.On("FindByEmailReference", mock.Anything, mock.Anything).Return(existing, false, nil)
+	subs.On("UpsertSubmissionWithReply", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+	subs.On("UpsertEmail", mock.Anything, mock.Anything).Return(nil).Maybe()
+	aud.On("Append", mock.Anything, mock.Anything).Return(nil)
+
+	svc := newSvc(t, subs, aud, mail, cl)
+	svc.coalesceWindow = 2 * time.Minute
+	svc.setClock(func() time.Time { return now })
+
+	if _, err := svc.IngestEmail(context.Background(), IngestRequest{
+		MessageID: "second-msg", InReplyTo: "first-msg", FromAddress: "broker@example.com", Subject: "Re: CGL",
+		Attachments: []model.Attachment{{Filename: "ACORD_126.pdf", ContentType: "application/pdf", Content: []byte("a126")}},
+	}); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	svc.Wait()
+	// the previous reply was 3 min ago (> 2 min window), so spacing has released
+	if mail.sentCount() != 1 {
+		t.Fatalf("a follow-up after the coalesce window should send immediately, got %d", mail.sentCount())
+	}
+}
+
+func TestIngestEmail_FollowupWithinWindowDefersToSweeper(t *testing.T) {
+	subs := repomocks.NewSubmissionRepository(t)
+	aud := repomocks.NewAuditRepository(t)
+	mail := &fakeMail{}
+	cl := smallChecklist()
+
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	existing := &model.Submission{
+		ID: "sub-1", PolicyType: "cgl", State: model.StateAwaiting,
+		LastReplyAt:  now.Add(-30 * time.Second), // replied 30s ago
+		Emails:       []model.Email{{DeterministicID: "first", MessageID: "first-msg"}},
+		Documents:    []model.Document{{ID: "d125", ClassifiedAs: "acord_125"}},
+		MissingItems: []model.MissingItem{{ID: "acord_126", Description: "ACORD 126"}},
+	}
+	subs.On("FindByEmailReference", mock.Anything, mock.Anything).Return(existing, false, nil)
+	subs.On("UpsertSubmissionWithReply", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+	subs.On("UpsertEmail", mock.Anything, mock.Anything).Return(nil).Maybe()
+	aud.On("Append", mock.Anything, mock.Anything).Return(nil)
+
+	svc := newSvc(t, subs, aud, mail, cl)
+	svc.coalesceWindow = 2 * time.Minute
+	svc.setClock(func() time.Time { return now })
+
+	res, err := svc.IngestEmail(context.Background(), IngestRequest{
+		MessageID: "second-msg", InReplyTo: "first-msg", FromAddress: "broker@example.com", Subject: "Re: CGL",
+		Attachments: []model.Attachment{
+			{Filename: "ACORD_126.pdf", ContentType: "application/pdf", Content: []byte("a126")},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	// the reply is durably queued but NOT sent online: last_reply_at + window is still in the future
+	if !res.ReplyQueued {
+		t.Fatal("a deferred reply must still be queued in the outbox")
+	}
+	svc.Wait()
+	if mail.sentCount() != 0 {
+		t.Fatalf("a follow-up within the coalesce window must defer to the sweeper, got %d online sends", mail.sentCount())
+	}
+}
+
 func TestCheckEscalations(t *testing.T) {
 	subs := repomocks.NewSubmissionRepository(t)
 	aud := repomocks.NewAuditRepository(t)
@@ -326,18 +918,19 @@ func TestCheckEscalations(t *testing.T) {
 	cl := smallChecklist()
 
 	now := time.Date(2026, 5, 26, 12, 0, 0, 0, time.UTC)
-	stale := model.Submission{ID: "s1", State: model.StateAwaiting, LastActionAt: now.Add(-100 * time.Hour)}
+	// escalatable: the broker owes a document
+	broker := model.Submission{ID: "s1", State: model.StateAwaiting, LastActionAt: now.Add(-100 * time.Hour),
+		MissingItems: []model.MissingItem{{ID: "acord_126", Description: "ACORD 126", Code: model.ReasonNotProvided}}}
+	// blocked solely on an unreadable file: the agency's problem, must not escalate
+	flagOnly := model.Submission{ID: "s2", State: model.StateAwaiting, NeedsReview: true, LastActionAt: now.Add(-100 * time.Hour),
+		MissingItems: []model.MissingItem{{ID: "acord_125", Description: "ACORD 125", Code: model.ReasonUnreadable}}}
 
-	subs.On("ListStale", mock.Anything, mock.Anything, mock.Anything).Return([]model.Submission{stale}, nil)
-	subs.On("UpsertSubmission", mock.Anything, mock.Anything).Return(nil)
-
-	foundEscalated := false
-	aud.On("Append", mock.Anything, mock.Anything).Return(nil).Run(func(args mock.Arguments) {
-		e := args.Get(1).(*model.AuditEntry)
-		if e.EventType == model.EventEscalated {
-			foundEscalated = true
-		}
+	subs.On("ListStale", mock.Anything, mock.Anything, mock.Anything).Return([]model.Submission{broker, flagOnly}, nil)
+	var escalatedIDs []string
+	subs.On("UpsertSubmission", mock.Anything, mock.Anything).Return(nil).Run(func(args mock.Arguments) {
+		escalatedIDs = append(escalatedIDs, args.Get(1).(*model.Submission).ID)
 	})
+	aud.On("Append", mock.Anything, mock.Anything).Return(nil)
 
 	svc := newSvc(t, subs, aud, mail, cl)
 	svc.setClock(func() time.Time { return now })
@@ -345,8 +938,8 @@ func TestCheckEscalations(t *testing.T) {
 	if err := svc.CheckEscalations(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if !foundEscalated {
-		t.Fatal("expected EventEscalated audit entry")
+	if len(escalatedIDs) != 1 || escalatedIDs[0] != "s1" {
+		t.Fatalf("only the broker-actionable case should escalate, got %v", escalatedIDs)
 	}
 }
 
@@ -424,16 +1017,18 @@ func newSvcWith(t *testing.T, subs *repomocks.SubmissionRepository, aud *repomoc
 	t.Helper()
 	subs.On("FindByDeterministicID", mock.Anything, mock.Anything).Return(nil, model.ErrSubmissionNotFound).Maybe()
 	subs.On("ListEscalatedSince", mock.Anything, mock.Anything, mock.Anything).Return(nil, nil).Maybe()
+	subs.On("ListOpen", mock.Anything, mock.Anything).Return(nil, nil).Maybe()
+	subs.On("CountOpen", mock.Anything).Return(0, nil).Maybe()
+	subs.On("FilenameOnlyItems", mock.Anything, mock.Anything).Return(map[string][]string(nil), nil).Maybe()
+	subs.On("SetLastReplyAt", mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
 	cl := store.All()[0]
 	log := logrus.NewEntry(logrus.New())
 	repo := &repository.Repository{Submissions: subs, Audit: aud, Outbox: newFakeOutbox()}
 	return NewSubmissionsService(Dependencies{
-		Config: &config.Config{Escalation: config.EscalationConfig{
-			ThresholdHours:      72,
-			AutoCloseAfterHours: 24,
-			DigestIntervalHours: 24,
-			DigestRecipient:     "ops@example.com",
-		}},
+		Config: &config.Config{
+			Escalation: config.EscalationConfig{ThresholdHours: 72, AutoCloseAfterHours: 24},
+			Digest:     config.DigestConfig{IntervalHours: 24, Recipient: "ops@example.com", MaxRows: 500},
+		},
 		Repository:     repo,
 		EmailSender:    mail,
 		Classifier:     &filenameClassifier{checklist: cl},
@@ -751,49 +1346,7 @@ func TestCheckClosures_DisabledWhenAutoCloseIsZero(t *testing.T) {
 	// no ListCompletedBefore expectation registered — failing it would surface here
 }
 
-func TestSendEscalationDigest_SendsToConfiguredRecipient(t *testing.T) {
-	subs := repomocks.NewSubmissionRepository(t)
-	aud := repomocks.NewAuditRepository(t)
-	mail := &fakeMail{}
-	cl := smallChecklist()
-	store := &multiStore{byType: map[string]model.Checklist{"cgl": cl}}
-
-	now := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
-	escalated := []model.Submission{
-		{ID: "esc-1", PolicyType: "cgl", FromAddress: "a@x", State: model.StateEscalated, LastActionAt: now.Add(-100 * time.Hour)},
-		{ID: "esc-2", PolicyType: "cgl", FromAddress: "b@x", State: model.StateEscalated, LastActionAt: now.Add(-80 * time.Hour)},
-	}
-	subs.On("ListEscalatedSince", mock.Anything, mock.Anything, mock.Anything).Return(escalated, nil)
-
-	digestSent := false
-	aud.On("Append", mock.Anything, mock.Anything).Return(nil).Run(func(args mock.Arguments) {
-		e := args.Get(1).(*model.AuditEntry)
-		if e.EventType == model.EventDigestSent {
-			digestSent = true
-		}
-	})
-
-	svc := newSvcWith(t, subs, aud, mail, store, nil)
-	svc.setClock(func() time.Time { return now })
-
-	if err := svc.SendEscalationDigest(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if mail.sentCount() != 1 {
-		t.Fatalf("expected 1 digest email, got %d", mail.sentCount())
-	}
-	if mail.sent[0].ToAddress != "ops@example.com" {
-		t.Errorf("recipient: got %q, want ops@example.com", mail.sent[0].ToAddress)
-	}
-	if !contains(mail.sent[0].BodyText, "esc-1") || !contains(mail.sent[0].BodyText, "esc-2") {
-		t.Errorf("digest body should list both submissions, got: %q", mail.sent[0].BodyText)
-	}
-	if !digestSent {
-		t.Fatal("expected EventDigestSent audit entry")
-	}
-}
-
-func TestSendEscalationDigest_NoRecipientIsNoOp(t *testing.T) {
+func TestSendDigest_NoRecipientIsNoOp(t *testing.T) {
 	subs := repomocks.NewSubmissionRepository(t)
 	aud := repomocks.NewAuditRepository(t)
 	mail := &fakeMail{}
@@ -801,9 +1354,9 @@ func TestSendEscalationDigest_NoRecipientIsNoOp(t *testing.T) {
 	store := &multiStore{byType: map[string]model.Checklist{"cgl": cl}}
 
 	svc := newSvcWith(t, subs, aud, mail, store, nil)
-	svc.cfg.Escalation.DigestRecipient = ""
+	svc.cfg.Digest.Recipient = ""
 
-	if err := svc.SendEscalationDigest(context.Background()); err != nil {
+	if err := svc.SendDigest(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if mail.sentCount() != 0 {
@@ -811,22 +1364,22 @@ func TestSendEscalationDigest_NoRecipientIsNoOp(t *testing.T) {
 	}
 }
 
-func TestSendEscalationDigest_NothingEscalatedIsNoOp(t *testing.T) {
+func TestSendDigest_NothingOpenIsNoOp(t *testing.T) {
 	subs := repomocks.NewSubmissionRepository(t)
 	aud := repomocks.NewAuditRepository(t)
 	mail := &fakeMail{}
 	cl := smallChecklist()
 	store := &multiStore{byType: map[string]model.Checklist{"cgl": cl}}
 
-	subs.On("ListEscalatedSince", mock.Anything, mock.Anything, mock.Anything).Return([]model.Submission{}, nil)
+	subs.On("ListOpen", mock.Anything, mock.Anything).Return([]model.Submission{}, nil)
 
 	svc := newSvcWith(t, subs, aud, mail, store, nil)
 
-	if err := svc.SendEscalationDigest(context.Background()); err != nil {
+	if err := svc.SendDigest(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if mail.sentCount() != 0 {
-		t.Errorf("expected 0 sends, got %d", mail.sentCount())
+		t.Errorf("expected 0 sends when nothing is open, got %d", mail.sentCount())
 	}
 }
 

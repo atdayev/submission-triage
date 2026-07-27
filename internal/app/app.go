@@ -132,6 +132,11 @@ func startWorkers(rootCtx context.Context, built *BuiltApp, cfg *config.Config, 
 		defer wg.Done()
 		service.NewEscalationWorker(built.Service, cfg.Escalation.Interval(), log).Run(rootCtx)
 	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		service.NewOutboxWorker(built.Service, cfg.Reply.FlushInterval(), log).Run(rootCtx)
+	}()
 	if built.Poller != nil {
 		wg.Add(1)
 		go func() {

@@ -310,7 +310,6 @@ func TestEscalationConfig_DurationConversions(t *testing.T) {
 		IntervalMinutes:     15,
 		ThresholdHours:      72,
 		AutoCloseAfterHours: 336,
-		DigestIntervalHours: 24,
 	}
 	if e.Interval().Minutes() != 15 {
 		t.Errorf("Interval: got %v", e.Interval())
@@ -321,8 +320,11 @@ func TestEscalationConfig_DurationConversions(t *testing.T) {
 	if e.AutoCloseAfter().Hours() != 336 {
 		t.Errorf("AutoCloseAfter: got %v", e.AutoCloseAfter())
 	}
-	if e.DigestInterval().Hours() != 24 {
-		t.Errorf("DigestInterval: got %v", e.DigestInterval())
+}
+
+func TestDigestConfig_Interval(t *testing.T) {
+	if got := (DigestConfig{IntervalHours: 24}).Interval().Hours(); got != 24 {
+		t.Errorf("Interval: got %v, want 24h", got)
 	}
 }
 
@@ -342,5 +344,70 @@ func TestSMTPConfigured(t *testing.T) {
 	}
 	if !(SMTPConfig{Host: "smtp.gmail.com", FromAddress: "ops@x"}).Configured() {
 		t.Error("host+from_address should be configured")
+	}
+}
+
+func TestMailConfig_Validate(t *testing.T) {
+	// full is a valid Google oauth config; mutate copies to test each gap.
+	full := func() OAuthConfig {
+		return OAuthConfig{Provider: "google", ClientID: "id", ClientSecret: "sec", User: "ops@x", RefreshToken: "rt"}
+	}
+	without := func(mut func(*OAuthConfig)) MailConfig {
+		o := full()
+		mut(&o)
+		return MailConfig{AuthMode: "oauth", OAuth: o}
+	}
+	tests := []struct {
+		name    string
+		mail    MailConfig
+		wantErr string // substring; "" means valid
+	}{
+		{"password default", MailConfig{AuthMode: "password"}, ""},
+		{"empty mode defaults to password", MailConfig{}, ""},
+		{"unknown mode", MailConfig{AuthMode: "token"}, "MAIL_AUTH_MODE"},
+		{"valid google", MailConfig{AuthMode: "oauth", OAuth: full()}, ""},
+		{"valid microsoft", MailConfig{AuthMode: "oauth", OAuth: OAuthConfig{Provider: "microsoft", ClientID: "id", ClientSecret: "sec", User: "ops@x", TenantID: "tid"}}, ""},
+		{"missing provider", without(func(o *OAuthConfig) { o.Provider = "" }), "MAIL_OAUTH_PROVIDER"},
+		{"missing client id", without(func(o *OAuthConfig) { o.ClientID = "" }), "MAIL_OAUTH_CLIENT_ID"},
+		{"missing client secret", without(func(o *OAuthConfig) { o.ClientSecret = "" }), "MAIL_OAUTH_CLIENT_SECRET"},
+		{"missing user", without(func(o *OAuthConfig) { o.User = "" }), "MAIL_OAUTH_USER"},
+		{"google missing refresh token", without(func(o *OAuthConfig) { o.RefreshToken = "" }), "MAIL_OAUTH_REFRESH_TOKEN"},
+		{"microsoft missing tenant", MailConfig{AuthMode: "oauth", OAuth: OAuthConfig{Provider: "microsoft", ClientID: "id", ClientSecret: "sec", User: "ops@x"}}, "MAIL_OAUTH_TENANT_ID"},
+		{"unknown provider", without(func(o *OAuthConfig) { o.Provider = "yahoo" }), "MAIL_OAUTH_PROVIDER"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.mail.Validate()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("expected valid, got %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("error %q missing %q", err.Error(), tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestIMAPConfigured_ModeAware(t *testing.T) {
+	hostOnly := IMAPConfig{Host: "imap.example.com"}
+	full := IMAPConfig{Host: "imap.example.com", Username: "u", Password: "p"}
+
+	// password mode (regression guard): host alone is not enough
+	if (&Config{IMAP: hostOnly}).IMAPConfigured() {
+		t.Error("password mode: host alone must not enable the poller")
+	}
+	if !(&Config{IMAP: full}).IMAPConfigured() {
+		t.Error("password mode: host+username+password must enable the poller")
+	}
+	// oauth mode: the mailbox identity comes from MAIL_OAUTH_USER, so host is enough
+	oauthCfg := &Config{IMAP: hostOnly, Mail: MailConfig{AuthMode: "oauth"}}
+	if !oauthCfg.IMAPConfigured() {
+		t.Error("oauth mode: host alone must enable the poller")
 	}
 }

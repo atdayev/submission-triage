@@ -34,9 +34,9 @@ func (_m *OutboxRepository) Enqueue(ctx context.Context, e *model.OutboxEntry) e
 	return r0
 }
 
-// ListPending provides a mock function with given fields: ctx, olderThan, limit
-func (_m *OutboxRepository) ListPending(ctx context.Context, olderThan time.Time, limit int) ([]model.OutboxEntry, error) {
-	ret := _m.Called(ctx, olderThan, limit)
+// ListPending provides a mock function with given fields: ctx, now, retryCutoff, limit
+func (_m *OutboxRepository) ListPending(ctx context.Context, now time.Time, retryCutoff time.Time, limit int) ([]model.OutboxEntry, error) {
+	ret := _m.Called(ctx, now, retryCutoff, limit)
 
 	if len(ret) == 0 {
 		panic("no return value specified for ListPending")
@@ -44,24 +44,42 @@ func (_m *OutboxRepository) ListPending(ctx context.Context, olderThan time.Time
 
 	var r0 []model.OutboxEntry
 	var r1 error
-	if rf, ok := ret.Get(0).(func(context.Context, time.Time, int) ([]model.OutboxEntry, error)); ok {
-		return rf(ctx, olderThan, limit)
+	if rf, ok := ret.Get(0).(func(context.Context, time.Time, time.Time, int) ([]model.OutboxEntry, error)); ok {
+		return rf(ctx, now, retryCutoff, limit)
 	}
-	if rf, ok := ret.Get(0).(func(context.Context, time.Time, int) []model.OutboxEntry); ok {
-		r0 = rf(ctx, olderThan, limit)
+	if rf, ok := ret.Get(0).(func(context.Context, time.Time, time.Time, int) []model.OutboxEntry); ok {
+		r0 = rf(ctx, now, retryCutoff, limit)
 	} else {
 		if ret.Get(0) != nil {
 			r0 = ret.Get(0).([]model.OutboxEntry)
 		}
 	}
 
-	if rf, ok := ret.Get(1).(func(context.Context, time.Time, int) error); ok {
-		r1 = rf(ctx, olderThan, limit)
+	if rf, ok := ret.Get(1).(func(context.Context, time.Time, time.Time, int) error); ok {
+		r1 = rf(ctx, now, retryCutoff, limit)
 	} else {
 		r1 = ret.Error(1)
 	}
 
 	return r0, r1
+}
+
+// MarkSent provides a mock function with given fields: ctx, id, version
+func (_m *OutboxRepository) MarkSent(ctx context.Context, id string, version time.Time) error {
+	ret := _m.Called(ctx, id, version)
+
+	if len(ret) == 0 {
+		panic("no return value specified for MarkSent")
+	}
+
+	var r0 error
+	if rf, ok := ret.Get(0).(func(context.Context, string, time.Time) error); ok {
+		r0 = rf(ctx, id, version)
+	} else {
+		r0 = ret.Error(0)
+	}
+
+	return r0
 }
 
 // Update provides a mock function with given fields: ctx, id, status, attempts, lastErr

@@ -2,6 +2,7 @@ package classifier
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/atdayev/submission-triage/internal/infrastructure/llm"
@@ -29,8 +30,15 @@ type Result struct {
 	Confidence  float64
 	By          string
 	Reason      string
+	Capped      bool // the LLM was skipped because the daily spend cap was reached
 	Usage       *llm.Usage
 }
+
+// Heuristic match confidences; filename scores highest despite being the weakest evidence.
+const (
+	confidenceFilename = 0.95
+	confidenceKeyword  = 0.85
+)
 
 // HeuristicLLMClassifier matches by filename and content, then falls back to an LLM.
 type HeuristicLLMClassifier struct {
@@ -45,25 +53,22 @@ func NewHeuristicLLMClassifier(client llm.Client) *HeuristicLLMClassifier {
 // Classify matches in against its checklist, using the LLM only when heuristics are ambiguous.
 func (c *HeuristicLLMClassifier) Classify(ctx context.Context, in Input) (Result, error) {
 	byName := matchByFilename(in)
-	if r, ok := singleMatch(byName, 0.95, "filename match"); ok {
-		return r, nil
-	}
-
 	byContent := matchByContent(in)
-	if r, ok := singleMatch(merge(byName, byContent), 0.85, ""); ok {
-		switch id := r.CandidateID; {
-		case byName[id] && byContent[id]:
-			r.Reason = "filename and content match"
-		case byName[id]:
-			r.Reason = "filename match"
-		default:
-			r.Reason = "content match"
+
+	if id, ok := singleMatch(byName); ok {
+		by, reason := model.ClassifiedByFilename, "filename match"
+		if byContent[id] {
+			by, reason = model.ClassifiedByFilenameKeyword, "filename and content match"
 		}
-		return r, nil
+		return Result{CandidateID: id, Confidence: confidenceFilename, By: by, Reason: reason}, nil
+	}
+	// byName isn't a singleton here; a filename hit would make merge ambiguous, so a lone match is keyword-only
+	if id, ok := singleMatch(merge(byName, byContent)); ok {
+		return Result{CandidateID: id, Confidence: confidenceKeyword, By: model.ClassifiedByKeyword, Reason: "content match"}, nil
 	}
 
 	if c.llmClient == nil {
-		return Result{By: "heuristic", Reason: "no match, llm unavailable"}, nil
+		return Result{By: model.ClassifiedByHeuristic, Reason: "no match, llm unavailable"}, nil
 	}
 	return c.classifyByLLM(ctx, in)
 }
@@ -83,17 +88,24 @@ func (c *HeuristicLLMClassifier) classifyByLLM(ctx context.Context, in Input) (R
 		Candidates:  candidates,
 		PolicyType:  in.PolicyType,
 	})
+	if errors.Is(err, llm.ErrSpendCapReached) {
+		// spend cap reached: degrade to heuristic-only, exactly like an absent LLM
+		return Result{By: model.ClassifiedByHeuristic, Reason: "llm spend cap reached", Capped: true}, nil
+	}
 	if err != nil {
-		return Result{By: "llm", Reason: fmt.Sprintf("llm error: %v", err)}, err
+		// a call that spent tokens then failed to parse still carries usage; surface
+		// it so the cost is audited like the extract-field path
+		usage := resp.Usage
+		return Result{By: model.ClassifiedByLLM, Reason: fmt.Sprintf("llm error: %v", err), Usage: &usage}, err
 	}
 	usage := resp.Usage
 	if resp.CandidateID == "" || resp.CandidateID == "unknown" {
-		return Result{Confidence: resp.Confidence, By: "llm", Reason: resp.Reason, Usage: &usage}, nil
+		return Result{Confidence: resp.Confidence, By: model.ClassifiedByLLM, Reason: resp.Reason, Usage: &usage}, nil
 	}
 	if !candidateIDs[resp.CandidateID] {
-		return Result{Confidence: resp.Confidence, By: "llm", Reason: "llm returned unknown candidate id", Usage: &usage}, nil
+		return Result{Confidence: resp.Confidence, By: model.ClassifiedByLLM, Reason: "llm returned unknown candidate id", Usage: &usage}, nil
 	}
-	return Result{CandidateID: resp.CandidateID, Confidence: resp.Confidence, By: "llm", Reason: resp.Reason, Usage: &usage}, nil
+	return Result{CandidateID: resp.CandidateID, Confidence: resp.Confidence, By: model.ClassifiedByLLM, Reason: resp.Reason, Usage: &usage}, nil
 }
 
 func matchByFilename(in Input) map[string]bool {
@@ -130,12 +142,13 @@ func merge(a, b map[string]bool) map[string]bool {
 	return out
 }
 
-func singleMatch(matches map[string]bool, confidence float64, reason string) (Result, bool) {
+// singleMatch returns the sole matched id, or false when zero or several matched.
+func singleMatch(matches map[string]bool) (string, bool) {
 	if len(matches) != 1 {
-		return Result{}, false
+		return "", false
 	}
 	for id := range matches {
-		return Result{CandidateID: id, Confidence: confidence, By: "heuristic", Reason: reason}, true
+		return id, true
 	}
-	return Result{}, false
+	return "", false
 }

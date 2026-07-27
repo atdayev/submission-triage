@@ -16,7 +16,6 @@ const (
 // CSV flattens a sheet to tab-joined rows.
 type CSV struct{}
 
-// NewCSV returns a CSV text extractor.
 func NewCSV() *CSV { return &CSV{} }
 
 // Extract returns the CSV rows as tab-joined lines, capped by row and scan limits.

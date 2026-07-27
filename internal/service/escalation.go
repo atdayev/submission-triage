@@ -2,14 +2,29 @@ package service
 
 import (
 	"context"
+	"runtime/debug"
 	"time"
 
 	"github.com/sirupsen/logrus"
 
+	"github.com/atdayev/submission-triage/internal/model"
 	"github.com/atdayev/submission-triage/pkg/logger"
 )
 
-// EscalationWorker periodically redelivers the outbox and runs escalation, closure, and digest checks.
+// recoverCheck runs a worker's check body, recovering from a panic so a poisoned
+// row can't kill the goroutine (and likely the process). It wraps the body only,
+// never the surrounding select, so context cancellation is never swallowed.
+func recoverCheck(ctx context.Context, svc *SubmissionsService, log *logrus.Entry, name string, body func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.WithField("check", name).Errorf("worker recovered from panic: %v\n%s", r, debug.Stack())
+			svc.audit(ctx, "", model.EventWorkerPanic, map[string]any{"check": name})
+		}
+	}()
+	body()
+}
+
+// EscalationWorker periodically runs escalation, closure, and digest checks.
 type EscalationWorker struct {
 	svc      *SubmissionsService
 	interval time.Duration
@@ -21,17 +36,14 @@ func NewEscalationWorker(svc *SubmissionsService, interval time.Duration, log *l
 	return &EscalationWorker{svc: svc, interval: interval, log: log}
 }
 
-// Run sweeps the outbox once, then ticks the periodic checks until ctx is canceled.
+// Run ticks the periodic checks until ctx is canceled. The outbox sweep is not
+// here — the OutboxWorker owns it so reply latency isn't tied to this interval.
 func (w *EscalationWorker) Run(ctx context.Context) {
 	ctx = logger.ContextWithLogger(ctx, w.log)
 	w.log.WithField("interval", w.interval.String()).Info("escalation worker started")
-	// sweep the outbox immediately so post-crash replies don't wait a full interval
-	if err := w.svc.RedeliverOutbox(ctx); err != nil {
-		w.log.WithError(err).Error("startup outbox redelivery failed")
-	}
 	t := time.NewTicker(w.interval)
 	defer t.Stop()
-	digestInterval := w.svc.cfg.Escalation.DigestInterval()
+	digestInterval := w.svc.cfg.Digest.Interval()
 	var digestTimer *time.Ticker
 	var digestC <-chan time.Time
 	if digestInterval > 0 {
@@ -48,22 +60,23 @@ func (w *EscalationWorker) Run(ctx context.Context) {
 			if ctx.Err() != nil {
 				return // canceled concurrently with the tick; skip a doomed cycle
 			}
-			if err := w.svc.RedeliverOutbox(ctx); err != nil {
-				w.log.WithError(err).Error("outbox redelivery failed")
-			}
-			if err := w.svc.CheckEscalations(ctx); err != nil {
-				w.log.WithError(err).Error("periodic escalation check failed")
-			}
-			if err := w.svc.CheckClosures(ctx); err != nil {
-				w.log.WithError(err).Error("periodic closure check failed")
-			}
+			recoverCheck(ctx, w.svc, w.log, "periodic_checks", func() {
+				if err := w.svc.CheckEscalations(ctx); err != nil {
+					w.log.WithError(err).Error("periodic escalation check failed")
+				}
+				if err := w.svc.CheckClosures(ctx); err != nil {
+					w.log.WithError(err).Error("periodic closure check failed")
+				}
+			})
 		case <-digestC:
 			if ctx.Err() != nil {
 				return
 			}
-			if err := w.svc.SendEscalationDigest(ctx); err != nil {
-				w.log.WithError(err).Error("escalation digest send failed")
-			}
+			recoverCheck(ctx, w.svc, w.log, "digest", func() {
+				if err := w.svc.SendDigest(ctx); err != nil {
+					w.log.WithError(err).Error("digest send failed")
+				}
+			})
 		}
 	}
 }

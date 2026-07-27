@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -29,6 +30,121 @@ func setupDB(t *testing.T) (*sql.DB, *SubmissionRepositoryImpl, *AuditRepository
 		t.Fatalf("migrate: %v", err)
 	}
 	return db, NewSubmissionRepository(db, log), NewAuditRepository(db, log)
+}
+
+func TestSubmissionRepo_ListOpenExcludesClosedAndCaps(t *testing.T) {
+	_, subs, _ := setupDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	seed := func(id string, state model.State) {
+		if err := subs.UpsertSubmission(ctx, &model.Submission{
+			ID: id, PolicyType: "cgl", State: state, CreatedAt: now, UpdatedAt: now, LastActionAt: now,
+		}); err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+	}
+	seed("o1", model.StateAwaiting)
+	seed("o2", model.StateEscalated)
+	seed("o3", model.StateComplete)
+	seed("c1", model.StateClosed) // must be excluded
+
+	open, err := subs.ListOpen(ctx, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(open) != 3 {
+		t.Fatalf("ListOpen should exclude closed: got %d, want 3", len(open))
+	}
+	for _, s := range open {
+		if s.State == model.StateClosed {
+			t.Error("closed submission leaked into ListOpen")
+		}
+	}
+
+	n, err := subs.CountOpen(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
+		t.Fatalf("CountOpen: got %d, want 3", n)
+	}
+
+	capped, err := subs.ListOpen(ctx, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(capped) != 2 {
+		t.Fatalf("ListOpen cap: got %d, want 2", len(capped))
+	}
+}
+
+func TestSubmissionRepo_NeedsReviewRoundTrips(t *testing.T) {
+	_, subs, _ := setupDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	sub := &model.Submission{
+		ID: "r1", PolicyType: "cgl", State: model.StateAwaiting, NeedsReview: true,
+		CreatedAt: now, UpdatedAt: now, LastActionAt: now,
+	}
+	if err := subs.UpsertSubmission(ctx, sub); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	got, err := subs.GetByID(ctx, "r1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.NeedsReview {
+		t.Error("needs_review flag did not round-trip through the repo")
+	}
+
+	// the flag clears when a later upsert recomputes it false
+	sub.NeedsReview = false
+	if err := subs.UpsertSubmission(ctx, sub); err != nil {
+		t.Fatalf("re-upsert: %v", err)
+	}
+	if got, _ = subs.GetByID(ctx, "r1"); got.NeedsReview {
+		t.Error("needs_review flag should clear on re-upsert")
+	}
+}
+
+func TestSubmissionRepo_FilenameOnlyItems(t *testing.T) {
+	_, subs, _ := setupDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// s1: acord_125 by filename alone (flagged); loss_runs by keyword (corroborated,
+	// not flagged); an unclassified doc (ignored).
+	s1 := &model.Submission{
+		ID: "s1", PolicyType: "cgl", State: model.StateComplete, CreatedAt: now, UpdatedAt: now, LastActionAt: now,
+		Documents: []model.Document{
+			{ID: "d1", SubmissionID: "s1", Filename: "a.pdf", ClassifiedAs: "acord_125", Confidence: 0.95, ClassifiedBy: model.ClassifiedByFilename, CreatedAt: now},
+			{ID: "d2", SubmissionID: "s1", Filename: "b.pdf", ClassifiedAs: "loss_runs", Confidence: 0.85, ClassifiedBy: model.ClassifiedByKeyword, CreatedAt: now},
+			{ID: "d3", SubmissionID: "s1", Filename: "c.pdf", ClassifiedAs: "", ClassifiedBy: model.ClassifiedByHeuristic, CreatedAt: now},
+		},
+	}
+	// s2: only a filename+keyword match — corroborated, so nothing is flagged.
+	s2 := &model.Submission{
+		ID: "s2", PolicyType: "cgl", State: model.StateAwaiting, CreatedAt: now, UpdatedAt: now, LastActionAt: now,
+		Documents: []model.Document{
+			{ID: "d4", SubmissionID: "s2", Filename: "x.pdf", ClassifiedAs: "acord_126", Confidence: 0.95, ClassifiedBy: model.ClassifiedByFilenameKeyword, CreatedAt: now},
+		},
+	}
+	for _, s := range []*model.Submission{s1, s2} {
+		if err := subs.UpsertSubmission(ctx, s); err != nil {
+			t.Fatalf("seed %s: %v", s.ID, err)
+		}
+	}
+
+	got, err := subs.FilenameOnlyItems(ctx, []string{"s1", "s2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got["s1"], []string{"acord_125"}) {
+		t.Errorf("s1 filename-only: got %v, want [acord_125]", got["s1"])
+	}
+	if _, ok := got["s2"]; ok {
+		t.Errorf("s2 is fully corroborated; should be absent, got %v", got["s2"])
+	}
 }
 
 func TestSubmissionRepo_UpsertAndGet(t *testing.T) {

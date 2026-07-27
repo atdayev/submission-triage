@@ -5,6 +5,7 @@ package email
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"net"
 	"strings"
@@ -14,17 +15,25 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/atdayev/submission-triage/internal/config"
+	"github.com/atdayev/submission-triage/internal/infrastructure/oauth"
 	"github.com/atdayev/submission-triage/internal/model"
 )
 
 // runs realSMTPSend against a minimal in-process SMTP server (EHLO/AUTH/MAIL/RCPT/DATA).
 
+// passwordSend is realSMTPSend with no injected mechanism (password/PlainAuth path).
+func passwordSend(ctx context.Context, cfg config.SMTPConfig, from string, to []string, msg []byte) error {
+	return realSMTPSend(ctx, cfg, nil, from, to, msg)
+}
+
 type receivedMail struct {
-	authed   bool
-	mailFrom string
-	rcpt     []string
-	data     string
-	done     chan struct{}
+	authed      bool
+	authMech    string
+	authPayload string
+	mailFrom    string
+	rcpt        []string
+	data        string
+	done        chan struct{}
 }
 
 func fakeSMTPServer(t *testing.T) (string, *receivedMail) {
@@ -55,9 +64,17 @@ func fakeSMTPServer(t *testing.T) (string, *receivedMail) {
 			case strings.HasPrefix(cmd, "EHLO"), strings.HasPrefix(cmd, "HELO"):
 				// no STARTTLS advertised; the client only proceeds in the clear
 				// because the host is loopback (isLocalhost), never for a remote server
-				fmt.Fprint(conn, "250-test\r\n250 AUTH PLAIN\r\n")
+				fmt.Fprint(conn, "250-test\r\n250 AUTH PLAIN XOAUTH2\r\n")
 			case strings.HasPrefix(cmd, "AUTH"):
 				rec.authed = true
+				if fields := strings.Fields(strings.TrimSpace(line)); len(fields) >= 2 {
+					rec.authMech = strings.ToUpper(fields[1])
+					if len(fields) >= 3 {
+						if dec, err := base64.StdEncoding.DecodeString(fields[2]); err == nil {
+							rec.authPayload = string(dec)
+						}
+					}
+				}
 				fmt.Fprint(conn, "235 2.7.0 accepted\r\n")
 			case strings.HasPrefix(cmd, "MAIL FROM"):
 				rec.mailFrom = strings.TrimSpace(line)
@@ -116,7 +133,7 @@ func TestIntegration_SMTP_ContextCancelUnblocksSend(t *testing.T) {
 	host, port, _ := net.SplitHostPort(stallingServer(t))
 	s := &SMTPSender{
 		cfg:           config.SMTPConfig{Host: host, Port: port, FromAddress: "ops@agency.example"},
-		send:          realSMTPSend,
+		send:          passwordSend,
 		log:           logrus.NewEntry(logrus.New()),
 		retryAttempts: 1,
 		retryBase:     time.Millisecond,
@@ -156,7 +173,7 @@ func TestIntegration_SMTP_RealSendSequence(t *testing.T) {
 			FromAddress: "ops@agency.example",
 			FromName:    "Triage",
 		},
-		send:          realSMTPSend,
+		send:          passwordSend,
 		log:           logrus.NewEntry(logrus.New()),
 		retryAttempts: 1,
 		retryBase:     time.Millisecond,
@@ -200,5 +217,40 @@ func TestIntegration_SMTP_RealSendSequence(t *testing.T) {
 		if !strings.Contains(rec.data, want) {
 			t.Errorf("DATA missing %q\n---\n%s", want, rec.data)
 		}
+	}
+}
+
+func TestIntegration_SMTP_XOAUTH2(t *testing.T) {
+	const (
+		user  = "ops@agency.example"
+		token = "ya29.stub-access-token"
+	)
+	addr, rec := fakeSMTPServer(t)
+	host, port, _ := net.SplitHostPort(addr)
+	auth := XOAUTH2Auth(user, stubTokenSource{token: token})
+	s := &SMTPSender{
+		cfg: config.SMTPConfig{Host: host, Port: port, FromAddress: user, FromName: "Triage"},
+		send: func(ctx context.Context, cfg config.SMTPConfig, from string, to []string, msg []byte) error {
+			return realSMTPSend(ctx, cfg, auth, from, to, msg)
+		},
+		log:           logrus.NewEntry(logrus.New()),
+		retryAttempts: 1,
+		retryBase:     time.Millisecond,
+	}
+
+	if _, err := s.SendThreadedReply(context.Background(), model.Reply{ToAddress: "broker@example.com", Subject: "hi", BodyText: "b"}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	select {
+	case <-rec.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not finish the conversation")
+	}
+
+	if rec.authMech != "XOAUTH2" {
+		t.Errorf("auth mechanism: got %q, want XOAUTH2", rec.authMech)
+	}
+	if want := string(oauth.XOAUTH2Payload(user, token)); rec.authPayload != want {
+		t.Errorf("auth payload:\n got %q\nwant %q", rec.authPayload, want)
 	}
 }

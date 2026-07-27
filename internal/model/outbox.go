@@ -21,4 +21,7 @@ type OutboxEntry struct {
 	LastError    string
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
+	// NotBefore is the earliest this reply may be sent; it enforces the
+	// per-submission coalesce spacing.
+	NotBefore time.Time
 }

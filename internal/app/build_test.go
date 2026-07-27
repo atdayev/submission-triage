@@ -49,7 +49,7 @@ func TestChooseSender(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s, err := chooseSender(tt.cfg, log)
+			s, err := chooseSender(tt.cfg, nil, log)
 			if tt.wantName == "" {
 				if err == nil {
 					t.Fatalf("expected error, got sender %q", s.Name())
