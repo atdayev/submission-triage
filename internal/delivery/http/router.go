@@ -3,6 +3,7 @@ package http
 import (
 	"database/sql"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/sirupsen/logrus"
@@ -11,12 +12,13 @@ import (
 )
 
 // NewRouter builds the HTTP router with request-ID and recovery middleware.
-func NewRouter(db *sql.DB, log *logrus.Entry) http.Handler {
+// poll may be nil when IMAP is not configured.
+func NewRouter(db *sql.DB, poll handler.PollStatus, staleAfter time.Duration, log *logrus.Entry) http.Handler {
 	r := chi.NewRouter()
 	r.Use(withRequestID(log))
 	r.Use(withRecovery())
 
-	health := handler.NewHealthHandler(db, log)
+	health := handler.NewHealthHandler(db, poll, staleAfter, log)
 	r.Get("/health", health.Handle)
 
 	return r

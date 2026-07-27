@@ -15,17 +15,18 @@ type Reply struct {
 	References   []string
 }
 
-// BuildMissingItemsReply lists the outstanding documents for the sender.
+// BuildMissingItemsReply lists the outstanding documents for the sender, given
+// only broker-actionable items (unreadable/low-confidence are handled agency-side).
 func BuildMissingItemsReply(s Submission, missing []MissingItem, lastInbound Email) Reply {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Hi %s,\n\n", greetingName(lastInbound))
 	b.WriteString("Thanks for the submission. To finish the file we still need:\n\n")
 	for _, m := range missing {
-		if m.Reason != "" && m.Reason != "document not provided" {
+		if m.Code == ReasonFieldShortfall {
 			fmt.Fprintf(&b, "  - %s (%s)\n", m.Description, m.Reason)
-			continue
+		} else {
+			fmt.Fprintf(&b, "  - %s\n", m.Description)
 		}
-		fmt.Fprintf(&b, "  - %s\n", m.Description)
 	}
 	b.WriteString("\nReply to this thread with the documents and we'll continue.\n")
 	return newReply(s, b.String(), lastInbound)
@@ -46,11 +47,12 @@ func BuildPolicyUnknownReply(s Submission, lastInbound Email, knownTypes []strin
 	return newReply(s, body, lastInbound)
 }
 
-// BuildCompletionReply confirms the submission is complete.
+// BuildCompletionReply confirms the submission is complete, reporting only what
+// we observe — never promising a downstream underwriting action.
 func BuildCompletionReply(s Submission, lastInbound Email) Reply {
 	body := fmt.Sprintf("Hi %s,\n\n"+
-		"Thanks — we now have everything we need on this submission. "+
-		"It's moving to underwriting; you'll hear back from us shortly.\n",
+		"Thanks — everything on our checklist for this submission is now accounted for. "+
+		"Nothing further is needed from you at this time.\n",
 		greetingName(lastInbound))
 	return newReply(s, body, lastInbound)
 }

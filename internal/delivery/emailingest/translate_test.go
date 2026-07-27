@@ -173,3 +173,43 @@ func TestTranslate_StampsSource(t *testing.T) {
 		t.Errorf("Source: got %q, want imap", got)
 	}
 }
+
+func TestTranslate_DetectsAutoSubmitted(t *testing.T) {
+	cases := []struct {
+		name   string
+		hdr    emlparse.Header
+		expect bool
+	}{
+		{"auto-replied", emlparse.Header{Name: "Auto-Submitted", Value: "auto-replied"}, true},
+		{"auto-submitted-no", emlparse.Header{Name: "Auto-Submitted", Value: "no"}, false},
+		{"precedence-bulk", emlparse.Header{Name: "Precedence", Value: "bulk"}, true},
+		{"precedence-list", emlparse.Header{Name: "Precedence", Value: "list"}, true},
+		{"list-id", emlparse.Header{Name: "List-Id", Value: "<news.example.com>"}, true},
+		{"list-unsubscribe", emlparse.Header{Name: "List-Unsubscribe", Value: "<mailto:x@y>"}, true},
+		{"null-return-path", emlparse.Header{Name: "Return-Path", Value: "<>"}, true},
+		{"normal-return-path", emlparse.Header{Name: "Return-Path", Value: "<broker@x>"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := samplePayload()
+			p.Headers = append(p.Headers, tc.hdr)
+			r := Translate(p, "imap")
+			if r.AutoSubmitted != tc.expect {
+				t.Errorf("AutoSubmitted: got %v, want %v", r.AutoSubmitted, tc.expect)
+			}
+			if tc.expect && r.AutoResponseHeaders == nil {
+				t.Error("AutoResponseHeaders should be populated when auto-submitted")
+			}
+		})
+	}
+}
+
+func TestTranslate_NormalMailNotAutoSubmitted(t *testing.T) {
+	r := Translate(samplePayload(), "imap")
+	if r.AutoSubmitted {
+		t.Error("a plain broker email must not be flagged auto-submitted")
+	}
+	if r.AutoResponseHeaders != nil {
+		t.Errorf("no auto-response headers expected, got %v", r.AutoResponseHeaders)
+	}
+}

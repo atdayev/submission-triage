@@ -15,11 +15,61 @@ type Checklist struct {
 	Escalation EscalationPolicy
 }
 
+// ReasonCode is the machine-readable cause an item is unsatisfied.
+type ReasonCode string
+
+const (
+	ReasonNotProvided    ReasonCode = "not_provided"
+	ReasonLowConfidence  ReasonCode = "low_confidence"  // a doc classified here, but below the confidence floor
+	ReasonUnreadable     ReasonCode = "unreadable"      // a doc classified here, but no text extracted (scanned)
+	ReasonFieldShortfall ReasonCode = "field_shortfall" // present, but a required field fails its rule
+)
+
+const (
+	reasonNotProvidedText   = "document not provided"
+	reasonLowConfidenceText = "received but not confidently identified"
+	reasonUnreadableText    = "received but no readable text (appears scanned)"
+)
+
 // MissingItem is a required item not satisfied by a submission.
 type MissingItem struct {
 	ID          string
 	Description string
 	Reason      string
+	Code        ReasonCode
+	// Confidence is the classifier's best guess for a low-confidence item, so a
+	// reviewer sees how close the call was; 0 when not applicable.
+	Confidence float64 `json:",omitempty"`
+}
+
+// RequiresReview reports whether any missing item needs a human — an unreadable
+// or low-confidence document, neither of which the broker can act on.
+func RequiresReview(missing []MissingItem) bool {
+	for _, m := range missing {
+		if m.Code == ReasonUnreadable || m.Code == ReasonLowConfidence {
+			return true
+		}
+	}
+	return false
+}
+
+// BrokerActionable returns the missing items worth asking the broker for (absent
+// docs and shortfalls); unreadable/low-confidence items are the agency's, omitted.
+func BrokerActionable(missing []MissingItem) []MissingItem {
+	out := make([]MissingItem, 0, len(missing))
+	for _, m := range missing {
+		if m.Code == ReasonNotProvided || m.Code == ReasonFieldShortfall {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// ChecklistOptions carries evaluation knobs the pure model can't read from config.
+type ChecklistOptions struct {
+	// ConfidenceFloor is the minimum classification confidence a document needs
+	// to count toward an item; 0 disables the floor.
+	ConfidenceFloor float64
 }
 
 // RequiredItem is one document a checklist requires.
@@ -59,26 +109,45 @@ type RequiresField struct {
 	Unit string
 }
 
-// EvaluateChecklist returns the items a submission is still missing.
-func EvaluateChecklist(s Submission, c Checklist) []MissingItem {
-	docsByItem := make(map[string][]*Document, len(c.Required))
+// itemDocs buckets the documents classified to one required item.
+type itemDocs struct {
+	qualifying    []*Document // confidence >= floor and readable; the only docs that satisfy
+	unreadable    bool        // some classified doc had no extractable text
+	lowConfidence bool        // some classified doc fell below the confidence floor
+	topConfidence float64     // highest confidence among the below-floor docs
+}
+
+// EvaluateChecklist returns the items a submission is still missing. A document
+// counts toward an item only if it clears the confidence floor and is readable;
+// otherwise the item is unsatisfied with a reason code the caller routes on.
+func EvaluateChecklist(s Submission, c Checklist, opts ChecklistOptions) []MissingItem {
+	byItem := make(map[string]*itemDocs, len(c.Required))
 	for i := range s.Documents {
 		d := &s.Documents[i]
 		if d.ClassifiedAs == "" {
 			continue
 		}
-		docsByItem[d.ClassifiedAs] = append(docsByItem[d.ClassifiedAs], d)
+		b := byItem[d.ClassifiedAs]
+		if b == nil {
+			b = &itemDocs{}
+			byItem[d.ClassifiedAs] = b
+		}
+		switch {
+		case d.Unreadable:
+			b.unreadable = true
+		case d.Confidence < opts.ConfidenceFloor:
+			b.lowConfidence = true
+			b.topConfidence = math.Max(b.topConfidence, d.Confidence)
+		default:
+			b.qualifying = append(b.qualifying, d)
+		}
 	}
 
 	missing := make([]MissingItem, 0)
 	for _, item := range c.Required {
-		docs := docsByItem[item.ID]
-		if len(docs) == 0 {
-			missing = append(missing, MissingItem{
-				ID:          item.ID,
-				Description: item.Description,
-				Reason:      "document not provided",
-			})
+		b := byItem[item.ID]
+		if b == nil || len(b.qualifying) == 0 {
+			missing = append(missing, unsatisfiedItem(item, b))
 			continue
 		}
 		if item.RequiresField == nil {
@@ -87,7 +156,7 @@ func EvaluateChecklist(s Submission, c Checklist) []MissingItem {
 		// a soft-pass (extraction not run) must not mask another document's concrete failure
 		affirmed, failed := false, false
 		var failReason string
-		for _, doc := range docs {
+		for _, doc := range b.qualifying {
 			reason, ok, ran := evaluateField(item.RequiresField, doc)
 			if ok && ran {
 				affirmed = true
@@ -103,10 +172,26 @@ func EvaluateChecklist(s Submission, c Checklist) []MissingItem {
 				ID:          item.ID,
 				Description: item.Description,
 				Reason:      failReason,
+				Code:        ReasonFieldShortfall,
 			})
 		}
 	}
 	return missing
+}
+
+// unsatisfiedItem classifies why an item with no qualifying document is missing.
+// Unreadable wins over low-confidence: it is the one a broker can act on.
+func unsatisfiedItem(item RequiredItem, b *itemDocs) MissingItem {
+	m := MissingItem{ID: item.ID, Description: item.Description}
+	switch {
+	case b != nil && b.unreadable:
+		m.Reason, m.Code = reasonUnreadableText, ReasonUnreadable
+	case b != nil && b.lowConfidence:
+		m.Reason, m.Code, m.Confidence = reasonLowConfidenceText, ReasonLowConfidence, b.topConfidence
+	default:
+		m.Reason, m.Code = reasonNotProvidedText, ReasonNotProvided
+	}
+	return m
 }
 
 // evaluateField reports (reason, ok, ran); ran is false on a soft-pass (nil map

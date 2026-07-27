@@ -18,12 +18,15 @@ import (
 func Translate(p emlparse.Payload, source string) service.IngestRequest {
 	var inReplyTo string
 	var references []string
+	autoHeaders := map[string]string{}
 	for _, hdr := range p.Headers {
-		switch strings.ToLower(hdr.Name) {
+		switch name := strings.ToLower(hdr.Name); name {
 		case "in-reply-to":
 			inReplyTo = strings.TrimSpace(hdr.Value)
 		case "references":
 			references = append(references, splitReferences(hdr.Value)...)
+		default:
+			autoHeaders[name] = hdr.Value
 		}
 	}
 
@@ -46,7 +49,7 @@ func Translate(p emlparse.Payload, source string) service.IngestRequest {
 		fromAddr = p.From
 	}
 
-	return service.IngestRequest{
+	req := service.IngestRequest{
 		MessageID:   trimAngle(p.MessageID),
 		InReplyTo:   trimAngle(inReplyTo),
 		References:  trimAngles(references),
@@ -59,6 +62,27 @@ func Translate(p emlparse.Payload, source string) service.IngestRequest {
 		Attachments: atts,
 		Source:      source,
 	}
+	if detectAutoSubmitted(autoHeaders) {
+		req.AutoSubmitted = true
+		req.AutoResponseHeaders = autoHeaders
+	}
+	return req
+}
+
+// detectAutoSubmitted reports mail from an automated agent: an Auto-Submitted
+// other than "no", bulk/list/junk Precedence, a list header, or a null return path.
+func detectAutoSubmitted(h map[string]string) bool {
+	if v, ok := h["auto-submitted"]; ok && !strings.EqualFold(strings.TrimSpace(v), "no") {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(h["precedence"])) {
+	case "bulk", "list", "junk":
+		return true
+	}
+	if h["list-id"] != "" || h["list-unsubscribe"] != "" {
+		return true
+	}
+	return strings.TrimSpace(h["return-path"]) == "<>"
 }
 
 // parseReceivedAt parses the Date header to UTC, falling back to now on error or unresolved zone.

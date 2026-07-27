@@ -1,0 +1,4 @@
+CREATE TABLE IF NOT EXISTS llm_spend (
+    day TEXT PRIMARY KEY,
+    usd REAL NOT NULL
+);

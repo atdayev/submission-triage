@@ -21,7 +21,7 @@ func TestBuildMissingItemsReply_LossRunsShortfall(t *testing.T) {
 	}
 	doc := Document{ClassifiedAs: "loss_runs", ExtractedFields: map[string]any{"years_covered": 3.0}}
 	s := Submission{ID: "sub1", Documents: []Document{doc}}
-	missing := EvaluateChecklist(s, cl)
+	missing := EvaluateChecklist(s, cl, ChecklistOptions{})
 
 	inbound := Email{FromName: "Dana Smith", FromAddress: "dana@brokerage.example", MessageID: "<m1@x>"}
 	reply := BuildMissingItemsReply(s, missing, inbound)
@@ -32,6 +32,25 @@ func TestBuildMissingItemsReply_LossRunsShortfall(t *testing.T) {
 	}
 	if strings.Contains(reply.BodyText, "field") || strings.Contains(reply.BodyText, "years_covered") {
 		t.Errorf("reply leaks internal jargon:\n%s", reply.BodyText)
+	}
+}
+
+func TestBuildCompletionReply_NoForwardLookingPromise(t *testing.T) {
+	s := Submission{ID: "s1", PolicyType: "cgl"}
+	inbound := Email{FromName: "Dana Smith", FromAddress: "dana@brokerage.example", MessageID: "<m1@x>"}
+	reply := BuildCompletionReply(s, inbound)
+
+	if !strings.Contains(reply.BodyText, "Hi Dana,") {
+		t.Errorf("greeting missing:\n%s", reply.BodyText)
+	}
+	// a completion note reports observation only; it must not promise a human/next step
+	for _, banned := range []string{"underwriting", "moving to", "hear back", "shortly"} {
+		if strings.Contains(strings.ToLower(reply.BodyText), banned) {
+			t.Errorf("completion reply makes a forward-looking promise (%q):\n%s", banned, reply.BodyText)
+		}
+	}
+	if !strings.Contains(reply.BodyText, "accounted for") {
+		t.Errorf("completion reply should state what we observe:\n%s", reply.BodyText)
 	}
 }
 

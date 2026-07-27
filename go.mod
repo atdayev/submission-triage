@@ -18,14 +18,15 @@ require (
 
 require (
 	github.com/caarlos0/env/v11 v11.4.1
+	github.com/emersion/go-sasl v0.0.0-20241020182733-b788ff22d5a6
 	github.com/joho/godotenv v1.5.1
+	golang.org/x/oauth2 v0.36.0
 )
 
 require (
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/emersion/go-message v0.18.2 // indirect
-	github.com/emersion/go-sasl v0.0.0-20241020182733-b788ff22d5a6 // indirect
 	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
 	github.com/jonboulle/clockwork v0.5.0 // indirect
 	github.com/kr/pretty v0.3.1 // indirect

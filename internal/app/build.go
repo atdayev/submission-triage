@@ -13,12 +13,15 @@ import (
 	"github.com/atdayev/submission-triage/internal/config"
 	"github.com/atdayev/submission-triage/internal/database"
 	deliveryhttp "github.com/atdayev/submission-triage/internal/delivery/http"
+	"github.com/atdayev/submission-triage/internal/delivery/http/handler"
 	"github.com/atdayev/submission-triage/internal/delivery/imap"
 	"github.com/atdayev/submission-triage/internal/infrastructure/checklist"
 	"github.com/atdayev/submission-triage/internal/infrastructure/classifier"
 	"github.com/atdayev/submission-triage/internal/infrastructure/email"
 	"github.com/atdayev/submission-triage/internal/infrastructure/extractor"
 	"github.com/atdayev/submission-triage/internal/infrastructure/llm"
+	"github.com/atdayev/submission-triage/internal/infrastructure/oauth"
+	"github.com/atdayev/submission-triage/internal/model"
 	"github.com/atdayev/submission-triage/internal/repository"
 	"github.com/atdayev/submission-triage/internal/service"
 )
@@ -33,6 +36,8 @@ type BuiltApp struct {
 
 // Build wires up the database, service, router, and optional IMAP poller.
 func Build(ctx context.Context, cfg *config.Config, log *logrus.Entry, migrationsDir string) (*BuiltApp, error) {
+	resolveDeprecatedConfig(cfg, log)
+
 	db, err := openDB(ctx, cfg, migrationsDir, log)
 	if err != nil {
 		return nil, err
@@ -48,11 +53,24 @@ func Build(ctx context.Context, cfg *config.Config, log *logrus.Entry, migration
 
 	var llmClient llm.Client
 	if cfg.Anthropic.APIKey != "" {
-		llmClient = llm.NewAnthropicClient(cfg.Anthropic, cfg.Retry.Attempts, cfg.Retry.BaseDelay(), log)
+		spend := repository.NewLLMSpendRepository(db)
+		llmClient = llm.NewAnthropicClient(cfg.Anthropic, spend, cfg.Retry.Attempts, cfg.Retry.BaseDelay(), log)
 	}
 	clf := classifier.NewHeuristicLLMClassifier(llmClient)
 
-	sender, err := chooseSender(cfg, log)
+	// one XOAUTH2 token source serves both IMAP and SMTP (oauth mode only)
+	var tokenSource oauth.TokenSource
+	if cfg.Mail.OAuthEnabled() {
+		ts, err := oauth.NewTokenSource(cfg.Mail.OAuth, authFailureAuditor(repo, log))
+		if err != nil {
+			_ = db.Close()
+			return nil, err
+		}
+		tokenSource = ts
+		log.WithField("provider", cfg.Mail.OAuth.Provider).Info("mail auth: XOAUTH2 enabled")
+	}
+
+	sender, err := chooseSender(cfg, tokenSource, log)
 	if err != nil {
 		_ = db.Close()
 		return nil, err
@@ -72,14 +90,24 @@ func Build(ctx context.Context, cfg *config.Config, log *logrus.Entry, migration
 		Log:            log,
 	})
 
-	router := deliveryhttp.NewRouter(db, log)
+	imapAuth := imap.PasswordAuth(cfg.IMAP.Username, cfg.IMAP.Password)
+	if tokenSource != nil {
+		imapAuth = imap.XOAUTH2Auth(cfg.Mail.OAuth.User, tokenSource)
+	}
 
 	var poller *imap.Poller
-	if cfg.IMAP.Configured() {
-		poller = imap.NewPoller(cfg.IMAP, svc, log)
+	if cfg.IMAPConfigured() {
+		poller = imap.NewPoller(cfg.IMAP, imapAuth, svc, log)
 	} else {
 		log.Warn("IMAP not configured; the service will not ingest mail")
 	}
+
+	// a nil *imap.Poller must reach the router as a nil interface, not a typed nil
+	var pollStatus handler.PollStatus
+	if poller != nil {
+		pollStatus = poller
+	}
+	router := deliveryhttp.NewRouter(db, pollStatus, cfg.PollStaleAfter(), log)
 
 	return &BuiltApp{
 		DB:      db,
@@ -87,6 +115,23 @@ func Build(ctx context.Context, cfg *config.Config, log *logrus.Entry, migration
 		Router:  router,
 		Poller:  poller,
 	}, nil
+}
+
+// resolveDeprecatedConfig applies deprecated env aliases onto their replacements
+// and warns once, so existing .env files keep working.
+func resolveDeprecatedConfig(cfg *config.Config, log *logrus.Entry) {
+	if cfg.IMAP.CompleteLabel != "" {
+		cfg.IMAP.FolderComplete = cfg.IMAP.CompleteLabel
+		log.Warn("config: IMAP_COMPLETE_LABEL is deprecated; use IMAP_FOLDER_COMPLETE")
+	}
+	if cfg.Digest.LegacyIntervalHours != 0 {
+		cfg.Digest.IntervalHours = cfg.Digest.LegacyIntervalHours
+		log.Warn("config: ESCALATION_DIGEST_INTERVAL_HOURS is deprecated; use DIGEST_INTERVAL_HOURS")
+	}
+	if cfg.Digest.LegacyRecipient != "" {
+		cfg.Digest.Recipient = cfg.Digest.LegacyRecipient
+		log.Warn("config: ESCALATION_DIGEST_RECIPIENT is deprecated; use DIGEST_RECIPIENT")
+	}
 }
 
 // openDB opens the SQLite database and applies migrations.
@@ -103,23 +148,42 @@ func openDB(ctx context.Context, cfg *config.Config, migrationsDir string, log *
 }
 
 // chooseSender picks the outbound sender from config; "log" never auto-selects.
-func chooseSender(cfg *config.Config, log *logrus.Entry) (email.Sender, error) {
+// A non-nil tokenSource switches SMTP to XOAUTH2.
+func chooseSender(cfg *config.Config, tokenSource oauth.TokenSource, log *logrus.Entry) (email.Sender, error) {
 	attempts, base := cfg.Retry.Attempts, cfg.Retry.BaseDelay()
+	var auth email.AuthMech
+	if tokenSource != nil {
+		auth = email.XOAUTH2Auth(cfg.Mail.OAuth.User, tokenSource)
+	}
 	switch strings.ToLower(cfg.Outbound.Provider) {
 	case "smtp":
 		if !cfg.SMTP.Configured() {
 			return nil, errors.New("OUTBOUND_PROVIDER=smtp but SMTP is not configured: set SMTP_HOST and SMTP_FROM_ADDRESS")
 		}
-		return email.NewSMTPSender(cfg.SMTP, attempts, base, log), nil
+		return email.NewSMTPSender(cfg.SMTP, auth, attempts, base, log), nil
 	case "log":
 		return email.NewLogSender(log), nil
 	case "":
 		if cfg.SMTP.Configured() {
-			return email.NewSMTPSender(cfg.SMTP, attempts, base, log), nil
+			return email.NewSMTPSender(cfg.SMTP, auth, attempts, base, log), nil
 		}
 		return nil, errors.New("no outbound provider configured: set SMTP_*, or OUTBOUND_PROVIDER=log to send nothing")
 	default:
 		return nil, fmt.Errorf("unknown outbound provider %q (want smtp|log)", cfg.Outbound.Provider)
+	}
+}
+
+// authFailureAuditor records auth.failed audit events on permanent OAuth token
+// failures, carrying the provider and error class but never the token.
+func authFailureAuditor(repo *repository.Repository, log *logrus.Entry) oauth.FailureFunc {
+	return func(ctx context.Context, provider, class string) {
+		entry := &model.AuditEntry{
+			EventType: model.EventAuthFailed,
+			Payload:   map[string]any{"provider": provider, "class": class},
+		}
+		if err := repo.Audit.Append(ctx, entry); err != nil {
+			log.WithError(err).Warn("auth.failed audit append failed")
+		}
 	}
 }
 

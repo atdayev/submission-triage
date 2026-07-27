@@ -28,6 +28,16 @@ const (
 	maxTextSampleBytes = 2048
 )
 
+// ErrSpendCapReached is returned when today's estimated LLM spend is at the cap;
+// no API call is made. Callers degrade to heuristics.
+var ErrSpendCapReached = errors.New("anthropic: daily spend cap reached")
+
+// SpendTracker records and reports estimated LLM spend for the current UTC day.
+type SpendTracker interface {
+	Today(ctx context.Context) (float64, error)
+	Add(ctx context.Context, usd float64) error
+}
+
 // modelPricing maps model ID to USD per million tokens; unmapped model means cost 0.
 var modelPricing = map[string]pricing{
 	"claude-haiku-4-5":          {input: 1.0, output: 5.0},
@@ -102,6 +112,7 @@ type AnthropicClient struct {
 	cfg           config.AnthropicConfig
 	httpClient    *http.Client
 	endpoint      string
+	spend         SpendTracker // nil disables spend tracking
 	retryAttempts int
 	retryBase     time.Duration
 }
@@ -153,7 +164,8 @@ type anthropicResponse struct {
 }
 
 // NewAnthropicClient returns an AnthropicClient and warns when the model has no pricing entry.
-func NewAnthropicClient(cfg config.AnthropicConfig, retryAttempts int, retryBase time.Duration, log *logrus.Entry) *AnthropicClient {
+// spend may be nil to disable spend tracking (the cap is also inert without pricing).
+func NewAnthropicClient(cfg config.AnthropicConfig, spend SpendTracker, retryAttempts int, retryBase time.Duration, log *logrus.Entry) *AnthropicClient {
 	if _, ok := modelPricing[cfg.Model]; !ok && log != nil {
 		log.WithField("model", cfg.Model).
 			Warn("anthropic: no pricing entry for model; EstimatedCostUSD in audit will be 0")
@@ -162,6 +174,7 @@ func NewAnthropicClient(cfg config.AnthropicConfig, retryAttempts int, retryBase
 		cfg:           cfg,
 		httpClient:    &http.Client{Timeout: cfg.Timeout()},
 		endpoint:      anthropicAPIURL,
+		spend:         spend,
 		retryAttempts: retryAttempts,
 		retryBase:     retryBase,
 	}
@@ -194,9 +207,11 @@ func (c *AnthropicClient) Classify(ctx context.Context, req ClassificationReques
 		Messages:  []anthropicMessage{{Role: "user", Content: prompt}},
 	}, prompt)
 	if err != nil {
+		resp.Usage = usage // surface usage (incl. capped/failed calls), not drop it
 		return resp, err
 	}
 	if err := json.Unmarshal([]byte(extractJSON(raw)), &resp); err != nil {
+		resp.Usage = usage
 		return resp, fmt.Errorf("anthropic: parse classify response: %w", err)
 	}
 	resp.Confidence = clampConfidence(resp.Confidence)
@@ -296,6 +311,12 @@ func (c *AnthropicClient) callMessages(ctx context.Context, body anthropicReques
 	if c.cfg.APIKey == "" {
 		return "", usage, errors.New("anthropic: api key not configured")
 	}
+	// refuse before spending anything more today; fail open on a read error
+	if c.cfg.DailyCapUSD > 0 && c.spend != nil {
+		if total, terr := c.spend.Today(ctx); terr == nil && total >= c.cfg.DailyCapUSD {
+			return "", usage, ErrSpendCapReached
+		}
+	}
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return "", usage, fmt.Errorf("anthropic: marshal: %w", err)
@@ -345,6 +366,9 @@ func (c *AnthropicClient) callMessages(ctx context.Context, body anthropicReques
 	}
 	if err != nil {
 		return "", usage, err
+	}
+	if c.spend != nil && usage.EstimatedCostUSD > 0 {
+		_ = c.spend.Add(ctx, usage.EstimatedCostUSD)
 	}
 	return text, usage, nil
 }

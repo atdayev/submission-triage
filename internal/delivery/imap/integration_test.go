@@ -4,6 +4,8 @@ package imap
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net"
 	"strings"
 	"testing"
@@ -13,6 +15,7 @@ import (
 	"github.com/emersion/go-imap/v2/imapclient"
 	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/emersion/go-imap/v2/imapserver/imapmemserver"
+	"github.com/emersion/go-sasl"
 	"github.com/sirupsen/logrus"
 
 	"github.com/atdayev/submission-triage/internal/config"
@@ -48,6 +51,8 @@ func startMemServer(t *testing.T, msgs ...string) string {
 			return mem.NewSession(), nil, nil
 		},
 		InsecureAuth: true,
+		// advertise MOVE + UIDPLUS so the adapter's capability ladder can take the MOVE path
+		Caps: goimap.CapSet{goimap.CapIMAP4rev1: {}, goimap.CapMove: {}, goimap.CapUIDPlus: {}},
 	})
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -92,6 +97,10 @@ func useInsecureDial(t *testing.T) {
 
 func testLog() *logrus.Entry { return logrus.NewEntry(logrus.New()) }
 
+func passwordAuthFor(cfg config.IMAPConfig) Authenticator {
+	return PasswordAuth(cfg.Username, cfg.Password)
+}
+
 func cfgFor(addr string) config.IMAPConfig {
 	host, port, _ := net.SplitHostPort(addr)
 	return config.IMAPConfig{
@@ -109,7 +118,7 @@ func TestIntegration_RealAdapter_FetchMarkSeenRefetch(t *testing.T) {
 	useInsecureDial(t)
 	ctx := context.Background()
 
-	mb, err := dialIMAP(cfgFor(addr), testLog())(ctx)
+	mb, err := dialIMAP(cfgFor(addr), passwordAuthFor(cfgFor(addr)), testLog())(ctx)
 	if err != nil {
 		t.Fatalf("dialIMAP (dial+login+select): %v", err)
 	}
@@ -156,12 +165,13 @@ func TestIntegration_RealAdapter_FetchMarkSeenRefetch(t *testing.T) {
 	}
 }
 
-func TestIntegration_RealAdapter_LabelCreatesAndFiles(t *testing.T) {
+func TestIntegration_RealAdapter_FileMovesMessage(t *testing.T) {
 	addr := startMemServer(t, validEML)
 	useInsecureDial(t)
 	ctx := context.Background()
 
-	mb, err := dialIMAP(cfgFor(addr), testLog())(ctx)
+	// imapmemserver advertises MOVE, so File must take the MOVE path end to end
+	mb, err := dialIMAP(cfgFor(addr), passwordAuthFor(cfgFor(addr)), testLog())(ctx)
 	if err != nil {
 		t.Fatalf("dialIMAP: %v", err)
 	}
@@ -172,26 +182,34 @@ func TestIntegration_RealAdapter_LabelCreatesAndFiles(t *testing.T) {
 		t.Fatalf("FetchUnseen: got %d (err %v), want 1", len(msgs), err)
 	}
 
-	const label = "Ready for Underwriting"
-	// label-mailbox doesn't exist yet: this must create it, then copy into it
-	if err := mb.Label(ctx, msgs[0].UID, label); err != nil {
-		t.Fatalf("Label (create+copy): %v", err)
-	}
-	// idempotent: a second completion in the same label must still succeed
-	if err := mb.Label(ctx, msgs[0].UID, label); err != nil {
-		t.Fatalf("Label (existing): %v", err)
+	const folder = "Ready for Underwriting"
+	// folder doesn't exist yet: File must create it, then MOVE into it
+	if err := mb.File(ctx, msgs[0].UID, folder); err != nil {
+		t.Fatalf("File (create+move): %v", err)
 	}
 
 	c := mb.(*imapMailbox).c
-	if _, err := c.Select(label, nil).Wait(); err != nil {
-		t.Fatalf("select label mailbox %q: %v", label, err)
+	// the message is now in the folder...
+	if _, err := c.Select(folder, nil).Wait(); err != nil {
+		t.Fatalf("select folder %q: %v", folder, err)
 	}
 	found, err := c.UIDSearch(&goimap.SearchCriteria{}, nil).Wait()
 	if err != nil {
-		t.Fatalf("search label mailbox: %v", err)
+		t.Fatalf("search folder: %v", err)
 	}
-	if n := len(found.AllUIDs()); n < 1 {
-		t.Errorf("message not filed under %q: %d found, want >=1", label, n)
+	if n := len(found.AllUIDs()); n != 1 {
+		t.Errorf("message not moved into %q: %d found, want 1", folder, n)
+	}
+	// ...and MOVE removed it from the inbox (no duplicate, unlike COPY)
+	if _, err := c.Select("INBOX", nil).Wait(); err != nil {
+		t.Fatalf("re-select INBOX: %v", err)
+	}
+	inbox, err := c.UIDSearch(&goimap.SearchCriteria{}, nil).Wait()
+	if err != nil {
+		t.Fatalf("search inbox: %v", err)
+	}
+	if n := len(inbox.AllUIDs()); n != 0 {
+		t.Errorf("MOVE left a duplicate in the inbox: %d messages, want 0", n)
 	}
 }
 
@@ -199,7 +217,7 @@ func TestIntegration_RealAdapter_RespectsBatchLimit(t *testing.T) {
 	addr := startMemServer(t, validEML, secondEML)
 	useInsecureDial(t)
 
-	mb, err := dialIMAP(cfgFor(addr), testLog())(context.Background())
+	mb, err := dialIMAP(cfgFor(addr), passwordAuthFor(cfgFor(addr)), testLog())(context.Background())
 	if err != nil {
 		t.Fatalf("dialIMAP: %v", err)
 	}
@@ -220,7 +238,7 @@ func TestIntegration_PollerEndToEnd(t *testing.T) {
 
 	ing := &fakeIngester{}
 	p := &Poller{
-		dial:       dialIMAP(cfgFor(addr), testLog()),
+		dial:       dialIMAP(cfgFor(addr), passwordAuthFor(cfgFor(addr)), testLog()),
 		ingest:     ing,
 		interval:   time.Hour,
 		batchLimit: 50,
@@ -252,7 +270,7 @@ func TestIntegration_DialFailsOnBadCredentials(t *testing.T) {
 
 	cfg := cfgFor(addr)
 	cfg.Password = "wrong"
-	if _, err := dialIMAP(cfg, testLog())(context.Background()); err == nil {
+	if _, err := dialIMAP(cfg, passwordAuthFor(cfg), testLog())(context.Background()); err == nil {
 		t.Fatal("expected login failure with wrong password")
 	}
 }
@@ -262,7 +280,7 @@ func TestIntegration_CancelClosesConnection(t *testing.T) {
 	useInsecureDial(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	mb, err := dialIMAP(cfgFor(addr), testLog())(ctx)
+	mb, err := dialIMAP(cfgFor(addr), passwordAuthFor(cfgFor(addr)), testLog())(ctx)
 	if err != nil {
 		t.Fatalf("dialIMAP: %v", err)
 	}
@@ -273,6 +291,138 @@ func TestIntegration_CancelClosesConnection(t *testing.T) {
 	case <-mb.(*imapMailbox).c.Closed():
 	case <-time.After(2 * time.Second):
 		t.Fatal("connection not closed after ctx cancel; in-flight commands could hang at shutdown")
+	}
+}
+
+// xoauth2MemSession wraps a memserver session to accept the XOAUTH2 mechanism
+// with a fixed token; imapmemserver itself supports only LOGIN.
+type xoauth2MemSession struct {
+	imapserver.Session
+	token string
+}
+
+func (s *xoauth2MemSession) AuthenticateMechanisms() []string { return []string{"XOAUTH2"} }
+
+func (s *xoauth2MemSession) Authenticate(mech string) (sasl.Server, error) {
+	if mech != "XOAUTH2" {
+		return nil, fmt.Errorf("unsupported mechanism %q", mech)
+	}
+	return &xoauth2MemServer{token: s.token, inner: s.Session}, nil
+}
+
+// xoauth2MemServer validates the XOAUTH2 payload, then binds the memserver user
+// via its underlying LOGIN (the test password is known).
+type xoauth2MemServer struct {
+	token string
+	inner imapserver.Session
+}
+
+func (s *xoauth2MemServer) Next(response []byte) (challenge []byte, done bool, err error) {
+	user, token, ok := parseXOAUTH2(response)
+	if !ok {
+		return nil, false, errors.New("malformed XOAUTH2 payload")
+	}
+	if token != s.token {
+		return nil, false, errors.New("invalid token")
+	}
+	if err := s.inner.Login(user, testPass); err != nil {
+		return nil, false, err
+	}
+	return nil, true, nil
+}
+
+// parseXOAUTH2 pulls the user and bearer token out of "user=<u>\x01auth=Bearer <t>\x01\x01".
+func parseXOAUTH2(payload []byte) (user, token string, ok bool) {
+	for _, field := range strings.Split(string(payload), "\x01") {
+		switch {
+		case strings.HasPrefix(field, "user="):
+			user = strings.TrimPrefix(field, "user=")
+		case strings.HasPrefix(field, "auth=Bearer "):
+			token = strings.TrimPrefix(field, "auth=Bearer ")
+		}
+	}
+	return user, token, user != "" && token != ""
+}
+
+// startXOAUTH2MemServer is startMemServer with sessions that accept XOAUTH2.
+func startXOAUTH2MemServer(t *testing.T, token string, msgs ...string) string {
+	t.Helper()
+	mem := imapmemserver.New()
+	user := imapmemserver.NewUser(testUser, testPass)
+	if err := user.Create("INBOX", nil); err != nil {
+		t.Fatalf("create INBOX: %v", err)
+	}
+	mem.AddUser(user)
+
+	srv := imapserver.New(&imapserver.Options{
+		NewSession: func(_ *imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
+			return &xoauth2MemSession{Session: mem.NewSession(), token: token}, nil, nil
+		},
+		InsecureAuth: true,
+		// the session wrapper hides imapmemserver's optional interfaces (MOVE, etc.),
+		// so advertise only core IMAP4rev1 — this test exercises auth + fetch
+		Caps: goimap.CapSet{goimap.CapIMAP4rev1: {}},
+	})
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
+
+	seed, err := imapclient.DialInsecure(ln.Addr().String(), nil)
+	if err != nil {
+		t.Fatalf("seed dial: %v", err)
+	}
+	defer seed.Close()
+	if err := seed.Login(testUser, testPass).Wait(); err != nil {
+		t.Fatalf("seed login: %v", err)
+	}
+	for _, raw := range msgs {
+		cmd := seed.Append("INBOX", int64(len(raw)), nil)
+		if _, err := cmd.Write([]byte(raw)); err != nil {
+			t.Fatalf("append write: %v", err)
+		}
+		if err := cmd.Close(); err != nil {
+			t.Fatalf("append close: %v", err)
+		}
+		if _, err := cmd.Wait(); err != nil {
+			t.Fatalf("append: %v", err)
+		}
+	}
+	_ = seed.Logout().Wait()
+	return ln.Addr().String()
+}
+
+func TestIntegration_RealAdapter_XOAUTH2Auth(t *testing.T) {
+	const token = "ya29.stub-access-token"
+	addr := startXOAUTH2MemServer(t, token, validEML)
+	useInsecureDial(t)
+	ctx := context.Background()
+
+	auth := XOAUTH2Auth(testUser, stubTokenSource{token: token})
+	mb, err := dialIMAP(cfgFor(addr), auth, testLog())(ctx)
+	if err != nil {
+		t.Fatalf("dialIMAP with XOAUTH2: %v", err)
+	}
+	defer mb.Close()
+
+	msgs, err := mb.FetchUnseen(ctx, 50)
+	if err != nil {
+		t.Fatalf("FetchUnseen after XOAUTH2 auth: %v", err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("unseen count: got %d, want 1", len(msgs))
+	}
+}
+
+func TestIntegration_RealAdapter_XOAUTH2BadTokenFails(t *testing.T) {
+	addr := startXOAUTH2MemServer(t, "the-right-token", validEML)
+	useInsecureDial(t)
+
+	auth := XOAUTH2Auth(testUser, stubTokenSource{token: "the-wrong-token"})
+	if _, err := dialIMAP(cfgFor(addr), auth, testLog())(context.Background()); err == nil {
+		t.Fatal("expected XOAUTH2 auth to fail with a bad token")
 	}
 }
 
@@ -288,7 +438,7 @@ func TestIntegration_RealAdapter_SkipsOversized(t *testing.T) {
 
 	cfg := cfgFor(addr)
 	cfg.MaxMessageMB = 1 // 1 MiB cap; the big message must be skipped
-	mb, err := dialIMAP(cfg, testLog())(context.Background())
+	mb, err := dialIMAP(cfg, passwordAuthFor(cfg), testLog())(context.Background())
 	if err != nil {
 		t.Fatalf("dialIMAP: %v", err)
 	}

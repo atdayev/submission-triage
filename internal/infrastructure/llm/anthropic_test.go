@@ -3,6 +3,7 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,6 +19,65 @@ import (
 	"github.com/atdayev/submission-triage/internal/config"
 )
 
+// fakeSpend is an in-memory SpendTracker for cap tests.
+type fakeSpend struct {
+	today float64
+	added []float64
+}
+
+func (f *fakeSpend) Today(context.Context) (float64, error) { return f.today, nil }
+func (f *fakeSpend) Add(_ context.Context, usd float64) error {
+	f.added = append(f.added, usd)
+	f.today += usd
+	return nil
+}
+
+func TestAnthropic_SpendCap_SkipsCallWhenReached(t *testing.T) {
+	var hit atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit.Store(true)
+	}))
+	defer srv.Close()
+
+	c := testClient(t, srv.URL)
+	c.cfg.DailyCapUSD = 2.0
+	c.spend = &fakeSpend{today: 5.0} // already over the cap
+
+	_, err := c.Classify(context.Background(), ClassificationRequest{
+		Candidates: []ClassificationCandidate{{ID: "x", Description: "y"}},
+	})
+	if !errors.Is(err, ErrSpendCapReached) {
+		t.Fatalf("expected ErrSpendCapReached, got %v", err)
+	}
+	if hit.Load() {
+		t.Error("no HTTP call should be made when the cap is reached")
+	}
+}
+
+func TestAnthropic_SpendCap_RecordsSpendAfterCall(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{
+			"content": []map[string]any{{"type": "text", "text": `{"candidate_id":"x","confidence":0.9,"reason":"ok"}`}},
+			"usage":   map[string]int{"input_tokens": 1000, "output_tokens": 500},
+		})
+	}))
+	defer srv.Close()
+
+	spend := &fakeSpend{}
+	c := testClient(t, srv.URL)
+	c.cfg.DailyCapUSD = 2.0
+	c.spend = spend
+
+	if _, err := c.Classify(context.Background(), ClassificationRequest{
+		Candidates: []ClassificationCandidate{{ID: "x", Description: "y"}},
+	}); err != nil {
+		t.Fatalf("classify: %v", err)
+	}
+	if len(spend.added) != 1 || spend.added[0] <= 0 {
+		t.Errorf("expected one positive spend increment, got %v", spend.added)
+	}
+}
+
 func testLog() *logrus.Entry {
 	lg := logrus.New()
 	lg.SetOutput(io.Discard)
@@ -31,7 +91,7 @@ func testClient(t *testing.T, url string) *AnthropicClient {
 		Model:      "claude-haiku-4-5",
 		MaxTokens:  256,
 		TimeoutSec: 5,
-	}, 3, time.Millisecond, testLog())
+	}, nil, 3, time.Millisecond, testLog())
 	c.endpoint = url
 	return c
 }
@@ -231,7 +291,7 @@ func TestAnthropic_EmptyAPIKey_FailsBeforeRequest(t *testing.T) {
 
 	c := NewAnthropicClient(config.AnthropicConfig{
 		Model: "claude-haiku-4-5", TimeoutSec: 1, MaxTokens: 1,
-	}, 1, time.Millisecond, testLog())
+	}, nil, 1, time.Millisecond, testLog())
 	c.endpoint = srv.URL
 	_, err := c.Classify(context.Background(), ClassificationRequest{
 		Candidates: []ClassificationCandidate{{ID: "x", Description: "y"}},
@@ -251,7 +311,7 @@ func TestAnthropic_UnknownModel_WarnsAtStartup(t *testing.T) {
 	lg, hook := newCaptureLogger()
 	NewAnthropicClient(config.AnthropicConfig{
 		APIKey: "x", Model: "claude-fictional-9000", TimeoutSec: 1, MaxTokens: 1,
-	}, 1, time.Millisecond, logrus.NewEntry(lg))
+	}, nil, 1, time.Millisecond, logrus.NewEntry(lg))
 
 	found := false
 	for _, e := range hook.entries {
@@ -271,7 +331,7 @@ func TestAnthropic_KnownModel_DoesNotWarn(t *testing.T) {
 	lg, hook := newCaptureLogger()
 	NewAnthropicClient(config.AnthropicConfig{
 		APIKey: "x", Model: "claude-haiku-4-5", TimeoutSec: 1, MaxTokens: 1,
-	}, 1, time.Millisecond, logrus.NewEntry(lg))
+	}, nil, 1, time.Millisecond, logrus.NewEntry(lg))
 
 	for _, e := range hook.entries {
 		if e.Level == logrus.WarnLevel && strings.Contains(e.Message, "no pricing entry") {

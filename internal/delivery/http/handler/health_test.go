@@ -8,11 +8,23 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sirupsen/logrus"
 
 	"github.com/atdayev/submission-triage/internal/database"
 )
+
+// fakePoll is a canned PollStatus for health tests.
+type fakePoll struct {
+	last       time.Time
+	configured bool
+}
+
+func (f fakePoll) LastSuccessfulPoll() time.Time { return f.last }
+func (f fakePoll) Configured() bool              { return f.configured }
+
+const testStaleAfter = 90 * time.Second // 3 x a 30s interval
 
 func TestHealth_DBUp_ReturnsOK(t *testing.T) {
 	log := logrus.NewEntry(logrus.New())
@@ -22,7 +34,7 @@ func TestHealth_DBUp_ReturnsOK(t *testing.T) {
 	}
 	t.Cleanup(func() { db.Close() })
 
-	h := NewHealthHandler(db, log)
+	h := NewHealthHandler(db, nil, testStaleAfter, log)
 	rec := httptest.NewRecorder()
 	h.Handle(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
 
@@ -42,7 +54,7 @@ func TestHealth_DBDown_Returns503(t *testing.T) {
 	}
 	db.Close() // intentionally close before serving
 
-	h := NewHealthHandler(db, log)
+	h := NewHealthHandler(db, nil, testStaleAfter, log)
 	rec := httptest.NewRecorder()
 	h.Handle(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
 
@@ -55,6 +67,71 @@ func TestHealth_DBDown_Returns503(t *testing.T) {
 	}
 	if strings.Contains(body, "down:") || strings.Contains(body, "sql:") {
 		t.Errorf("raw db error leaked to client: %s", body)
+	}
+}
+
+func TestHealth_FreshPoll_ReturnsOK(t *testing.T) {
+	log := logrus.NewEntry(logrus.New())
+	db, err := database.Open(context.Background(), filepath.Join(t.TempDir(), "h3.db"), log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	h := NewHealthHandler(db, fakePoll{last: time.Now(), configured: true}, testStaleAfter, log)
+	rec := httptest.NewRecorder()
+	h.Handle(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", rec.Code)
+	}
+	if body := rec.Body.String(); !strings.Contains(body, `"imap":"ok"`) {
+		t.Errorf(`expected "imap":"ok", got %s`, body)
+	}
+}
+
+func TestHealth_StalePoll_Returns503(t *testing.T) {
+	log := logrus.NewEntry(logrus.New())
+	db, err := database.Open(context.Background(), filepath.Join(t.TempDir(), "h4.db"), log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	stale := fakePoll{last: time.Now().Add(-4 * testStaleAfter), configured: true}
+	h := NewHealthHandler(db, stale, testStaleAfter, log)
+	rec := httptest.NewRecorder()
+	h.Handle(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status: got %d, want 503", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"imap":"stale"`) {
+		t.Errorf(`expected "imap":"stale", got %s`, body)
+	}
+	if !strings.Contains(body, `"db":"ok"`) {
+		t.Errorf("db should still read ok on a stale-only failure: %s", body)
+	}
+}
+
+func TestHealth_NilPoll_ReportsNotConfigured(t *testing.T) {
+	log := logrus.NewEntry(logrus.New())
+	db, err := database.Open(context.Background(), filepath.Join(t.TempDir(), "h5.db"), log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	h := NewHealthHandler(db, nil, testStaleAfter, log)
+	rec := httptest.NewRecorder()
+	h.Handle(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", rec.Code)
+	}
+	if body := rec.Body.String(); !strings.Contains(body, `"imap":"not_configured"`) {
+		t.Errorf(`expected "imap":"not_configured", got %s`, body)
 	}
 }
 

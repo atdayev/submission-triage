@@ -40,6 +40,7 @@ func TestIngestEmail_ReplyGoroutineSurvivesCtxCancel(t *testing.T) {
 	subs.On("FindByDeterministicID", mock.Anything, mock.Anything).Return(nil, model.ErrSubmissionNotFound).Maybe()
 	subs.On("UpsertSubmissionWithReply", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 	subs.On("UpsertEmail", mock.Anything, mock.Anything).Return(nil).Maybe()
+	subs.On("SetLastReplyAt", mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
 
 	replySentSeen := atomic.Bool{}
 	aud.On("Append", mock.Anything, mock.Anything).Return(nil).Run(func(args mock.Arguments) {
@@ -126,6 +127,7 @@ func TestShutdown_BoundedWhenSendStuck(t *testing.T) {
 	subs.On("FindByDeterministicID", mock.Anything, mock.Anything).Return(nil, model.ErrSubmissionNotFound).Maybe()
 	subs.On("UpsertSubmissionWithReply", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 	subs.On("UpsertEmail", mock.Anything, mock.Anything).Return(nil).Maybe()
+	subs.On("SetLastReplyAt", mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
 	aud.On("Append", mock.Anything, mock.Anything).Return(nil)
 
 	log := logrus.NewEntry(logrus.New())

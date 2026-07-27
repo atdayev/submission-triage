@@ -41,6 +41,42 @@ func writeTempEML(t *testing.T, contents string) string {
 	return path
 }
 
+func TestFromReader_CapturesAutoResponseHeaders(t *testing.T) {
+	const eml = "From: Auto <auto@example.com>\r\n" +
+		"To: ops@agency.example\r\n" +
+		"Subject: Out of office\r\n" +
+		"Message-ID: <ooo@example.com>\r\n" +
+		"Auto-Submitted: auto-replied\r\n" +
+		"Precedence: bulk\r\n" +
+		"List-Id: <news.example.com>\r\n" +
+		"List-Unsubscribe: <mailto:unsub@example.com>\r\n" +
+		"X-Auto-Response-Suppress: All\r\n" +
+		"Return-Path: <>\r\n" +
+		"\r\n" +
+		"I am away.\r\n"
+	p, err := FromReader(strings.NewReader(eml))
+	if err != nil {
+		t.Fatalf("FromReader: %v", err)
+	}
+	got := map[string]string{}
+	for _, h := range p.Headers {
+		got[h.Name] = h.Value
+	}
+	want := map[string]string{
+		"Auto-Submitted":           "auto-replied",
+		"Precedence":               "bulk",
+		"List-Id":                  "<news.example.com>",
+		"List-Unsubscribe":         "<mailto:unsub@example.com>",
+		"X-Auto-Response-Suppress": "All",
+		"Return-Path":              "<>",
+	}
+	for name, val := range want {
+		if got[name] != val {
+			t.Errorf("%s: got %q, want %q", name, got[name], val)
+		}
+	}
+}
+
 func TestFromFile_ParsesHeadersBodyAndAttachment(t *testing.T) {
 	path := writeTempEML(t, simpleEML)
 	p, err := FromFile(path)

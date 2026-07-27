@@ -3,6 +3,7 @@ package imap
 import (
 	"bytes"
 	"context"
+	"sync/atomic"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -27,38 +28,71 @@ type rawMessage struct {
 type mailbox interface {
 	FetchUnseen(ctx context.Context, limit int) ([]rawMessage, error)
 	MarkSeen(ctx context.Context, uid uint32) error
-	Label(ctx context.Context, uid uint32, name string) error
+	Flag(ctx context.Context, uid uint32) error
+	File(ctx context.Context, uid uint32, folder string) error
 	Close() error
 }
 
 // ingester is what the poller needs from the service.
 type ingester interface {
 	IngestEmail(ctx context.Context, req service.IngestRequest) (service.IngestResult, error)
+	AuditFileFailed(ctx context.Context, submissionID, folder, reason string)
+}
+
+// statusFolders maps a submission's post-ingest status to its mailbox folder.
+type statusFolders struct {
+	complete, awaiting, escalated, unknownPolicy string
 }
 
 // Poller polls an IMAP inbox for new mail and ingests it.
 type Poller struct {
-	dial          func(ctx context.Context) (mailbox, error)
-	ingest        ingester
-	interval      time.Duration
-	batchLimit    int
-	mailbox       string
-	completeLabel string
-	log           *logrus.Entry
+	dial         func(ctx context.Context) (mailbox, error)
+	ingest       ingester
+	interval     time.Duration
+	batchLimit   int
+	mailbox      string
+	fileByStatus bool
+	folders      statusFolders
+	log          *logrus.Entry
+
+	lastPoll atomic.Int64 // unix nanos of the last successful fetch cycle
+	failures atomic.Int64 // consecutive dial/fetch failures
 }
 
-// NewPoller returns a Poller configured from cfg.
-func NewPoller(cfg config.IMAPConfig, svc ingester, log *logrus.Entry) *Poller {
-	return &Poller{
-		dial:          dialIMAP(cfg, log),
-		ingest:        svc,
-		interval:      cfg.PollInterval(),
-		batchLimit:    defaultBatchLimit,
-		mailbox:       cfg.Mailbox,
-		completeLabel: cfg.CompleteLabel,
-		log:           log,
+// NewPoller returns a Poller configured from cfg, authenticating with auth.
+func NewPoller(cfg config.IMAPConfig, auth Authenticator, svc ingester, log *logrus.Entry) *Poller {
+	p := &Poller{
+		dial:         dialIMAP(cfg, auth, log),
+		ingest:       svc,
+		interval:     cfg.PollInterval(),
+		batchLimit:   defaultBatchLimit,
+		mailbox:      cfg.Mailbox,
+		fileByStatus: cfg.FileByStatus,
+		folders: statusFolders{
+			complete:      cfg.FolderComplete,
+			awaiting:      cfg.FolderAwaiting,
+			escalated:     cfg.FolderEscalated,
+			unknownPolicy: cfg.FolderUnknownPolicy,
+		},
+		log: log,
 	}
+	// seed with startup time so the first interval after boot isn't reported stale
+	p.lastPoll.Store(time.Now().UnixNano())
+	return p
 }
+
+// LastSuccessfulPoll reports when the poller last completed a fetch cycle.
+func (p *Poller) LastSuccessfulPoll() time.Time { return time.Unix(0, p.lastPoll.Load()) }
+
+// Configured reports that the poller is active; it exists only when IMAP is set.
+func (p *Poller) Configured() bool { return true }
+
+func (p *Poller) recordSuccess() {
+	p.lastPoll.Store(time.Now().UnixNano())
+	p.failures.Store(0)
+}
+
+func (p *Poller) recordFailure() int64 { return p.failures.Add(1) }
 
 // Run polls until ctx is cancelled, fetching once at startup then per interval.
 func (p *Poller) Run(ctx context.Context) {
@@ -87,16 +121,18 @@ func (p *Poller) pollOnce(ctx context.Context) {
 	}
 	mb, err := p.dial(ctx)
 	if err != nil {
-		p.log.WithError(err).Warn("imap connect failed; will retry next tick")
+		p.log.WithError(err).WithField("consecutive_failures", p.recordFailure()).Warn("imap connect failed; will retry next tick")
 		return
 	}
 	defer mb.Close()
 
 	msgs, err := mb.FetchUnseen(ctx, p.batchLimit)
 	if err != nil {
-		p.log.WithError(err).Warn("imap fetch failed")
+		p.log.WithError(err).WithField("consecutive_failures", p.recordFailure()).Warn("imap fetch failed")
 		return
 	}
+	// fetch cycle completed; a zero-message tick still proves the mailbox is reachable
+	p.recordSuccess()
 	if len(msgs) == 0 {
 		p.log.Debug("imap poll: no unseen messages")
 		return
@@ -140,13 +176,49 @@ func (p *Poller) process(ctx context.Context, mb mailbox, m rawMessage) {
 		"duplicate":     res.IsDuplicate,
 	}).Info("imap: message ingested")
 
-	if p.completeLabel != "" && !res.IsDuplicate && res.State == model.StateComplete {
-		if err := mb.Label(ctx, m.UID, p.completeLabel); err != nil {
-			log.WithError(err).WithField("label", p.completeLabel).Warn("imap: label failed")
+	// mark \Seen BEFORE filing: MOVE removes the source UID, so mark-seen must
+	// come first (MOVE preserves flags, so the filed copy stays read). A mark-seen
+	// failure leaves the message unread for a retry next tick (ingest is idempotent).
+	if err := mb.MarkSeen(ctx, m.UID); err != nil {
+		log.WithError(err).Warn("imap: mark-seen failed; leaving unread for retry")
+		return
+	}
+	// flag before filing: MOVE invalidates the source UID, so flags go on the
+	// original first; a flag failure is cosmetic (status lives in the DB + digest)
+	if res.NeedsReview {
+		if err := mb.Flag(ctx, m.UID); err != nil {
+			log.WithError(err).Warn("imap: flag failed; message stays unflagged")
 		}
 	}
+	folder := p.folderFor(res)
+	if folder == "" || res.IsDuplicate {
+		return
+	}
+	if err := mb.File(ctx, m.UID, folder); err != nil {
+		// cosmetic: the message stays read in the inbox, unfiled. The real status is
+		// in the DB and the daily digest, so this loses nothing correctness-wise.
+		log.WithError(err).WithField("folder", folder).Warn("imap: file failed; message stays in inbox")
+		p.ingest.AuditFileFailed(ctx, res.SubmissionID, folder, err.Error())
+	}
+}
 
-	if err := mb.MarkSeen(ctx, m.UID); err != nil {
-		log.WithError(err).Warn("imap: mark-seen failed")
+// folderFor returns the status folder for the just-processed message, or "" to
+// leave it in the inbox (filing disabled, or a non-terminal state).
+func (p *Poller) folderFor(res service.IngestResult) string {
+	if !p.fileByStatus {
+		return ""
+	}
+	if res.PolicyUnknown {
+		return p.folders.unknownPolicy
+	}
+	switch res.State {
+	case model.StateComplete:
+		return p.folders.complete
+	case model.StateAwaiting:
+		return p.folders.awaiting
+	case model.StateEscalated:
+		return p.folders.escalated
+	default:
+		return "" // open/closed: not filed
 	}
 }

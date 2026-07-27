@@ -15,7 +15,6 @@ const maxDocxPartBytes = 50 << 20
 // DOCX extracts plain text from .docx documents.
 type DOCX struct{}
 
-// NewDOCX returns a DOCX text extractor.
 func NewDOCX() *DOCX { return &DOCX{} }
 
 // Extract returns the text of word/document.xml from a .docx archive.

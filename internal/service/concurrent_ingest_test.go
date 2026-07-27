@@ -47,6 +47,7 @@ func TestIngestEmail_ConcurrentSameEmail_SingleSubmission(t *testing.T) {
 		capturedID.Store(s.ID)
 	})
 	subs.On("UpsertEmail", mock.Anything, mock.Anything).Return(nil).Maybe()
+	subs.On("SetLastReplyAt", mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
 	aud.On("Append", mock.Anything, mock.Anything).Return(nil)
 
 	bc := &blockingClassifier{entered: make(chan struct{}), release: make(chan struct{})}

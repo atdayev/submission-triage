@@ -17,7 +17,6 @@ const (
 // XLSX extracts plain text from .xlsx spreadsheets.
 type XLSX struct{}
 
-// NewXLSX returns an XLSX text extractor.
 func NewXLSX() *XLSX { return &XLSX{} }
 
 // Extract returns the sheet rows as tab-joined lines, capped by row and unzip limits.

@@ -62,7 +62,11 @@ type Submission struct {
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
 	LastActionAt time.Time
+	LastReplyAt  time.Time // when the last reply was sent; spaces the next reply
 	EscalatedAt  *time.Time
+	// NeedsReview flags a submission a human should look at (an unreadable or
+	// low-confidence document); orthogonal to State, persists until resolved.
+	NeedsReview  bool
 	Emails       []Email
 	Documents    []Document
 	MissingItems []MissingItem
@@ -116,12 +120,10 @@ func (s *Submission) MarkAction(now time.Time) {
 	s.LastActionAt = now
 }
 
-// AttachEmail appends an email to the submission.
 func (s *Submission) AttachEmail(e Email) {
 	s.Emails = append(s.Emails, e)
 }
 
-// AttachDocument appends a classified document to the submission.
 func (s *Submission) AttachDocument(d Document) {
 	s.Documents = append(s.Documents, d)
 }

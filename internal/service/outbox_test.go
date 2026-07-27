@@ -14,6 +14,7 @@ import (
 )
 
 func outboxSvc(ob repository.OutboxRepository, mail *fakeMail, subs *repomocks.SubmissionRepository, aud *repomocks.AuditRepository, maxAttempts int) *SubmissionsService {
+	subs.On("SetLastReplyAt", mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
 	return &SubmissionsService{
 		repo:              &repository.Repository{Submissions: subs, Audit: aud, Outbox: ob},
 		mail:              mail,
@@ -23,6 +24,17 @@ func outboxSvc(ob repository.OutboxRepository, mail *fakeMail, subs *repomocks.S
 		outboxMaxAttempts: maxAttempts,
 		outboxBatch:       100,
 	}
+}
+
+// listAllPending returns every pending row regardless of scheduling gates.
+func listAllPending(t *testing.T, ob repository.OutboxRepository) []model.OutboxEntry {
+	t.Helper()
+	far := time.Now().Add(time.Hour)
+	pend, err := ob.ListPending(context.Background(), far, far, 100)
+	if err != nil {
+		t.Fatalf("list pending: %v", err)
+	}
+	return pend
 }
 
 func TestRedeliverOutbox_SendsAndMarksSent(t *testing.T) {
@@ -43,7 +55,7 @@ func TestRedeliverOutbox_SendsAndMarksSent(t *testing.T) {
 	if mail.sentCount() != 1 {
 		t.Fatalf("sent: got %d, want 1", mail.sentCount())
 	}
-	if pend, _ := ob.ListPending(ctx, time.Now(), 10); len(pend) != 0 {
+	if pend := listAllPending(t, ob); len(pend) != 0 {
 		t.Errorf("entry still pending after success: %d", len(pend))
 	}
 }
@@ -68,11 +80,11 @@ func TestRedeliverOutbox_RetriesThenDeadLetters(t *testing.T) {
 	_ = ob.Enqueue(ctx, &model.OutboxEntry{SubmissionID: "s1", Reply: model.Reply{ToAddress: "broker@x"}})
 
 	_ = svc.RedeliverOutbox(ctx) // attempt 1 -> still pending
-	if pend, _ := ob.ListPending(ctx, time.Now(), 10); len(pend) != 1 {
+	if pend := listAllPending(t, ob); len(pend) != 1 {
 		t.Fatalf("after one failure expected still pending, got %d", len(pend))
 	}
 	_ = svc.RedeliverOutbox(ctx) // attempt 2 -> hits max -> dead-lettered
-	if pend, _ := ob.ListPending(ctx, time.Now(), 10); len(pend) != 0 {
+	if pend := listAllPending(t, ob); len(pend) != 0 {
 		t.Errorf("after max attempts expected dead-letter, still pending %d", len(pend))
 	}
 	if !deadLettered {
@@ -80,9 +92,9 @@ func TestRedeliverOutbox_RetriesThenDeadLetters(t *testing.T) {
 	}
 }
 
-// The sweeper backs off entries updated within outboxRetryAfter so it can't
-// double-dispatch one the online sender just enqueued.
-func TestRedeliverOutbox_RetryWindowBacksOffRecentEntry(t *testing.T) {
+// A never-attempted entry is due as soon as its coalesce window elapses; the
+// retry backoff applies only to entries that have already failed a send.
+func TestRedeliverOutbox_FreshEntryNotGatedByRetryWindow(t *testing.T) {
 	ctx := context.Background()
 	ob := newFakeOutbox()
 	subs := repomocks.NewSubmissionRepository(t)
@@ -92,7 +104,6 @@ func TestRedeliverOutbox_RetryWindowBacksOffRecentEntry(t *testing.T) {
 	mail := &fakeMail{}
 	svc := outboxSvc(ob, mail, subs, aud, 3)
 
-	// a controlled clock shared by the service and the fake outbox
 	base := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
 	nowVal := base
 	clk := func() time.Time { return nowVal }
@@ -105,16 +116,75 @@ func TestRedeliverOutbox_RetryWindowBacksOffRecentEntry(t *testing.T) {
 	if err := svc.RedeliverOutbox(ctx); err != nil {
 		t.Fatal(err)
 	}
+	if mail.sentCount() != 1 {
+		t.Fatalf("a never-attempted entry must send immediately, not wait out the retry window: got %d", mail.sentCount())
+	}
+}
+
+// A reply scheduled in the future (coalesce window not elapsed) is held by the
+// sweeper until not_before passes — e.g. a shutdown mid-window leaves it pending.
+func TestRedeliverOutbox_RespectsNotBefore(t *testing.T) {
+	ctx := context.Background()
+	ob := newFakeOutbox()
+	subs := repomocks.NewSubmissionRepository(t)
+	subs.On("UpsertEmail", mock.Anything, mock.Anything).Return(nil).Maybe()
+	aud := repomocks.NewAuditRepository(t)
+	aud.On("Append", mock.Anything, mock.Anything).Return(nil).Maybe()
+	mail := &fakeMail{}
+	svc := outboxSvc(ob, mail, subs, aud, 3)
+
+	base := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	nowVal := base
+	clk := func() time.Time { return nowVal }
+	svc.setClock(clk)
+	ob.now = clk
+
+	_ = ob.Enqueue(ctx, &model.OutboxEntry{SubmissionID: "s1", Reply: model.Reply{ToAddress: "b@x"}, NotBefore: base.Add(2 * time.Minute)})
+
+	_ = svc.RedeliverOutbox(ctx) // before not_before
 	if mail.sentCount() != 0 {
-		t.Fatalf("sweeper sent a freshly-enqueued entry inside the retry window: %d", mail.sentCount())
+		t.Fatalf("a reply scheduled in the future must not send yet: %d", mail.sentCount())
+	}
+
+	nowVal = base.Add(3 * time.Minute) // past not_before
+	_ = svc.RedeliverOutbox(ctx)
+	if mail.sentCount() != 1 {
+		t.Fatalf("the sweeper should send once not_before passes: %d", mail.sentCount())
+	}
+}
+
+// A failed entry backs off for outboxRetryAfter before it is retried.
+func TestRedeliverOutbox_AttemptedEntryBacksOffThenRetries(t *testing.T) {
+	ctx := context.Background()
+	ob := newFakeOutbox()
+	subs := repomocks.NewSubmissionRepository(t)
+	subs.On("UpsertEmail", mock.Anything, mock.Anything).Return(nil).Maybe()
+	aud := repomocks.NewAuditRepository(t)
+	aud.On("Append", mock.Anything, mock.Anything).Return(nil).Maybe()
+	mail := &fakeMail{shouldFail: true}
+	svc := outboxSvc(ob, mail, subs, aud, 5)
+
+	base := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	nowVal := base
+	clk := func() time.Time { return nowVal }
+	svc.setClock(clk)
+	ob.now = clk
+	svc.outboxRetryAfter = 2 * time.Minute
+
+	_ = ob.Enqueue(ctx, &model.OutboxEntry{SubmissionID: "s1", Reply: model.Reply{ToAddress: "broker@x", Subject: "re"}})
+
+	_ = svc.RedeliverOutbox(ctx) // attempt 1 fails -> attempts=1, updated_at=now
+	mail.shouldFail = false      // it would succeed if retried
+
+	_ = svc.RedeliverOutbox(ctx) // within the window -> held back
+	if mail.sentCount() != 0 {
+		t.Fatalf("an attempted entry should back off within the retry window: got %d", mail.sentCount())
 	}
 
 	nowVal = base.Add(3 * time.Minute) // past the window
-	if err := svc.RedeliverOutbox(ctx); err != nil {
-		t.Fatal(err)
-	}
+	_ = svc.RedeliverOutbox(ctx)
 	if mail.sentCount() != 1 {
-		t.Fatalf("sweeper should deliver after the retry window: got %d", mail.sentCount())
+		t.Fatalf("an attempted entry should retry after the window: got %d", mail.sentCount())
 	}
 }
 

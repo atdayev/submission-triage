@@ -26,7 +26,18 @@ type SubmissionRepository interface {
 	ListStale(ctx context.Context, olderThanUnixNano int64, limit int) ([]model.Submission, error)
 	ListCompletedBefore(ctx context.Context, olderThanUnixNano int64, limit int) ([]model.Submission, error)
 	ListEscalatedSince(ctx context.Context, sinceUnixNano int64, limit int) ([]model.Submission, error)
+	// ListOpen returns non-closed submissions for the daily digest, ordered by
+	// state then oldest inactivity, capped at limit.
+	ListOpen(ctx context.Context, limit int) ([]model.Submission, error)
+	// CountOpen returns the total non-closed submission count (for the digest's
+	// omitted line when the cap is hit).
+	CountOpen(ctx context.Context) (int, error)
+	// FilenameOnlyItems returns, per submission id, the item ids satisfied by a
+	// filename glob alone (no keyword/LLM corroboration) — the digest flags these.
+	FilenameOnlyItems(ctx context.Context, submissionIDs []string) (map[string][]string, error)
 	UpsertEmail(ctx context.Context, e *model.Email) error
+	// SetLastReplyAt records when a submission's last reply was sent (coalesce spacing).
+	SetLastReplyAt(ctx context.Context, submissionID string, t time.Time) error
 }
 
 type scanner interface {
@@ -115,7 +126,7 @@ func (r *SubmissionRepositoryImpl) GetByID(ctx context.Context, id string) (*mod
 	row := r.db.QueryRowContext(ctx, `
 		SELECT id, policy_type, state, subject_line, from_address, from_name,
 		       thread_key, created_at, updated_at, last_action_at,
-		       escalated_at, missing_items
+		       escalated_at, missing_items, last_reply_at, needs_review
 		FROM submissions WHERE id = ?`, id)
 
 	s, err := scanSubmission(row, r.log)
@@ -252,6 +263,15 @@ func nanoOrNow(t time.Time) int64 {
 	return t.UnixNano()
 }
 
+// nanoOrZero returns t as UnixNano, or 0 for a zero time (used where 0 is a
+// meaningful "never" sentinel, e.g. last_reply_at).
+func nanoOrZero(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.UnixNano()
+}
+
 func placeholderList(n int) string {
 	if n <= 0 {
 		return ""
@@ -267,7 +287,7 @@ func (r *SubmissionRepositoryImpl) ListCompletedBefore(ctx context.Context, olde
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT id, policy_type, state, subject_line, from_address, from_name,
 		       thread_key, created_at, updated_at, last_action_at,
-		       escalated_at, missing_items
+		       escalated_at, missing_items, last_reply_at, needs_review
 		FROM submissions
 		WHERE state = ? AND updated_at < ?
 		ORDER BY updated_at ASC
@@ -296,7 +316,7 @@ func (r *SubmissionRepositoryImpl) ListEscalatedSince(ctx context.Context, since
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT id, policy_type, state, subject_line, from_address, from_name,
 		       thread_key, created_at, updated_at, last_action_at,
-		       escalated_at, missing_items
+		       escalated_at, missing_items, last_reply_at, needs_review
 		FROM submissions
 		WHERE state = ? AND escalated_at IS NOT NULL AND escalated_at >= ?
 		ORDER BY escalated_at ASC
@@ -325,7 +345,7 @@ func (r *SubmissionRepositoryImpl) ListStale(ctx context.Context, olderThanUnixN
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT id, policy_type, state, subject_line, from_address, from_name,
 		       thread_key, created_at, updated_at, last_action_at,
-		       escalated_at, missing_items
+		       escalated_at, missing_items, last_reply_at, needs_review
 		FROM submissions
 		WHERE state = ? AND last_action_at < ?
 		ORDER BY last_action_at ASC
@@ -344,6 +364,95 @@ func (r *SubmissionRepositoryImpl) ListStale(ctx context.Context, olderThanUnixN
 		out = append(out, *s)
 	}
 	return out, rows.Err()
+}
+
+// ListOpen returns non-closed submissions, ordered by state then oldest inactivity.
+func (r *SubmissionRepositoryImpl) ListOpen(ctx context.Context, limit int) ([]model.Submission, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT id, policy_type, state, subject_line, from_address, from_name,
+		       thread_key, created_at, updated_at, last_action_at,
+		       escalated_at, missing_items, last_reply_at, needs_review
+		FROM submissions
+		WHERE state != ?
+		ORDER BY state ASC, last_action_at ASC
+		LIMIT ?`, string(model.StateClosed), limit)
+	if err != nil {
+		return nil, fmt.Errorf("query open: %w", err)
+	}
+	defer rows.Close()
+
+	var out []model.Submission
+	for rows.Next() {
+		s, err := scanSubmission(rows, r.log)
+		if err != nil {
+			return nil, fmt.Errorf("scan open: %w", err)
+		}
+		out = append(out, *s)
+	}
+	return out, rows.Err()
+}
+
+// FilenameOnlyItems returns, per submission id, the item ids a filename glob
+// satisfied with no keyword/LLM corroboration. Submissions with none are absent.
+func (r *SubmissionRepositoryImpl) FilenameOnlyItems(ctx context.Context, submissionIDs []string) (map[string][]string, error) {
+	if len(submissionIDs) == 0 {
+		return nil, nil
+	}
+	in := placeholderList(len(submissionIDs))
+	args := make([]any, len(submissionIDs))
+	for i, id := range submissionIDs {
+		args[i] = id
+	}
+	rows, err := r.db.QueryContext(ctx, fmt.Sprintf(`
+		SELECT submission_id, classified_as, classified_by
+		FROM documents
+		WHERE submission_id IN (%s) AND classified_as != ''`, in), args...)
+	if err != nil {
+		return nil, fmt.Errorf("query filename-only: %w", err)
+	}
+	defer rows.Close()
+
+	docsBySub := make(map[string][]model.Document)
+	for rows.Next() {
+		var sid, classifiedAs, classifiedBy string
+		if err := rows.Scan(&sid, &classifiedAs, &classifiedBy); err != nil {
+			return nil, fmt.Errorf("scan filename-only: %w", err)
+		}
+		docsBySub[sid] = append(docsBySub[sid], model.Document{ClassifiedAs: classifiedAs, ClassifiedBy: classifiedBy})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	out := make(map[string][]string, len(docsBySub))
+	for sid, docs := range docsBySub {
+		if ids := model.FilenameOnlyMatches(docs); len(ids) > 0 {
+			out[sid] = ids
+		}
+	}
+	return out, nil
+}
+
+// CountOpen returns the number of non-closed submissions.
+func (r *SubmissionRepositoryImpl) CountOpen(ctx context.Context) (int, error) {
+	var n int
+	if err := r.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM submissions WHERE state != ?`, string(model.StateClosed)).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count open: %w", err)
+	}
+	return n, nil
+}
+
+// SetLastReplyAt records when a submission's last reply was sent.
+func (r *SubmissionRepositoryImpl) SetLastReplyAt(ctx context.Context, submissionID string, t time.Time) error {
+	_, err := r.db.ExecContext(ctx,
+		`UPDATE submissions SET last_reply_at = ? WHERE id = ?`, nanoOrZero(t), submissionID)
+	if err != nil {
+		return fmt.Errorf("set last_reply_at: %w", err)
+	}
+	return nil
 }
 
 // UpsertEmail persists a single email in its own tx.
@@ -371,12 +480,14 @@ func upsertSubmissionRow(ctx context.Context, tx *sql.Tx, s *model.Submission) e
 	if s.EscalatedAt != nil {
 		escalatedAt = sql.NullInt64{Int64: s.EscalatedAt.UnixNano(), Valid: true}
 	}
+	// last_reply_at is written on insert but never on conflict: SetLastReplyAt
+	// owns it, so a concurrent in-flight send isn't clobbered by a re-upsert.
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO submissions (
 			id, policy_type, state, subject_line, from_address, from_name,
 			thread_key, created_at, updated_at, last_action_at,
-			escalated_at, missing_items
-		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+			escalated_at, missing_items, last_reply_at, needs_review
+		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 			policy_type=excluded.policy_type,
 			state=excluded.state,
@@ -387,10 +498,11 @@ func upsertSubmissionRow(ctx context.Context, tx *sql.Tx, s *model.Submission) e
 			updated_at=excluded.updated_at,
 			last_action_at=excluded.last_action_at,
 			escalated_at=excluded.escalated_at,
-			missing_items=excluded.missing_items`,
+			missing_items=excluded.missing_items,
+			needs_review=excluded.needs_review`,
 		s.ID, s.PolicyType, string(s.State), s.SubjectLine, s.FromAddress, s.FromName,
 		s.ThreadKey, nanoOrNow(s.CreatedAt), nanoOrNow(s.UpdatedAt), nanoOrNow(s.LastActionAt),
-		escalatedAt, string(missingJSON),
+		escalatedAt, string(missingJSON), nanoOrZero(s.LastReplyAt), boolToInt(s.NeedsReview),
 	)
 	if err != nil {
 		return fmt.Errorf("upsert submission: %w", err)
@@ -446,22 +558,30 @@ func upsertDocumentRow(ctx context.Context, tx *sql.Tx, d *model.Document) error
 		INSERT INTO documents (
 			id, submission_id, email_id, filename, content_type, size_bytes,
 			sha256, classified_as, confidence, classified_by,
-			extracted_text, extracted_fields, created_at
-		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+			extracted_text, extracted_fields, unreadable, created_at
+		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 			classified_as=excluded.classified_as,
 			confidence=excluded.confidence,
 			classified_by=excluded.classified_by,
 			extracted_text=excluded.extracted_text,
-			extracted_fields=excluded.extracted_fields`,
+			extracted_fields=excluded.extracted_fields,
+			unreadable=excluded.unreadable`,
 		d.ID, d.SubmissionID, d.EmailID, d.Filename, d.ContentType, d.SizeBytes,
 		d.SHA256, d.ClassifiedAs, d.Confidence, d.ClassifiedBy,
-		d.ExtractedText, string(fieldsJSON), d.CreatedAt.UnixNano(),
+		d.ExtractedText, string(fieldsJSON), boolToInt(d.Unreadable), d.CreatedAt.UnixNano(),
 	)
 	if err != nil {
 		return fmt.Errorf("upsert document: %w", err)
 	}
 	return nil
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 func stripAttachmentContent(in []model.Attachment) []model.Attachment {
@@ -480,21 +600,27 @@ func scanSubmission(s scanner, log *logrus.Entry) (*model.Submission, error) {
 		createdAt   int64
 		updatedAt   int64
 		lastAction  int64
+		lastReply   int64
 		escalatedAt sql.NullInt64
 		missingJSON string
+		needsReview int
 	)
 	err := s.Scan(
 		&sub.ID, &sub.PolicyType, &stateStr, &sub.SubjectLine, &sub.FromAddress, &sub.FromName,
 		&sub.ThreadKey, &createdAt, &updatedAt, &lastAction,
-		&escalatedAt, &missingJSON,
+		&escalatedAt, &missingJSON, &lastReply, &needsReview,
 	)
 	if err != nil {
 		return nil, err
 	}
 	sub.State = model.State(stateStr)
+	sub.NeedsReview = needsReview != 0
 	sub.CreatedAt = time.Unix(0, createdAt).UTC()
 	sub.UpdatedAt = time.Unix(0, updatedAt).UTC()
 	sub.LastActionAt = time.Unix(0, lastAction).UTC()
+	if lastReply != 0 {
+		sub.LastReplyAt = time.Unix(0, lastReply).UTC()
+	}
 	if escalatedAt.Valid {
 		t := time.Unix(0, escalatedAt.Int64).UTC()
 		sub.EscalatedAt = &t
@@ -574,7 +700,7 @@ func loadDocuments(ctx context.Context, db *sql.DB, submissionID string) ([]mode
 	rows, err := db.QueryContext(ctx, `
 		SELECT id, submission_id, email_id, filename, content_type, size_bytes,
 		       sha256, classified_as, confidence, classified_by,
-		       extracted_text, extracted_fields, created_at
+		       extracted_text, extracted_fields, unreadable, created_at
 		FROM documents WHERE submission_id = ?
 		ORDER BY created_at ASC`, submissionID)
 	if err != nil {
@@ -587,15 +713,17 @@ func loadDocuments(ctx context.Context, db *sql.DB, submissionID string) ([]mode
 		var (
 			d          model.Document
 			fieldsJSON string
+			unreadable int
 			createdAt  int64
 		)
 		if err := rows.Scan(
 			&d.ID, &d.SubmissionID, &d.EmailID, &d.Filename, &d.ContentType, &d.SizeBytes,
 			&d.SHA256, &d.ClassifiedAs, &d.Confidence, &d.ClassifiedBy,
-			&d.ExtractedText, &fieldsJSON, &createdAt,
+			&d.ExtractedText, &fieldsJSON, &unreadable, &createdAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan document: %w", err)
 		}
+		d.Unreadable = unreadable != 0
 		d.CreatedAt = time.Unix(0, createdAt).UTC()
 		if fieldsJSON != "" && fieldsJSON != "{}" {
 			if err := json.Unmarshal([]byte(fieldsJSON), &d.ExtractedFields); err != nil {
