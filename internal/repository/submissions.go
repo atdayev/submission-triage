@@ -24,6 +24,9 @@ type SubmissionRepository interface {
 	FindByEmailReference(ctx context.Context, messageIDs []string) (*model.Submission, bool, error)
 	FindByDeterministicID(ctx context.Context, deterministicID string) (*model.Submission, error)
 	ListStale(ctx context.Context, olderThanUnixNano int64, limit int) ([]model.Submission, error)
+	// ListBindSoon returns awaiting submissions whose effective date is at or before
+	// the cutoff (the bind window), excluding held/delivery-failed ones.
+	ListBindSoon(ctx context.Context, effectiveBeforeUnixNano int64, limit int) ([]model.Submission, error)
 	ListCompletedBefore(ctx context.Context, olderThanUnixNano int64, limit int) ([]model.Submission, error)
 	ListEscalatedSince(ctx context.Context, sinceUnixNano int64, limit int) ([]model.Submission, error)
 	// ListOpen returns non-closed submissions for the daily digest, ordered by
@@ -38,6 +41,15 @@ type SubmissionRepository interface {
 	UpsertEmail(ctx context.Context, e *model.Email) error
 	// SetLastReplyAt records when a submission's last reply was sent (coalesce spacing).
 	SetLastReplyAt(ctx context.Context, submissionID string, t time.Time) error
+	// SetOnHold sets on_hold on the given submissions (declarative Hold-folder sync).
+	SetOnHold(ctx context.Context, submissionIDs []string, onHold bool) error
+	// ListHeldIDs returns the ids of all currently-held submissions.
+	ListHeldIDs(ctx context.Context) ([]string, error)
+	// SubmissionIDsByMessageIDs resolves inbound Message-IDs to their submission ids.
+	SubmissionIDsByMessageIDs(ctx context.Context, messageIDs []string) ([]string, error)
+	// FindContentMatch returns the most recent open/awaiting submission from the same
+	// sender with the same normalized named insured, created since the cutoff.
+	FindContentMatch(ctx context.Context, namedInsured, fromAddress string, createdAfterUnixNano int64) (*model.Submission, error)
 }
 
 type scanner interface {
@@ -126,7 +138,8 @@ func (r *SubmissionRepositoryImpl) GetByID(ctx context.Context, id string) (*mod
 	row := r.db.QueryRowContext(ctx, `
 		SELECT id, policy_type, state, subject_line, from_address, from_name,
 		       thread_key, created_at, updated_at, last_action_at,
-		       escalated_at, missing_items, last_reply_at, needs_review
+		       escalated_at, missing_items, last_reply_at, needs_review,
+		       named_insured, effective_date, on_hold, delivery_failed, last_escalated_at
 		FROM submissions WHERE id = ?`, id)
 
 	s, err := scanSubmission(row, r.log)
@@ -287,9 +300,10 @@ func (r *SubmissionRepositoryImpl) ListCompletedBefore(ctx context.Context, olde
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT id, policy_type, state, subject_line, from_address, from_name,
 		       thread_key, created_at, updated_at, last_action_at,
-		       escalated_at, missing_items, last_reply_at, needs_review
+		       escalated_at, missing_items, last_reply_at, needs_review,
+		       named_insured, effective_date, on_hold, delivery_failed, last_escalated_at
 		FROM submissions
-		WHERE state = ? AND updated_at < ?
+		WHERE state = ? AND updated_at < ? AND on_hold = 0
 		ORDER BY updated_at ASC
 		LIMIT ?`, string(model.StateComplete), olderThanUnixNano, limit)
 	if err != nil {
@@ -316,9 +330,10 @@ func (r *SubmissionRepositoryImpl) ListEscalatedSince(ctx context.Context, since
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT id, policy_type, state, subject_line, from_address, from_name,
 		       thread_key, created_at, updated_at, last_action_at,
-		       escalated_at, missing_items, last_reply_at, needs_review
+		       escalated_at, missing_items, last_reply_at, needs_review,
+		       named_insured, effective_date, on_hold, delivery_failed, last_escalated_at
 		FROM submissions
-		WHERE state = ? AND escalated_at IS NOT NULL AND escalated_at >= ?
+		WHERE state = ? AND escalated_at IS NOT NULL AND escalated_at >= ? AND on_hold = 0
 		ORDER BY escalated_at ASC
 		LIMIT ?`, string(model.StateEscalated), sinceUnixNano, limit)
 	if err != nil {
@@ -345,9 +360,10 @@ func (r *SubmissionRepositoryImpl) ListStale(ctx context.Context, olderThanUnixN
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT id, policy_type, state, subject_line, from_address, from_name,
 		       thread_key, created_at, updated_at, last_action_at,
-		       escalated_at, missing_items, last_reply_at, needs_review
+		       escalated_at, missing_items, last_reply_at, needs_review,
+		       named_insured, effective_date, on_hold, delivery_failed, last_escalated_at
 		FROM submissions
-		WHERE state = ? AND last_action_at < ?
+		WHERE state = ? AND last_action_at < ? AND on_hold = 0 AND delivery_failed = 0
 		ORDER BY last_action_at ASC
 		LIMIT ?`, string(model.StateAwaiting), olderThanUnixNano, limit)
 	if err != nil {
@@ -366,6 +382,37 @@ func (r *SubmissionRepositoryImpl) ListStale(ctx context.Context, olderThanUnixN
 	return out, rows.Err()
 }
 
+// ListBindSoon returns awaiting submissions binding at or before the cutoff.
+func (r *SubmissionRepositoryImpl) ListBindSoon(ctx context.Context, effectiveBeforeUnixNano int64, limit int) ([]model.Submission, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT id, policy_type, state, subject_line, from_address, from_name,
+		       thread_key, created_at, updated_at, last_action_at,
+		       escalated_at, missing_items, last_reply_at, needs_review,
+		       named_insured, effective_date, on_hold, delivery_failed, last_escalated_at
+		FROM submissions
+		WHERE state = ? AND effective_date IS NOT NULL AND effective_date <= ?
+		  AND on_hold = 0 AND delivery_failed = 0
+		ORDER BY effective_date ASC
+		LIMIT ?`, string(model.StateAwaiting), effectiveBeforeUnixNano, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query bind-soon: %w", err)
+	}
+	defer rows.Close()
+
+	var out []model.Submission
+	for rows.Next() {
+		s, err := scanSubmission(rows, r.log)
+		if err != nil {
+			return nil, fmt.Errorf("scan bind-soon: %w", err)
+		}
+		out = append(out, *s)
+	}
+	return out, rows.Err()
+}
+
 // ListOpen returns non-closed submissions, ordered by state then oldest inactivity.
 func (r *SubmissionRepositoryImpl) ListOpen(ctx context.Context, limit int) ([]model.Submission, error) {
 	if limit <= 0 {
@@ -374,7 +421,8 @@ func (r *SubmissionRepositoryImpl) ListOpen(ctx context.Context, limit int) ([]m
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT id, policy_type, state, subject_line, from_address, from_name,
 		       thread_key, created_at, updated_at, last_action_at,
-		       escalated_at, missing_items, last_reply_at, needs_review
+		       escalated_at, missing_items, last_reply_at, needs_review,
+		       named_insured, effective_date, on_hold, delivery_failed, last_escalated_at
 		FROM submissions
 		WHERE state != ?
 		ORDER BY state ASC, last_action_at ASC
@@ -455,6 +503,88 @@ func (r *SubmissionRepositoryImpl) SetLastReplyAt(ctx context.Context, submissio
 	return nil
 }
 
+// SetOnHold sets on_hold for the given submissions in one statement (no-op on empty).
+func (r *SubmissionRepositoryImpl) SetOnHold(ctx context.Context, submissionIDs []string, onHold bool) error {
+	if len(submissionIDs) == 0 {
+		return nil
+	}
+	in := placeholderList(len(submissionIDs))
+	args := make([]any, 0, len(submissionIDs)+1)
+	args = append(args, boolToInt(onHold))
+	for _, id := range submissionIDs {
+		args = append(args, id)
+	}
+	if _, err := r.db.ExecContext(ctx, fmt.Sprintf(`UPDATE submissions SET on_hold = ? WHERE id IN (%s)`, in), args...); err != nil {
+		return fmt.Errorf("set on_hold: %w", err)
+	}
+	return nil
+}
+
+// ListHeldIDs returns the ids of all currently-held submissions.
+func (r *SubmissionRepositoryImpl) ListHeldIDs(ctx context.Context) ([]string, error) {
+	rows, err := r.db.QueryContext(ctx, `SELECT id FROM submissions WHERE on_hold = 1`)
+	if err != nil {
+		return nil, fmt.Errorf("list held: %w", err)
+	}
+	defer rows.Close()
+	return scanIDs(rows, "held")
+}
+
+// SubmissionIDsByMessageIDs resolves inbound Message-IDs to distinct submission ids.
+func (r *SubmissionRepositoryImpl) SubmissionIDsByMessageIDs(ctx context.Context, messageIDs []string) ([]string, error) {
+	ids := nonEmpty(messageIDs)
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	in := placeholderList(len(ids))
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	rows, err := r.db.QueryContext(ctx, fmt.Sprintf(`SELECT DISTINCT submission_id FROM emails WHERE message_id IN (%s)`, in), args...)
+	if err != nil {
+		return nil, fmt.Errorf("query submissions by message id: %w", err)
+	}
+	defer rows.Close()
+	return scanIDs(rows, "submission id")
+}
+
+// FindContentMatch returns the most recent open/awaiting submission from the same
+// sender with the same normalized named insured, created at or after the cutoff.
+func (r *SubmissionRepositoryImpl) FindContentMatch(ctx context.Context, namedInsured, fromAddress string, createdAfterUnixNano int64) (*model.Submission, error) {
+	insured := strings.ToLower(strings.TrimSpace(namedInsured))
+	if insured == "" || fromAddress == "" {
+		return nil, model.ErrSubmissionNotFound
+	}
+	var id string
+	err := r.db.QueryRowContext(ctx, `
+		SELECT id FROM submissions
+		WHERE named_insured != '' AND lower(trim(named_insured)) = ? AND from_address = ?
+		  AND state IN (?, ?) AND created_at >= ?
+		ORDER BY created_at DESC LIMIT 1`,
+		insured, fromAddress, string(model.StateOpen), string(model.StateAwaiting), createdAfterUnixNano).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, model.ErrSubmissionNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("content match: %w", err)
+	}
+	return r.GetByID(ctx, id)
+}
+
+// scanIDs collects a single-column id result set.
+func scanIDs(rows *sql.Rows, what string) ([]string, error) {
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan %s: %w", what, err)
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 // UpsertEmail persists a single email in its own tx.
 func (r *SubmissionRepositoryImpl) UpsertEmail(ctx context.Context, e *model.Email) error {
 	tx, err := r.db.BeginTx(ctx, nil)
@@ -480,14 +610,24 @@ func upsertSubmissionRow(ctx context.Context, tx *sql.Tx, s *model.Submission) e
 	if s.EscalatedAt != nil {
 		escalatedAt = sql.NullInt64{Int64: s.EscalatedAt.UnixNano(), Valid: true}
 	}
-	// last_reply_at is written on insert but never on conflict: SetLastReplyAt
-	// owns it, so a concurrent in-flight send isn't clobbered by a re-upsert.
+	var effectiveDate sql.NullInt64
+	if s.EffectiveDate != nil {
+		effectiveDate = sql.NullInt64{Int64: s.EffectiveDate.UnixNano(), Valid: true}
+	}
+	var lastEscalated sql.NullInt64
+	if s.LastEscalatedAt != nil {
+		lastEscalated = sql.NullInt64{Int64: s.LastEscalatedAt.UnixNano(), Valid: true}
+	}
+	// last_reply_at and on_hold are written on insert but never on conflict:
+	// SetLastReplyAt and the Hold-folder reconcile own them, so a re-upsert can't
+	// clobber a concurrent send's timestamp or a human's hold toggle.
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO submissions (
 			id, policy_type, state, subject_line, from_address, from_name,
 			thread_key, created_at, updated_at, last_action_at,
-			escalated_at, missing_items, last_reply_at, needs_review
-		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+			escalated_at, missing_items, last_reply_at, needs_review,
+			named_insured, effective_date, on_hold, delivery_failed, last_escalated_at
+		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 			policy_type=excluded.policy_type,
 			state=excluded.state,
@@ -499,10 +639,15 @@ func upsertSubmissionRow(ctx context.Context, tx *sql.Tx, s *model.Submission) e
 			last_action_at=excluded.last_action_at,
 			escalated_at=excluded.escalated_at,
 			missing_items=excluded.missing_items,
-			needs_review=excluded.needs_review`,
+			needs_review=excluded.needs_review,
+			named_insured=excluded.named_insured,
+			effective_date=excluded.effective_date,
+			delivery_failed=excluded.delivery_failed,
+			last_escalated_at=excluded.last_escalated_at`,
 		s.ID, s.PolicyType, string(s.State), s.SubjectLine, s.FromAddress, s.FromName,
 		s.ThreadKey, nanoOrNow(s.CreatedAt), nanoOrNow(s.UpdatedAt), nanoOrNow(s.LastActionAt),
 		escalatedAt, string(missingJSON), nanoOrZero(s.LastReplyAt), boolToInt(s.NeedsReview),
+		s.NamedInsured, effectiveDate, boolToInt(s.OnHold), boolToInt(s.DeliveryFailed), lastEscalated,
 	)
 	if err != nil {
 		return fmt.Errorf("upsert submission: %w", err)
@@ -527,12 +672,12 @@ func upsertEmailRow(ctx context.Context, tx *sql.Tx, e *model.Email) error {
 		INSERT INTO emails (
 			deterministic_id, submission_id, direction, message_id, in_reply_to,
 			refs, from_address, from_name, to_addresses, subject,
-			body_text, received_at, provider_msg_id, attachments
-		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+			body_text, received_at, provider_msg_id, attachments, reply_to
+		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(deterministic_id) DO NOTHING`,
 		e.DeterministicID, e.SubmissionID, string(e.Direction), e.MessageID, e.InReplyTo,
 		string(refsJSON), e.FromAddress, e.FromName, string(toJSON), e.Subject,
-		e.BodyText, e.ReceivedAt.UnixNano(), e.ProviderMsgID, string(attachJSON),
+		e.BodyText, e.ReceivedAt.UnixNano(), e.ProviderMsgID, string(attachJSON), e.ReplyTo,
 	)
 	if err != nil {
 		return fmt.Errorf("upsert email: %w", err)
@@ -558,18 +703,19 @@ func upsertDocumentRow(ctx context.Context, tx *sql.Tx, d *model.Document) error
 		INSERT INTO documents (
 			id, submission_id, email_id, filename, content_type, size_bytes,
 			sha256, classified_as, confidence, classified_by,
-			extracted_text, extracted_fields, unreadable, created_at
-		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+			extracted_text, extracted_fields, unreadable, encrypted, created_at
+		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 			classified_as=excluded.classified_as,
 			confidence=excluded.confidence,
 			classified_by=excluded.classified_by,
 			extracted_text=excluded.extracted_text,
 			extracted_fields=excluded.extracted_fields,
-			unreadable=excluded.unreadable`,
+			unreadable=excluded.unreadable,
+			encrypted=excluded.encrypted`,
 		d.ID, d.SubmissionID, d.EmailID, d.Filename, d.ContentType, d.SizeBytes,
 		d.SHA256, d.ClassifiedAs, d.Confidence, d.ClassifiedBy,
-		d.ExtractedText, string(fieldsJSON), boolToInt(d.Unreadable), d.CreatedAt.UnixNano(),
+		d.ExtractedText, string(fieldsJSON), boolToInt(d.Unreadable), boolToInt(d.Encrypted), d.CreatedAt.UnixNano(),
 	)
 	if err != nil {
 		return fmt.Errorf("upsert document: %w", err)
@@ -595,26 +741,41 @@ func stripAttachmentContent(in []model.Attachment) []model.Attachment {
 
 func scanSubmission(s scanner, log *logrus.Entry) (*model.Submission, error) {
 	var (
-		sub         model.Submission
-		stateStr    string
-		createdAt   int64
-		updatedAt   int64
-		lastAction  int64
-		lastReply   int64
-		escalatedAt sql.NullInt64
-		missingJSON string
-		needsReview int
+		sub            model.Submission
+		stateStr       string
+		createdAt      int64
+		updatedAt      int64
+		lastAction     int64
+		lastReply      int64
+		escalatedAt    sql.NullInt64
+		missingJSON    string
+		needsReview    int
+		effectiveDate  sql.NullInt64
+		onHold         int
+		deliveryFailed int
+		lastEscalated  sql.NullInt64
 	)
 	err := s.Scan(
 		&sub.ID, &sub.PolicyType, &stateStr, &sub.SubjectLine, &sub.FromAddress, &sub.FromName,
 		&sub.ThreadKey, &createdAt, &updatedAt, &lastAction,
 		&escalatedAt, &missingJSON, &lastReply, &needsReview,
+		&sub.NamedInsured, &effectiveDate, &onHold, &deliveryFailed, &lastEscalated,
 	)
 	if err != nil {
 		return nil, err
 	}
 	sub.State = model.State(stateStr)
 	sub.NeedsReview = needsReview != 0
+	sub.OnHold = onHold != 0
+	sub.DeliveryFailed = deliveryFailed != 0
+	if effectiveDate.Valid {
+		t := time.Unix(0, effectiveDate.Int64).UTC()
+		sub.EffectiveDate = &t
+	}
+	if lastEscalated.Valid {
+		t := time.Unix(0, lastEscalated.Int64).UTC()
+		sub.LastEscalatedAt = &t
+	}
 	sub.CreatedAt = time.Unix(0, createdAt).UTC()
 	sub.UpdatedAt = time.Unix(0, updatedAt).UTC()
 	sub.LastActionAt = time.Unix(0, lastAction).UTC()
@@ -655,7 +816,7 @@ func loadEmails(ctx context.Context, db *sql.DB, submissionID string, log *logru
 	rows, err := db.QueryContext(ctx, `
 		SELECT deterministic_id, submission_id, direction, message_id, in_reply_to,
 		       refs, from_address, from_name, to_addresses, subject,
-		       body_text, received_at, provider_msg_id, attachments
+		       body_text, received_at, provider_msg_id, attachments, reply_to
 		FROM emails WHERE submission_id = ?
 		ORDER BY received_at ASC`, submissionID)
 	if err != nil {
@@ -676,7 +837,7 @@ func loadEmails(ctx context.Context, db *sql.DB, submissionID string, log *logru
 		if err := rows.Scan(
 			&e.DeterministicID, &e.SubmissionID, &dir, &e.MessageID, &e.InReplyTo,
 			&refsJSON, &e.FromAddress, &e.FromName, &toJSON, &e.Subject,
-			&e.BodyText, &receivedAt, &e.ProviderMsgID, &attachmentsJSON,
+			&e.BodyText, &receivedAt, &e.ProviderMsgID, &attachmentsJSON, &e.ReplyTo,
 		); err != nil {
 			return nil, fmt.Errorf("scan email: %w", err)
 		}
@@ -700,7 +861,7 @@ func loadDocuments(ctx context.Context, db *sql.DB, submissionID string) ([]mode
 	rows, err := db.QueryContext(ctx, `
 		SELECT id, submission_id, email_id, filename, content_type, size_bytes,
 		       sha256, classified_as, confidence, classified_by,
-		       extracted_text, extracted_fields, unreadable, created_at
+		       extracted_text, extracted_fields, unreadable, encrypted, created_at
 		FROM documents WHERE submission_id = ?
 		ORDER BY created_at ASC`, submissionID)
 	if err != nil {
@@ -714,16 +875,18 @@ func loadDocuments(ctx context.Context, db *sql.DB, submissionID string) ([]mode
 			d          model.Document
 			fieldsJSON string
 			unreadable int
+			encrypted  int
 			createdAt  int64
 		)
 		if err := rows.Scan(
 			&d.ID, &d.SubmissionID, &d.EmailID, &d.Filename, &d.ContentType, &d.SizeBytes,
 			&d.SHA256, &d.ClassifiedAs, &d.Confidence, &d.ClassifiedBy,
-			&d.ExtractedText, &fieldsJSON, &unreadable, &createdAt,
+			&d.ExtractedText, &fieldsJSON, &unreadable, &encrypted, &createdAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan document: %w", err)
 		}
 		d.Unreadable = unreadable != 0
+		d.Encrypted = encrypted != 0
 		d.CreatedAt = time.Unix(0, createdAt).UTC()
 		if fieldsJSON != "" && fieldsJSON != "{}" {
 			if err := json.Unmarshal([]byte(fieldsJSON), &d.ExtractedFields); err != nil {

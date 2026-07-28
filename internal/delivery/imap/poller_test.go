@@ -19,15 +19,18 @@ type fileOp struct {
 }
 
 type fakeMailbox struct {
-	msgs       []rawMessage
-	seen       []uint32
-	flagged    []uint32
-	filed      []fileOp
-	ops        []string // ordered log of "seen"/"flag"/"file" for ordering assertions
-	fileErr    error
-	fetchLimit int
-	fetchErr   error
-	closed     bool
+	msgs          []rawMessage
+	seen          []uint32
+	flagged       []uint32
+	filed         []fileOp
+	ops           []string // ordered log of "seen"/"flag"/"file" for ordering assertions
+	fileErr       error
+	fetchLimit    int
+	fetchErr      error
+	closed        bool
+	holdIDs       []string // Message-IDs ScanFolder returns
+	scannedFolder string   // folder ScanFolder was last asked for
+	scanErr       error
 }
 
 func (f *fakeMailbox) FetchUnseen(_ context.Context, limit int) ([]rawMessage, error) {
@@ -56,16 +59,23 @@ func (f *fakeMailbox) File(_ context.Context, uid uint32, folder string) error {
 	return nil
 }
 
+func (f *fakeMailbox) ScanFolder(_ context.Context, folder string, _ int) ([]string, error) {
+	f.scannedFolder = folder
+	return f.holdIDs, f.scanErr
+}
+
 func (f *fakeMailbox) Close() error {
 	f.closed = true
 	return nil
 }
 
 type fakeIngester struct {
-	reqs        []service.IngestRequest
-	fn          func(service.IngestRequest) error
-	res         *service.IngestResult // returned when set; defaults to awaiting
-	fileFailure *fileOp               // captured AuditFileFailed args
+	reqs           []service.IngestRequest
+	fn             func(service.IngestRequest) error
+	res            *service.IngestResult // returned when set; defaults to awaiting
+	fileFailure    *fileOp               // captured AuditFileFailed args
+	reconciledHold []string              // Message-IDs passed to ReconcileHold
+	reconcileCalls int
 }
 
 func (f *fakeIngester) IngestEmail(_ context.Context, req service.IngestRequest) (service.IngestResult, error) {
@@ -83,6 +93,12 @@ func (f *fakeIngester) IngestEmail(_ context.Context, req service.IngestRequest)
 
 func (f *fakeIngester) AuditFileFailed(_ context.Context, _, folder, _ string) {
 	f.fileFailure = &fileOp{folder: folder}
+}
+
+func (f *fakeIngester) ReconcileHold(_ context.Context, messageIDs []string) error {
+	f.reconciledHold = append(f.reconciledHold, messageIDs...)
+	f.reconcileCalls++
+	return nil
 }
 
 func testPoller(mb mailbox, ing ingester) *Poller {
@@ -103,6 +119,25 @@ const validEML = "From: Alice <alice@example.com>\r\n" +
 	"Date: Mon, 19 May 2026 09:00:00 -0400\r\n" +
 	"\r\n" +
 	"Please find the application attached.\r\n"
+
+func TestPoller_ReconcilesHoldAfterInboxPass(t *testing.T) {
+	mb := &fakeMailbox{holdIDs: []string{"m-held"}}
+	ing := &fakeIngester{}
+	p := testPoller(mb, ing)
+	p.holdFolder = "Hold"
+	p.holdScanLimit = 200
+	p.pollOnce(context.Background())
+
+	if mb.scannedFolder != "Hold" {
+		t.Errorf("expected the Hold folder scanned, got %q", mb.scannedFolder)
+	}
+	if ing.reconcileCalls != 1 {
+		t.Fatalf("expected one ReconcileHold call, got %d", ing.reconcileCalls)
+	}
+	if len(ing.reconciledHold) != 1 || ing.reconciledHold[0] != "m-held" {
+		t.Errorf("ReconcileHold got %v, want [m-held]", ing.reconciledHold)
+	}
+}
 
 func TestPoller_IngestsAndMarksSeen(t *testing.T) {
 	mb := &fakeMailbox{msgs: []rawMessage{{UID: 7, Raw: []byte(validEML)}}}

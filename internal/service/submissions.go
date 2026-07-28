@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -94,6 +95,8 @@ type SubmissionsService struct {
 
 	cappedMu  sync.Mutex // guards cappedDay
 	cappedDay string     // UTC day the llm.capped audit was last emitted
+
+	replyDisabledOnce sync.Once // audits reply.disabled at most once per process
 }
 
 const (
@@ -122,6 +125,8 @@ type IngestRequest struct {
 	References  []string
 	FromAddress string
 	FromName    string
+	// ReplyTo is the address to reply to when set and parseable, else FromAddress.
+	ReplyTo     string
 	ToAddresses []string
 	Subject     string
 	BodyText    string
@@ -129,11 +134,15 @@ type IngestRequest struct {
 	Attachments []model.Attachment
 	Source      string
 	// AutoSubmitted marks mail from an automated agent (out-of-office, bulk,
-	// list, bounce); such mail is stored but never replied to.
+	// list); such mail is stored but never replied to.
 	AutoSubmitted bool
 	// AutoResponseHeaders are the auto-response headers seen on the message,
 	// recorded when a reply is suppressed.
 	AutoResponseHeaders map[string]string
+	// Bounce marks a delivery-status notification; a permanent bounce flags the
+	// submission delivery-failed rather than being suppressed as generic auto mail.
+	Bounce          bool
+	BouncePermanent bool
 }
 
 // IngestResult is the outcome of ingesting one email.
@@ -314,10 +323,13 @@ func (s *SubmissionsService) ingestEmailInner(ctx context.Context, req IngestReq
 		return *dup, nil
 	}
 
+	// a header match returns a submission with prior emails; a created one has none
+	newSubmission := len(sub.Emails) == 0
+
 	inbound := inboundEmail(req, emailID, sub.ID)
 	sub.AttachEmail(inbound)
-	// an automated sender's action doesn't advance the escalation clock
-	if !req.AutoSubmitted {
+	// an automated sender's action (auto-reply or bounce) doesn't advance the escalation clock
+	if !req.AutoSubmitted && !req.Bounce {
 		sub.MarkAction(s.now())
 	}
 
@@ -328,7 +340,30 @@ func (s *SubmissionsService) ingestEmailInner(ctx context.Context, req IngestReq
 		"source":           req.Source,
 	})
 
+	// a delivery-status notification isn't a submission update: record it, flag the
+	// unreachable address for a human, and never classify or reply to it
+	if req.Bounce {
+		return s.persistBounce(ctx, sub, collector, req)
+	}
+
 	missing, policyUnknown := s.evaluate(ctx, sub, inbound)
+
+	// pull the account identity once per submission (drives the digest lead and
+	// bind-date escalation); only when a checklist matched, so an application can exist
+	if !policyUnknown {
+		s.extractIdentity(ctx, sub)
+	}
+
+	// content threading: a fresh email with no thread headers landed as a new
+	// submission; if it matches an existing open one by named insured + sender,
+	// attach to that instead of duplicating
+	if newSubmission {
+		if merged, ok := s.contentMatch(ctx, sub, inbound, collector); ok {
+			sub = merged
+			missing = sub.MissingItems
+			policyUnknown = sub.PolicyType == model.PolicyTypeUnknown
+		}
+	}
 
 	// the review flag and the broker reply are decided independently: an unreadable
 	// file doesn't suppress the request for the documents that are genuinely absent
@@ -356,8 +391,9 @@ func (s *SubmissionsService) ingestEmailInner(ctx context.Context, req IngestReq
 		return s.persistSuppressed(ctx, sub, collector, req.AutoResponseHeaders, result)
 	}
 	reply, sendReply := s.buildReply(sub, missing, inbound, policyUnknown)
-	if !sendReply {
-		// nothing to ask the broker (flagged-only): persist the submission alone.
+	if !sendReply || s.replySuppressed(ctx, sub) {
+		// nothing to ask the broker (flagged-only), or replies are blocked (a hard
+		// bounce, a human hold, or the kill switch): persist the submission alone.
 		return s.persistNoReply(ctx, sub, collector, result)
 	}
 	// submission and reply commit in one tx: an inbound email without an outbox
@@ -405,6 +441,45 @@ func (s *SubmissionsService) persistSuppressed(ctx context.Context, sub *model.S
 	})
 	s.flushAudit(ctx, collector)
 	return result, nil
+}
+
+// persistBounce records a delivery-status notification. A permanent bounce flags
+// the submission delivery_failed and for review so a human fixes the unreachable
+// address; a transient bounce is only audited (the sending MTA retries on its own).
+// No reply is ever queued — a bounce is machine mail. The DSN classifier treats an
+// unparseable status code as permanent, so a real failure is never missed.
+func (s *SubmissionsService) persistBounce(ctx context.Context, sub *model.Submission, collector *auditCollector, req IngestRequest) (IngestResult, error) {
+	if req.BouncePermanent {
+		sub.DeliveryFailed = true
+		sub.NeedsReview = true
+	}
+	s.audit(ctx, sub.ID, model.EventReplyBounced, map[string]any{
+		"from":      req.FromAddress,
+		"permanent": req.BouncePermanent,
+	})
+	if err := s.repo.Submissions.UpsertSubmission(ctx, sub); err != nil {
+		return IngestResult{}, fmt.Errorf("persist bounce: %w", err)
+	}
+	s.flushAudit(ctx, collector)
+	return IngestResult{SubmissionID: sub.ID, State: sub.State, NeedsReview: sub.NeedsReview}, nil
+}
+
+// replySuppressed reports whether outbound replies are currently blocked for this
+// submission — a hard-bounced address, a human hold, or the global kill switch —
+// and audits why. The kill switch audits reply.disabled once per process.
+func (s *SubmissionsService) replySuppressed(ctx context.Context, sub *model.Submission) bool {
+	switch {
+	case s.cfg.Reply.RepliesEnabled != nil && !*s.cfg.Reply.RepliesEnabled:
+		s.auditReplyDisabledOnce(ctx)
+		return true
+	case sub.DeliveryFailed:
+		s.audit(ctx, sub.ID, model.EventReplySuppressed, map[string]any{"reason": "delivery_failed"})
+		return true
+	case sub.OnHold:
+		s.audit(ctx, sub.ID, model.EventReplySuppressed, map[string]any{"reason": "on_hold"})
+		return true
+	}
+	return false
 }
 
 // persistNoReply commits a submission with no broker reply: everything outstanding
@@ -483,6 +558,61 @@ func (s *SubmissionsService) resolveSubmission(ctx context.Context, req IngestRe
 	}
 }
 
+// contentMatch attaches a freshly-created submission's email and documents to an
+// existing open submission with the same normalized named insured and sender within
+// the match window (a broker who composed a new email instead of replying). It
+// re-parents the buffered audits, re-evaluates over the combined documents so the
+// reply doesn't re-ask for what's already on file, and returns the merged
+// submission. The conditions are strict on purpose: a looser match would merge a
+// renewal with a new-business submission for the same insured.
+func (s *SubmissionsService) contentMatch(ctx context.Context, newSub *model.Submission, inbound model.Email, collector *auditCollector) (*model.Submission, bool) {
+	if newSub.NamedInsured == "" {
+		return nil, false
+	}
+	cutoff := s.now().Add(-s.cfg.Threading.MatchWindow()).UnixNano()
+	existing, err := s.repo.Submissions.FindContentMatch(ctx, newSub.NamedInsured, newSub.FromAddress, cutoff)
+	if err != nil {
+		if !errors.Is(err, model.ErrSubmissionNotFound) {
+			s.log.WithError(err).Warn("content match lookup failed")
+		}
+		return nil, false
+	}
+	reparentAudits(collector, newSub.ID, existing.ID)
+
+	inbound.SubmissionID = existing.ID
+	existing.AttachEmail(inbound)
+	for _, d := range newSub.Documents {
+		d.SubmissionID = existing.ID
+		existing.Documents = append(existing.Documents, d)
+	}
+	if existing.NamedInsured == "" {
+		existing.NamedInsured = newSub.NamedInsured
+		existing.EffectiveDate = newSub.EffectiveDate
+	}
+	existing.MarkAction(s.now())
+	if cl, ok := s.checklists.Get(existing.PolicyType); ok {
+		existing.MissingItems = model.EvaluateChecklist(*existing, cl, model.ChecklistOptions{
+			ConfidenceFloor: s.cfg.Classifier.ConfidenceFloor,
+		})
+	}
+	s.audit(ctx, existing.ID, model.EventThreadMatchedByContent, map[string]any{
+		"named_insured": existing.NamedInsured,
+		"from":          existing.FromAddress,
+		"email_id":      inbound.DeterministicID,
+	})
+	return existing, true
+}
+
+// reparentAudits rewrites buffered audit entries from a phantom (never-persisted)
+// submission id to the one the email was ultimately merged into.
+func reparentAudits(c *auditCollector, from, to string) {
+	for _, e := range c.entries {
+		if e.SubmissionID == from {
+			e.SubmissionID = to
+		}
+	}
+}
+
 // inboundEmail maps an ingest request to the stored inbound email record.
 func inboundEmail(req IngestRequest, emailID, submissionID string) model.Email {
 	return model.Email{
@@ -494,6 +624,7 @@ func inboundEmail(req IngestRequest, emailID, submissionID string) model.Email {
 		References:      req.References,
 		FromAddress:     req.FromAddress,
 		FromName:        req.FromName,
+		ReplyTo:         req.ReplyTo,
 		ToAddresses:     req.ToAddresses,
 		Subject:         req.Subject,
 		BodyText:        req.BodyText,
@@ -607,11 +738,33 @@ func (s *SubmissionsService) buildReply(sub *model.Submission, missing []model.M
 	case len(missing) == 0:
 		return model.BuildCompletionReply(*sub, inbound), true
 	default:
-		if broker := model.BrokerActionable(missing); len(broker) > 0 {
-			return model.BuildMissingItemsReply(*sub, broker, inbound), true
+		broker := model.BrokerActionable(missing)
+		if len(broker) == 0 {
+			return model.Reply{}, false
 		}
-		return model.Reply{}, false
+		// the broker referenced files but attached none (often a share link): ask
+		// them to attach directly rather than listing every document as absent
+		if s.looksLikeMissingAttachment(inbound, broker) {
+			broker = []model.MissingItem{{ID: "missing_attachment", Code: model.ReasonMissingAttachment}}
+		}
+		return model.BuildMissingItemsReply(*sub, broker, inbound), true
 	}
+}
+
+// looksLikeMissingAttachment reports the A4 signal: this email carried no
+// attachments, documents are still outstanding, and the body either names a
+// file-sharing host or mentions attaching.
+func (s *SubmissionsService) looksLikeMissingAttachment(inbound model.Email, broker []model.MissingItem) bool {
+	if len(inbound.Attachments) > 0 || len(broker) == 0 {
+		return false
+	}
+	body := strings.ToLower(inbound.BodyText)
+	for _, d := range s.cfg.Document.AttachmentLinkDomains {
+		if d != "" && strings.Contains(body, strings.ToLower(d)) {
+			return true
+		}
+	}
+	return strings.Contains(body, "attach")
 }
 
 // deliver sends a reply and, on success, records the outbound email and audits
@@ -677,7 +830,10 @@ func (s *SubmissionsService) RedeliverOutbox(ctx context.Context) error {
 	return nil
 }
 
-// CheckEscalations escalates submissions idle past their policy's threshold.
+// CheckEscalations escalates submissions on two triggers: idle past their policy's
+// quiet threshold, and — regardless of quiet time — bind-window submissions whose
+// effective date is near, rate-limited to one nudge per MinGap. Held and
+// delivery-failed submissions are excluded by the queries.
 func (s *SubmissionsService) CheckEscalations(ctx context.Context) error {
 	now := s.now()
 	globalThreshold := s.cfg.Escalation.Threshold()
@@ -688,11 +844,11 @@ func (s *SubmissionsService) CheckEscalations(ctx context.Context) error {
 			minThreshold = t
 		}
 	}
-	cutoff := now.Add(-minThreshold)
-	stale, err := s.repo.Submissions.ListStale(ctx, cutoff.UnixNano(), 100)
+	stale, err := s.repo.Submissions.ListStale(ctx, now.Add(-minThreshold).UnixNano(), 100)
 	if err != nil {
 		return fmt.Errorf("list stale: %w", err)
 	}
+	escalated := map[string]bool{}
 	for i := range stale {
 		sub := &stale[i]
 		threshold := globalThreshold
@@ -702,25 +858,56 @@ func (s *SubmissionsService) CheckEscalations(ctx context.Context) error {
 		if now.Sub(sub.LastActionAt) < threshold {
 			continue
 		}
-		// only nudge the broker when they can act; a submission blocked solely on
-		// an unreadable/low-confidence file is the agency's problem, not theirs.
-		if len(model.BrokerActionable(sub.MissingItems)) == 0 {
-			continue
+		if s.escalate(ctx, sub, now, "quiet_threshold") {
+			escalated[sub.ID] = true
 		}
-		if err := sub.TransitionTo(model.StateEscalated, now); err != nil {
-			s.log.WithError(err).WithField("submission_id", sub.ID).Warn("could not escalate")
-			continue
+	}
+
+	bindWindow := s.cfg.Escalation.BindWindow()
+	if bindWindow <= 0 {
+		return nil
+	}
+	minGap := s.cfg.Escalation.MinGap()
+	soon, err := s.repo.Submissions.ListBindSoon(ctx, now.Add(bindWindow).UnixNano(), 100)
+	if err != nil {
+		return fmt.Errorf("list bind-soon: %w", err)
+	}
+	for i := range soon {
+		sub := &soon[i]
+		if escalated[sub.ID] {
+			continue // already handled by the quiet-time pass this tick
 		}
-		if err := s.repo.Submissions.UpsertSubmission(ctx, sub); err != nil {
-			s.log.WithError(err).WithField("submission_id", sub.ID).Warn("escalation upsert failed")
-			continue
+		if sub.LastEscalatedAt != nil && now.Sub(*sub.LastEscalatedAt) < minGap {
+			continue // nudged too recently
 		}
-		s.audit(ctx, sub.ID, model.EventEscalated, map[string]any{
-			"last_action_at": sub.LastActionAt,
-			"threshold":      threshold.String(),
-		})
+		s.escalate(ctx, sub, now, "bind_window")
 	}
 	return nil
+}
+
+// escalate moves an awaiting submission to escalated when the broker can act,
+// stamping LastEscalatedAt so bind-window re-nudges are rate-limited. It reports
+// whether the submission escalated. A submission blocked solely on an unreadable or
+// low-confidence file is the agency's problem, so it is never escalated.
+func (s *SubmissionsService) escalate(ctx context.Context, sub *model.Submission, now time.Time, reason string) bool {
+	if len(model.BrokerActionable(sub.MissingItems)) == 0 {
+		return false
+	}
+	if err := sub.TransitionTo(model.StateEscalated, now); err != nil {
+		s.log.WithError(err).WithField("submission_id", sub.ID).Warn("could not escalate")
+		return false
+	}
+	t := now
+	sub.LastEscalatedAt = &t
+	if err := s.repo.Submissions.UpsertSubmission(ctx, sub); err != nil {
+		s.log.WithError(err).WithField("submission_id", sub.ID).Warn("escalation upsert failed")
+		return false
+	}
+	s.audit(ctx, sub.ID, model.EventEscalated, map[string]any{
+		"reason":         reason,
+		"last_action_at": sub.LastActionAt,
+	})
+	return true
 }
 
 // CheckClosures auto-closes completed and escalated submissions gone quiet.
@@ -767,6 +954,59 @@ func (s *SubmissionsService) closeQuiet(ctx context.Context, sub *model.Submissi
 		"reason":        reason,
 		"auto_close_at": now,
 	})
+}
+
+// ReconcileHold syncs on_hold to the Hold folder's membership: submissions whose
+// message is in the folder are held, and currently-held submissions whose message
+// has left are released. Folder membership is the state — declarative and
+// idempotent, so running it every tick is free and drift-free.
+func (s *SubmissionsService) ReconcileHold(ctx context.Context, messageIDs []string) error {
+	inFolder, err := s.repo.Submissions.SubmissionIDsByMessageIDs(ctx, messageIDs)
+	if err != nil {
+		return fmt.Errorf("resolve hold folder: %w", err)
+	}
+	held, err := s.repo.Submissions.ListHeldIDs(ctx)
+	if err != nil {
+		return fmt.Errorf("list held: %w", err)
+	}
+	inSet := toSet(inFolder)
+	heldSet := toSet(held)
+
+	var toHold, toRelease []string
+	for _, id := range inFolder {
+		if _, ok := heldSet[id]; !ok {
+			toHold = append(toHold, id)
+		}
+	}
+	for _, id := range held {
+		if _, ok := inSet[id]; !ok {
+			toRelease = append(toRelease, id)
+		}
+	}
+	if err := s.repo.Submissions.SetOnHold(ctx, toHold, true); err != nil {
+		return fmt.Errorf("hold: %w", err)
+	}
+	if err := s.repo.Submissions.SetOnHold(ctx, toRelease, false); err != nil {
+		return fmt.Errorf("release: %w", err)
+	}
+	for _, id := range toHold {
+		s.audit(ctx, id, model.EventHeld, nil)
+	}
+	for _, id := range toRelease {
+		s.audit(ctx, id, model.EventReleased, nil)
+	}
+	if len(toHold) > 0 || len(toRelease) > 0 {
+		s.log.WithField("held", len(toHold)).WithField("released", len(toRelease)).Info("hold folder reconciled")
+	}
+	return nil
+}
+
+func toSet(ids []string) map[string]struct{} {
+	set := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		set[id] = struct{}{}
+	}
+	return set
 }
 
 // SendDigest emails the agency a daily status digest of every open submission.
@@ -908,7 +1148,10 @@ func (s *SubmissionsService) classifyAttachments(ctx context.Context, sub *model
 // classifyAttachment classifies one attachment and extracts its declared field.
 func (s *SubmissionsService) classifyAttachment(ctx context.Context, sub *model.Submission, e model.Email, cl model.Checklist, a model.Attachment, itemByID map[string]model.RequiredItem) model.Document {
 	text := s.extractText(a)
-	unreadable := s.isUnreadable(a, text)
+	// a password-protected PDF (no extractable text) is the broker's to resend
+	// unlocked, not an agency-side unreadable scan
+	encrypted := isEncrypted(a) && len(strings.TrimSpace(text)) == 0
+	unreadable := !encrypted && s.isUnreadable(a, text)
 	result, err := s.classifier.Classify(ctx, classifier.Input{
 		Filename:    a.Filename,
 		ContentType: a.ContentType,
@@ -943,6 +1186,7 @@ func (s *SubmissionsService) classifyAttachment(ctx context.Context, sub *model.
 		ClassifiedBy:  result.By,
 		ExtractedText: textutil.TruncateBytes(text, maxExtractedTextBytes),
 		Unreadable:    unreadable,
+		Encrypted:     encrypted,
 		CreatedAt:     s.now(),
 	}
 
@@ -960,6 +1204,13 @@ func (s *SubmissionsService) classifyAttachment(ctx context.Context, sub *model.
 			"filename":        a.Filename,
 			"size_bytes":      a.Size,
 			"extracted_chars": len(strings.TrimSpace(text)),
+		})
+	}
+	if encrypted {
+		s.log.WithField("filename", a.Filename).Warn("document is password-protected; will ask the broker to resend it unlocked")
+		s.audit(ctx, sub.ID, model.EventDocumentEncrypted, map[string]any{
+			"filename":   a.Filename,
+			"size_bytes": a.Size,
 		})
 	}
 
@@ -1007,6 +1258,124 @@ func (s *SubmissionsService) extractField(ctx context.Context, submissionID, fil
 	return resp.Value
 }
 
+// applicationItemIDs are the checklist items whose document carries the account
+// identity (named insured, effective date).
+var applicationItemIDs = map[string]bool{
+	"acord_125":         true,
+	"acord_130":         true,
+	"cyber_application": true,
+}
+
+var effectiveDateFormats = []string{
+	"2006-01-02", "01/02/2006", "1/2/2006", "2006/01/02",
+	"January 2, 2006", "Jan 2, 2006", "02-Jan-2006", "2 January 2006",
+}
+
+// extractIdentity pulls the named insured and effective date once per submission,
+// from a readable application document. Fallback chain: LLM -> a "Named Insured"
+// label in the extracted text -> nothing. A generic subject is deliberately left to
+// the digest and never stored, so content threading can't merge on it. Re-runs only
+// while the named insured is still empty and a new readable application arrives.
+func (s *SubmissionsService) extractIdentity(ctx context.Context, sub *model.Submission) {
+	if sub.NamedInsured != "" {
+		return
+	}
+	doc := applicationDoc(sub.Documents)
+	if doc == nil {
+		return
+	}
+	named, effective := "", ""
+	if s.llm != nil {
+		resp, err := s.llm.ExtractIdentity(ctx, llm.IdentityRequest{Filename: doc.Filename, TextSample: doc.ExtractedText})
+		s.auditLLMCall(ctx, sub.ID, "extract_identity", doc.Filename, resp.Usage)
+		switch {
+		case errors.Is(err, llm.ErrSpendCapReached):
+			s.auditCapOnce(ctx)
+		case err != nil:
+			s.audit(ctx, sub.ID, model.EventLLMFailed, map[string]any{
+				"filename": doc.Filename, "op": "extract_identity", "error": err.Error(),
+			})
+		default:
+			named, effective = resp.NamedInsured, resp.EffectiveDate
+		}
+	}
+	if named == "" {
+		named = namedInsuredFromText(doc.ExtractedText)
+	}
+	if named == "" {
+		return // never invent one; the digest falls back to the subject line
+	}
+	sub.NamedInsured = named
+	if t, ok := parseEffectiveDate(effective); ok {
+		sub.EffectiveDate = &t
+	}
+	s.audit(ctx, sub.ID, model.EventIdentityExtracted, map[string]any{
+		"named_insured":  named,
+		"effective_date": effective,
+	})
+}
+
+// applicationDoc returns a readable application document to extract identity from.
+func applicationDoc(docs []model.Document) *model.Document {
+	for i := range docs {
+		d := &docs[i]
+		if applicationItemIDs[d.ClassifiedAs] && !d.Unreadable && !d.Encrypted && strings.TrimSpace(d.ExtractedText) != "" {
+			return d
+		}
+	}
+	return nil
+}
+
+// namedInsuredFromText reads the value on or after a "Named Insured" label the way
+// it appears on ACORD forms; returns "" when the label isn't present.
+func namedInsuredFromText(text string) string {
+	lines := strings.Split(text, "\n")
+	for i, line := range lines {
+		idx := strings.Index(strings.ToLower(line), "named insured")
+		if idx < 0 {
+			continue
+		}
+		rest := strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(line[idx+len("named insured"):]), ":.-# \t"))
+		if v := cleanInsured(rest); v != "" {
+			return v
+		}
+		// the value often sits on the next line under the label
+		for j := i + 1; j < len(lines) && j <= i+2; j++ {
+			if v := cleanInsured(strings.TrimSpace(lines[j])); v != "" {
+				return v
+			}
+		}
+	}
+	return ""
+}
+
+// cleanInsured rejects label echoes and out-of-range values that aren't a name.
+func cleanInsured(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) < 2 || len(s) > 120 {
+		return ""
+	}
+	low := strings.ToLower(s)
+	if strings.Contains(low, "named insured") || strings.Contains(low, "mailing address") {
+		return ""
+	}
+	return s
+}
+
+// parseEffectiveDate parses a date string in a handful of common formats.
+func parseEffectiveDate(s string) (time.Time, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Time{}, false
+	}
+	for _, f := range effectiveDateFormats {
+		if t, err := time.Parse(f, s); err == nil {
+			return t.UTC(), true
+		}
+	}
+	return time.Time{}, false
+}
+
 // auditCapOnce emits the llm.capped audit at most once per UTC day. It writes
 // directly, bypassing the ingest's audit collector: the spend cap is a global
 // daily event that must be recorded even if this ingest later fails to commit.
@@ -1031,6 +1400,22 @@ func (s *SubmissionsService) auditCapOnce(ctx context.Context) {
 		s.cappedMu.Unlock()
 		s.log.WithError(err).Warn("llm.capped audit append failed")
 	}
+}
+
+// auditReplyDisabledOnce records the global reply kill switch a single time per
+// process. Written directly (not via the ingest collector): a process-level event
+// that must land even if this ingest doesn't commit.
+func (s *SubmissionsService) auditReplyDisabledOnce(ctx context.Context) {
+	s.replyDisabledOnce.Do(func() {
+		entry := &model.AuditEntry{
+			EventType: model.EventReplyDisabled,
+			Payload:   map[string]any{"note": "REPLIES_ENABLED=false; no broker replies will be queued"},
+			RequestID: logger.RequestIDFromContext(ctx),
+		}
+		if err := s.repo.Audit.Append(ctx, entry); err != nil {
+			s.log.WithError(err).Warn("reply.disabled audit append failed")
+		}
+	})
 }
 
 func (s *SubmissionsService) auditLLMCall(ctx context.Context, submissionID, op, filename string, u llm.Usage) {
@@ -1072,6 +1457,16 @@ func (s *SubmissionsService) isUnreadable(a model.Attachment, text string) bool 
 func isPDF(contentType string) bool {
 	ct := normalizeContentType(contentType)
 	return ct == "application/pdf" || ct == "application/x-pdf"
+}
+
+// isEncrypted reports whether a is a PDF carrying an /Encrypt marker (present in
+// the trailer of a password-protected document). The caller pairs this with an
+// empty extraction, so a readable PDF that merely contains the literal isn't flagged.
+func isEncrypted(a model.Attachment) bool {
+	if !isPDF(a.ContentType) || len(a.Content) == 0 {
+		return false
+	}
+	return bytes.Contains(a.Content, []byte("/Encrypt"))
 }
 
 // normalizeContentType strips MIME parameters and lowercases so a lookup keyed on
@@ -1201,12 +1596,15 @@ func outboundEmail(r model.Reply, providerMsgID string, now time.Time) model.Ema
 		DeterministicID: hex.EncodeToString(det[:]),
 		SubmissionID:    r.SubmissionID,
 		Direction:       model.DirectionOutbound,
-		ToAddresses:     []string{r.ToAddress},
-		Subject:         r.Subject,
-		BodyText:        r.BodyText,
-		ReceivedAt:      now,
-		ProviderMsgID:   providerMsgID,
-		InReplyTo:       r.InReplyTo,
-		References:      r.References,
+		// store the sent Message-ID so a DSN bounce (or a broker reply quoting it)
+		// threads back to this submission
+		MessageID:     providerMsgID,
+		ToAddresses:   []string{r.ToAddress},
+		Subject:       r.Subject,
+		BodyText:      r.BodyText,
+		ReceivedAt:    now,
+		ProviderMsgID: providerMsgID,
+		InReplyTo:     r.InReplyTo,
+		References:    r.References,
 	}
 }

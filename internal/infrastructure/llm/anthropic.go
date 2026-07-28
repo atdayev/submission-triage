@@ -55,6 +55,22 @@ type pricing struct {
 type Client interface {
 	Classify(ctx context.Context, req ClassificationRequest) (ClassificationResponse, error)
 	ExtractField(ctx context.Context, req FieldExtractionRequest) (FieldExtractionResponse, error)
+	// ExtractIdentity pulls the named insured and effective date in one call.
+	ExtractIdentity(ctx context.Context, req IdentityRequest) (IdentityResponse, error)
+}
+
+// IdentityRequest asks the model to pull the account identity from an application.
+type IdentityRequest struct {
+	Filename   string
+	TextSample string
+}
+
+// IdentityResponse is the extracted account identity; either field may be empty.
+// EffectiveDate is returned as written on the document for the caller to parse.
+type IdentityResponse struct {
+	NamedInsured  string
+	EffectiveDate string
+	Usage         Usage
 }
 
 // ClassificationRequest is a document to match against candidate categories.
@@ -245,6 +261,60 @@ func (c *AnthropicClient) ExtractField(ctx context.Context, req FieldExtractionR
 		return FieldExtractionResponse{Usage: usage}, err
 	}
 	return decodeFieldExtraction(body, fieldType, usage), nil
+}
+
+// ExtractIdentity asks the model for the named insured and effective date via the
+// report_identity tool (one call, two fields).
+func (c *AnthropicClient) ExtractIdentity(ctx context.Context, req IdentityRequest) (IdentityResponse, error) {
+	prompt := fmt.Sprintf(
+		"From this insurance application, extract the named insured (the business or person the "+
+			"policy covers) and the policy effective date.\nFilename: %s\nText sample:\n%s\n\n"+
+			"Call the report_identity tool. Leave a field empty if it is not present; give the "+
+			"effective date as written on the document. Do not guess.",
+		req.Filename, truncate(req.TextSample, maxTextSampleBytes))
+	tool := anthropicTool{
+		Name:        "report_identity",
+		Description: "Report the named insured and effective date from the application.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"named_insured":  map[string]any{"type": "string"},
+				"effective_date": map[string]any{"type": "string"},
+			},
+			"required": []string{"named_insured"},
+		},
+	}
+	body, usage, err := c.callMessages(ctx, anthropicRequest{
+		Model:      c.cfg.Model,
+		MaxTokens:  c.cfg.MaxTokens,
+		System:     "You extract the account identity from insurance applications. Use the report_identity tool.",
+		Messages:   []anthropicMessage{{Role: "user", Content: prompt}},
+		Tools:      []anthropicTool{tool},
+		ToolChoice: &anthropicToolChoice{Type: "tool", Name: "report_identity"},
+	}, prompt)
+	if err != nil {
+		return IdentityResponse{Usage: usage}, err
+	}
+	return decodeIdentity(body, usage), nil
+}
+
+// decodeIdentity parses the report_identity tool body into an IdentityResponse.
+func decodeIdentity(body string, usage Usage) IdentityResponse {
+	if strings.TrimSpace(body) == "" {
+		return IdentityResponse{Usage: usage}
+	}
+	var parsed struct {
+		NamedInsured  string `json:"named_insured"`
+		EffectiveDate string `json:"effective_date"`
+	}
+	if err := json.Unmarshal([]byte(body), &parsed); err != nil {
+		return IdentityResponse{Usage: usage}
+	}
+	return IdentityResponse{
+		NamedInsured:  strings.TrimSpace(parsed.NamedInsured),
+		EffectiveDate: strings.TrimSpace(parsed.EffectiveDate),
+		Usage:         usage,
+	}
 }
 
 // buildFieldExtractionPrompt builds the extraction prompt and report_field tool for the given field type.

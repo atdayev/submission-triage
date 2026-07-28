@@ -980,13 +980,16 @@ func (m *multiStore) All() []model.Checklist {
 	return out
 }
 
-// fakeLLM canned-responds Classify and ExtractField. Errors short-circuit.
+// fakeLLM canned-responds Classify, ExtractField, and ExtractIdentity. Errors short-circuit.
 type fakeLLM struct {
-	classifyResp llm.ClassificationResponse
-	classifyErr  error
-	extractResp  llm.FieldExtractionResponse
-	extractErr   error
-	extractCalls int
+	classifyResp  llm.ClassificationResponse
+	classifyErr   error
+	extractResp   llm.FieldExtractionResponse
+	extractErr    error
+	extractCalls  int
+	identityResp  llm.IdentityResponse
+	identityErr   error
+	identityCalls int
 }
 
 func (f *fakeLLM) Classify(_ context.Context, _ llm.ClassificationRequest) (llm.ClassificationResponse, error) {
@@ -996,6 +999,11 @@ func (f *fakeLLM) Classify(_ context.Context, _ llm.ClassificationRequest) (llm.
 func (f *fakeLLM) ExtractField(_ context.Context, _ llm.FieldExtractionRequest) (llm.FieldExtractionResponse, error) {
 	f.extractCalls++
 	return f.extractResp, f.extractErr
+}
+
+func (f *fakeLLM) ExtractIdentity(_ context.Context, _ llm.IdentityRequest) (llm.IdentityResponse, error) {
+	f.identityCalls++
+	return f.identityResp, f.identityErr
 }
 
 func cglChecklistWithLossRuns() model.Checklist {

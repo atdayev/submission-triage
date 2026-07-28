@@ -20,12 +20,15 @@ type Email struct {
 	References      []string
 	FromAddress     string
 	FromName        string
-	ToAddresses     []string
-	Subject         string
-	BodyText        string
-	ReceivedAt      time.Time
-	ProviderMsgID   string
-	Attachments     []Attachment
+	// ReplyTo is the address the producer wants replies at (assistants/shared
+	// inboxes send From, own the file on Reply-To); empty when absent.
+	ReplyTo       string
+	ToAddresses   []string
+	Subject       string
+	BodyText      string
+	ReceivedAt    time.Time
+	ProviderMsgID string
+	Attachments   []Attachment
 }
 
 // Attachment is a decoded file attached to an email.

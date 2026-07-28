@@ -55,6 +55,7 @@ func Translate(p emlparse.Payload, source string) service.IngestRequest {
 		References:  trimAngles(references),
 		FromAddress: fromAddr,
 		FromName:    p.FromFull.Name,
+		ReplyTo:     validReplyTo(p.ReplyToFull.Email),
 		ToAddresses: to,
 		Subject:     p.Subject,
 		BodyText:    p.TextBody,
@@ -62,11 +63,28 @@ func Translate(p emlparse.Payload, source string) service.IngestRequest {
 		Attachments: atts,
 		Source:      source,
 	}
-	if detectAutoSubmitted(autoHeaders) {
+	// a bounce is detected specifically, before the generic auto-submitted check —
+	// a hard bounce carries Return-Path <> and would otherwise be silently suppressed
+	if p.Bounce {
+		req.Bounce = true
+		req.BouncePermanent = p.BouncePermanent
+	} else if detectAutoSubmitted(autoHeaders) {
 		req.AutoSubmitted = true
 		req.AutoResponseHeaders = autoHeaders
 	}
 	return req
+}
+
+// validReplyTo returns addr only when it parses as an email, so an unparseable
+// Reply-To falls back to From rather than misrouting the reply.
+func validReplyTo(addr string) string {
+	if addr == "" {
+		return ""
+	}
+	if _, err := mail.ParseAddress(addr); err != nil {
+		return ""
+	}
+	return addr
 }
 
 // detectAutoSubmitted reports mail from an automated agent: an Auto-Submitted

@@ -20,6 +20,7 @@ type Document struct {
 	ExtractedText   string
 	ExtractedFields map[string]any
 	Unreadable      bool // extraction yielded no text (e.g. a scanned PDF)
+	Encrypted       bool // password-protected; the broker can resend it unlocked
 	CreatedAt       time.Time
 }
 

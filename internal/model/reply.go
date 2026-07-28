@@ -15,21 +15,57 @@ type Reply struct {
 	References   []string
 }
 
+const (
+	missingAttachmentLine = "We didn't find any attachments on this message. If you sent a download link, could you attach the files directly instead?"
+	encryptedLineFmt      = "We received %s but it's password-protected and we can't open it. Could you resend it unlocked, or send the password separately?"
+)
+
 // BuildMissingItemsReply lists the outstanding documents for the sender, given
 // only broker-actionable items (unreadable/low-confidence are handled agency-side).
+// A missing-attachment signal supersedes the list — the broker referenced files but
+// sent none, so asking for specific documents would read as ignoring them; each
+// password-protected item gets its own resend-unlocked ask.
 func BuildMissingItemsReply(s Submission, missing []MissingItem, lastInbound Email) Reply {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Hi %s,\n\n", greetingName(lastInbound))
-	b.WriteString("Thanks for the submission. To finish the file we still need:\n\n")
+
+	if hasCode(missing, ReasonMissingAttachment) {
+		b.WriteString(missingAttachmentLine + "\n")
+		return newReply(s, b.String(), lastInbound)
+	}
+
+	var absent, encrypted []MissingItem
 	for _, m := range missing {
-		if m.Code == ReasonFieldShortfall {
-			fmt.Fprintf(&b, "  - %s (%s)\n", m.Description, m.Reason)
+		if m.Code == ReasonEncrypted {
+			encrypted = append(encrypted, m)
 		} else {
-			fmt.Fprintf(&b, "  - %s\n", m.Description)
+			absent = append(absent, m)
 		}
+	}
+	if len(absent) > 0 {
+		b.WriteString("Thanks for the submission. To finish the file we still need:\n\n")
+		for _, m := range absent {
+			if m.Code == ReasonFieldShortfall {
+				fmt.Fprintf(&b, "  - %s (%s)\n", m.Description, m.Reason)
+			} else {
+				fmt.Fprintf(&b, "  - %s\n", m.Description)
+			}
+		}
+	}
+	for _, m := range encrypted {
+		fmt.Fprintf(&b, "\n"+encryptedLineFmt+"\n", m.Description)
 	}
 	b.WriteString("\nReply to this thread with the documents and we'll continue.\n")
 	return newReply(s, b.String(), lastInbound)
+}
+
+func hasCode(missing []MissingItem, code ReasonCode) bool {
+	for _, m := range missing {
+		if m.Code == code {
+			return true
+		}
+	}
+	return false
 }
 
 // BuildPolicyUnknownReply asks the sender to name the line of business;
@@ -68,12 +104,23 @@ func newReply(s Submission, body string, lastInbound Email) Reply {
 	}
 	return Reply{
 		SubmissionID: s.ID,
-		ToAddress:    lastInbound.FromAddress,
+		ToAddress:    replyTarget(lastInbound),
 		Subject:      subject,
 		BodyText:     body,
 		InReplyTo:    lastInbound.MessageID,
 		References:   refs,
 	}
+}
+
+// replyTarget picks where a reply goes: Reply-To when the sender set one (an
+// assistant or shared inbox sends From, but the producer owns Reply-To), else
+// From. CC is deliberately not copied — keeping the original CC list in the loop
+// risks replying to a wide distribution.
+func replyTarget(e Email) string {
+	if rt := strings.TrimSpace(e.ReplyTo); rt != "" {
+		return rt
+	}
+	return e.FromAddress
 }
 
 func greetingName(e Email) string {

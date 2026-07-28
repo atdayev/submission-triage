@@ -19,16 +19,19 @@ type Checklist struct {
 type ReasonCode string
 
 const (
-	ReasonNotProvided    ReasonCode = "not_provided"
-	ReasonLowConfidence  ReasonCode = "low_confidence"  // a doc classified here, but below the confidence floor
-	ReasonUnreadable     ReasonCode = "unreadable"      // a doc classified here, but no text extracted (scanned)
-	ReasonFieldShortfall ReasonCode = "field_shortfall" // present, but a required field fails its rule
+	ReasonNotProvided       ReasonCode = "not_provided"
+	ReasonLowConfidence     ReasonCode = "low_confidence"     // a doc classified here, but below the confidence floor
+	ReasonUnreadable        ReasonCode = "unreadable"         // a doc classified here, but no text extracted (scanned)
+	ReasonFieldShortfall    ReasonCode = "field_shortfall"    // present, but a required field fails its rule
+	ReasonEncrypted         ReasonCode = "encrypted"          // present, but password-protected; the broker can resend it unlocked
+	ReasonMissingAttachment ReasonCode = "missing_attachment" // the broker referenced files but attached none
 )
 
 const (
 	reasonNotProvidedText   = "document not provided"
 	reasonLowConfidenceText = "received but not confidently identified"
 	reasonUnreadableText    = "received but no readable text (appears scanned)"
+	reasonEncryptedText     = "received but password-protected (cannot open)"
 )
 
 // MissingItem is a required item not satisfied by a submission.
@@ -53,12 +56,14 @@ func RequiresReview(missing []MissingItem) bool {
 	return false
 }
 
-// BrokerActionable returns the missing items worth asking the broker for (absent
-// docs and shortfalls); unreadable/low-confidence items are the agency's, omitted.
+// BrokerActionable returns the missing items worth asking the broker for — absent
+// docs, field shortfalls, password-protected files, and referenced-but-missing
+// attachments; unreadable/low-confidence items are the agency's, omitted.
 func BrokerActionable(missing []MissingItem) []MissingItem {
 	out := make([]MissingItem, 0, len(missing))
 	for _, m := range missing {
-		if m.Code == ReasonNotProvided || m.Code == ReasonFieldShortfall {
+		switch m.Code {
+		case ReasonNotProvided, ReasonFieldShortfall, ReasonEncrypted, ReasonMissingAttachment:
 			out = append(out, m)
 		}
 	}
@@ -113,6 +118,7 @@ type RequiresField struct {
 type itemDocs struct {
 	qualifying    []*Document // confidence >= floor and readable; the only docs that satisfy
 	unreadable    bool        // some classified doc had no extractable text
+	encrypted     bool        // some classified doc is password-protected
 	lowConfidence bool        // some classified doc fell below the confidence floor
 	topConfidence float64     // highest confidence among the below-floor docs
 }
@@ -133,6 +139,8 @@ func EvaluateChecklist(s Submission, c Checklist, opts ChecklistOptions) []Missi
 			byItem[d.ClassifiedAs] = b
 		}
 		switch {
+		case d.Encrypted:
+			b.encrypted = true
 		case d.Unreadable:
 			b.unreadable = true
 		case d.Confidence < opts.ConfidenceFloor:
@@ -179,11 +187,14 @@ func EvaluateChecklist(s Submission, c Checklist, opts ChecklistOptions) []Missi
 	return missing
 }
 
-// unsatisfiedItem classifies why an item with no qualifying document is missing.
-// Unreadable wins over low-confidence: it is the one a broker can act on.
+// unsatisfiedItem classifies why an item with no qualifying document is missing,
+// most-specific cause first: encrypted (resend unlocked) over unreadable over
+// low-confidence over not-provided.
 func unsatisfiedItem(item RequiredItem, b *itemDocs) MissingItem {
 	m := MissingItem{ID: item.ID, Description: item.Description}
 	switch {
+	case b != nil && b.encrypted:
+		m.Reason, m.Code = reasonEncryptedText, ReasonEncrypted
 	case b != nil && b.unreadable:
 		m.Reason, m.Code = reasonUnreadableText, ReasonUnreadable
 	case b != nil && b.lowConfidence:

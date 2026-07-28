@@ -58,6 +58,8 @@ type Payload struct {
 	MessageID   string
 	From        string
 	FromFull    Address
+	ReplyTo     string
+	ReplyToFull Address
 	To          string
 	ToFull      []Address
 	Subject     string
@@ -65,6 +67,10 @@ type Payload struct {
 	Date        string
 	Headers     []Header
 	Attachments []Attachment
+	// Bounce marks a delivery-status notification (a hard/soft bounce of one of
+	// our replies); BouncePermanent is true for a 5.x.x DSN or an unparseable code.
+	Bounce          bool
+	BouncePermanent bool
 }
 
 // FromFile parses an RFC822 message file into a Payload.
@@ -93,9 +99,10 @@ func FromReader(r io.Reader) (Payload, error) {
 		date = time.Now().Format(time.RFC1123Z)
 	}
 	from := splitAddress(msg.Header.Get("From"))
+	replyTo := splitAddress(msg.Header.Get("Reply-To"))
 	to := splitAddress(msg.Header.Get("To"))
 
-	text, atts, err := parseBody(msg)
+	text, atts, deliveryStatus, err := parseBody(msg)
 	if err != nil {
 		return p, err
 	}
@@ -103,6 +110,8 @@ func FromReader(r io.Reader) (Payload, error) {
 	p.MessageID = messageID
 	p.From = from.Email
 	p.FromFull = from
+	p.ReplyTo = replyTo.Email
+	p.ReplyToFull = replyTo
 	p.To = to.Email
 	p.ToFull = []Address{to}
 	p.Subject = decodeHeader(msg.Header.Get("Subject"))
@@ -118,38 +127,81 @@ func FromReader(r io.Reader) (Payload, error) {
 		}
 	}
 	p.Attachments = atts
+
+	topType, ctParams, _ := mime.ParseMediaType(msg.Header.Get("Content-Type"))
+	p.Bounce, p.BouncePermanent = detectBounce(topType, ctParams, from.Email, msg.Header.Get("Return-Path"), deliveryStatus)
 	return p, nil
 }
 
-func parseBody(msg *mail.Message) (string, []Attachment, error) {
+// detectBounce reports whether the message is a delivery-status notification and,
+// if so, whether the failure is permanent. Any one of three signals triggers it:
+// a multipart/report delivery-status, a mailer-daemon/postmaster sender, or a
+// null return-path alongside a message/delivery-status part. A 4.x.x DSN status
+// is transient; anything else (including an unparseable code) is permanent.
+func detectBounce(mediaType string, ctParams map[string]string, fromEmail, returnPath, deliveryStatus string) (bounce, permanent bool) {
+	report := mediaType == "multipart/report" && strings.EqualFold(ctParams["report-type"], "delivery-status")
+	nullReturn := strings.TrimSpace(returnPath) == "<>"
+	bounce = report || isDaemonAddress(fromEmail) || (nullReturn && deliveryStatus != "")
+	if !bounce {
+		return false, false
+	}
+	return true, dsnPermanent(deliveryStatus)
+}
+
+func isDaemonAddress(email string) bool {
+	local := email
+	if at := strings.IndexByte(email, '@'); at > 0 {
+		local = email[:at]
+	}
+	switch strings.ToLower(strings.TrimSpace(local)) {
+	case "mailer-daemon", "postmaster":
+		return true
+	}
+	return false
+}
+
+// dsnPermanent reads the DSN "Status: N.x.x" field; only a 4.x.x class is
+// transient, so an absent or unparseable code is treated as permanent.
+func dsnPermanent(deliveryStatus string) bool {
+	for line := range strings.SplitSeq(deliveryStatus, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(strings.ToLower(line), "status:") {
+			continue
+		}
+		return !strings.HasPrefix(strings.TrimSpace(line[len("status:"):]), "4.")
+	}
+	return true
+}
+
+func parseBody(msg *mail.Message) (string, []Attachment, string, error) {
 	contentType := msg.Header.Get("Content-Type")
 	mediaType, params, err := mime.ParseMediaType(contentType)
 	if err != nil || !strings.HasPrefix(mediaType, "multipart/") || params["boundary"] == "" {
 		body, derr := decodeBody(msg.Body, msg.Header.Get("Content-Transfer-Encoding"))
 		if derr != nil {
-			return "", nil, derr
+			return "", nil, "", derr
 		}
 		text := toUTF8(body, params["charset"])
 		if strings.HasPrefix(mediaType, "text/html") {
 			text = stripHTML(text)
 		}
-		return text, nil, nil
+		return text, nil, "", nil
 	}
 
-	var text, htmlBody string
+	var text, htmlBody, deliveryStatus string
 	var atts []Attachment
-	if err := walkParts(msg.Body, params["boundary"], &text, &htmlBody, &atts, 0); err != nil {
-		return text, atts, err
+	if err := walkParts(msg.Body, params["boundary"], &text, &htmlBody, &atts, &deliveryStatus, 0); err != nil {
+		return text, atts, deliveryStatus, err
 	}
 	if text == "" && htmlBody != "" {
 		text = stripHTML(htmlBody)
 	}
-	return text, atts, nil
+	return text, atts, deliveryStatus, nil
 }
 
 // walkParts collects text, HTML, and attachments from a multipart stream,
 // recovering what it parsed past per-part or truncated-stream errors.
-func walkParts(r io.Reader, boundary string, text, htmlBody *string, atts *[]Attachment, depth int) error {
+func walkParts(r io.Reader, boundary string, text, htmlBody *string, atts *[]Attachment, deliveryStatus *string, depth int) error {
 	if depth > maxMultipartDepth {
 		return fmt.Errorf("multipart: nesting exceeds depth %d", maxMultipartDepth)
 	}
@@ -170,12 +222,19 @@ func walkParts(r io.Reader, boundary string, text, htmlBody *string, atts *[]Att
 
 		if strings.HasPrefix(partType, "multipart/") {
 			// nested-walk failures don't abort the outer walk; recover what we can
-			_ = walkParts(part, partParams["boundary"], text, htmlBody, atts, depth+1)
+			_ = walkParts(part, partParams["boundary"], text, htmlBody, atts, deliveryStatus, depth+1)
 			continue
 		}
 
 		body, err := decodeBody(part, part.Header.Get("Content-Transfer-Encoding"))
 		if err != nil {
+			continue
+		}
+
+		// a delivery-status report part carries the DSN Status code that tells a
+		// hard bounce from a transient one
+		if partType == "message/delivery-status" && *deliveryStatus == "" {
+			*deliveryStatus = string(body)
 			continue
 		}
 

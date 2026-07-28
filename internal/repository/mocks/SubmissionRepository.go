@@ -141,6 +141,66 @@ func (_m *SubmissionRepository) FindByEmailReference(ctx context.Context, messag
 	return r0, r1, r2
 }
 
+// FindContentMatch provides a mock function with given fields: ctx, namedInsured, fromAddress, createdAfterUnixNano
+func (_m *SubmissionRepository) FindContentMatch(ctx context.Context, namedInsured string, fromAddress string, createdAfterUnixNano int64) (*model.Submission, error) {
+	ret := _m.Called(ctx, namedInsured, fromAddress, createdAfterUnixNano)
+
+	if len(ret) == 0 {
+		panic("no return value specified for FindContentMatch")
+	}
+
+	var r0 *model.Submission
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context, string, string, int64) (*model.Submission, error)); ok {
+		return rf(ctx, namedInsured, fromAddress, createdAfterUnixNano)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context, string, string, int64) *model.Submission); ok {
+		r0 = rf(ctx, namedInsured, fromAddress, createdAfterUnixNano)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(*model.Submission)
+		}
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context, string, string, int64) error); ok {
+		r1 = rf(ctx, namedInsured, fromAddress, createdAfterUnixNano)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
+// ListBindSoon provides a mock function with given fields: ctx, effectiveBeforeUnixNano, limit
+func (_m *SubmissionRepository) ListBindSoon(ctx context.Context, effectiveBeforeUnixNano int64, limit int) ([]model.Submission, error) {
+	ret := _m.Called(ctx, effectiveBeforeUnixNano, limit)
+
+	if len(ret) == 0 {
+		panic("no return value specified for ListBindSoon")
+	}
+
+	var r0 []model.Submission
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context, int64, int) ([]model.Submission, error)); ok {
+		return rf(ctx, effectiveBeforeUnixNano, limit)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context, int64, int) []model.Submission); ok {
+		r0 = rf(ctx, effectiveBeforeUnixNano, limit)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).([]model.Submission)
+		}
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context, int64, int) error); ok {
+		r1 = rf(ctx, effectiveBeforeUnixNano, limit)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
 // ListCompletedBefore provides a mock function with given fields: ctx, olderThanUnixNano, limit
 func (_m *SubmissionRepository) ListCompletedBefore(ctx context.Context, olderThanUnixNano int64, limit int) ([]model.Submission, error) {
 	ret := _m.Called(ctx, olderThanUnixNano, limit)
@@ -194,6 +254,36 @@ func (_m *SubmissionRepository) ListEscalatedSince(ctx context.Context, sinceUni
 
 	if rf, ok := ret.Get(1).(func(context.Context, int64, int) error); ok {
 		r1 = rf(ctx, sinceUnixNano, limit)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
+// ListHeldIDs provides a mock function with given fields: ctx
+func (_m *SubmissionRepository) ListHeldIDs(ctx context.Context) ([]string, error) {
+	ret := _m.Called(ctx)
+
+	if len(ret) == 0 {
+		panic("no return value specified for ListHeldIDs")
+	}
+
+	var r0 []string
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context) ([]string, error)); ok {
+		return rf(ctx)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context) []string); ok {
+		r0 = rf(ctx)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).([]string)
+		}
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context) error); ok {
+		r1 = rf(ctx)
 	} else {
 		r1 = ret.Error(1)
 	}
@@ -277,6 +367,54 @@ func (_m *SubmissionRepository) SetLastReplyAt(ctx context.Context, submissionID
 	}
 
 	return r0
+}
+
+// SetOnHold provides a mock function with given fields: ctx, submissionIDs, onHold
+func (_m *SubmissionRepository) SetOnHold(ctx context.Context, submissionIDs []string, onHold bool) error {
+	ret := _m.Called(ctx, submissionIDs, onHold)
+
+	if len(ret) == 0 {
+		panic("no return value specified for SetOnHold")
+	}
+
+	var r0 error
+	if rf, ok := ret.Get(0).(func(context.Context, []string, bool) error); ok {
+		r0 = rf(ctx, submissionIDs, onHold)
+	} else {
+		r0 = ret.Error(0)
+	}
+
+	return r0
+}
+
+// SubmissionIDsByMessageIDs provides a mock function with given fields: ctx, messageIDs
+func (_m *SubmissionRepository) SubmissionIDsByMessageIDs(ctx context.Context, messageIDs []string) ([]string, error) {
+	ret := _m.Called(ctx, messageIDs)
+
+	if len(ret) == 0 {
+		panic("no return value specified for SubmissionIDsByMessageIDs")
+	}
+
+	var r0 []string
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context, []string) ([]string, error)); ok {
+		return rf(ctx, messageIDs)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context, []string) []string); ok {
+		r0 = rf(ctx, messageIDs)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).([]string)
+		}
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context, []string) error); ok {
+		r1 = rf(ctx, messageIDs)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
 }
 
 // UpsertEmail provides a mock function with given fields: ctx, e
