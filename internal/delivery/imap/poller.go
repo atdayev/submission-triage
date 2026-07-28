@@ -30,6 +30,8 @@ type mailbox interface {
 	MarkSeen(ctx context.Context, uid uint32) error
 	Flag(ctx context.Context, uid uint32) error
 	File(ctx context.Context, uid uint32, folder string) error
+	// ScanFolder returns the Message-IDs in folder (read-only), capped at limit.
+	ScanFolder(ctx context.Context, folder string, limit int) ([]string, error)
 	Close() error
 }
 
@@ -37,6 +39,7 @@ type mailbox interface {
 type ingester interface {
 	IngestEmail(ctx context.Context, req service.IngestRequest) (service.IngestResult, error)
 	AuditFileFailed(ctx context.Context, submissionID, folder, reason string)
+	ReconcileHold(ctx context.Context, messageIDs []string) error
 }
 
 // statusFolders maps a submission's post-ingest status to its mailbox folder.
@@ -46,14 +49,16 @@ type statusFolders struct {
 
 // Poller polls an IMAP inbox for new mail and ingests it.
 type Poller struct {
-	dial         func(ctx context.Context) (mailbox, error)
-	ingest       ingester
-	interval     time.Duration
-	batchLimit   int
-	mailbox      string
-	fileByStatus bool
-	folders      statusFolders
-	log          *logrus.Entry
+	dial          func(ctx context.Context) (mailbox, error)
+	ingest        ingester
+	interval      time.Duration
+	batchLimit    int
+	mailbox       string
+	fileByStatus  bool
+	folders       statusFolders
+	holdFolder    string
+	holdScanLimit int
+	log           *logrus.Entry
 
 	lastPoll atomic.Int64 // unix nanos of the last successful fetch cycle
 	failures atomic.Int64 // consecutive dial/fetch failures
@@ -74,7 +79,9 @@ func NewPoller(cfg config.IMAPConfig, auth Authenticator, svc ingester, log *log
 			escalated:     cfg.FolderEscalated,
 			unknownPolicy: cfg.FolderUnknownPolicy,
 		},
-		log: log,
+		holdFolder:    cfg.FolderHold,
+		holdScanLimit: cfg.HoldScanLimit,
+		log:           log,
 	}
 	// seed with startup time so the first interval after boot isn't reported stale
 	p.lastPoll.Store(time.Now().UnixNano())
@@ -135,14 +142,32 @@ func (p *Poller) pollOnce(ctx context.Context) {
 	p.recordSuccess()
 	if len(msgs) == 0 {
 		p.log.Debug("imap poll: no unseen messages")
+	} else {
+		p.log.WithField("count", len(msgs)).Info("imap poll: processing unseen messages")
+		for _, m := range msgs {
+			if ctx.Err() != nil {
+				return
+			}
+			p.process(ctx, mb, m)
+		}
+	}
+	// after the INBOX pass (its UIDs are done) reconcile the Hold folder membership
+	p.reconcileHold(ctx, mb)
+}
+
+// reconcileHold syncs on_hold to the Hold folder's current membership. Runs after
+// the INBOX pass so selecting another folder can't invalidate in-flight UIDs.
+func (p *Poller) reconcileHold(ctx context.Context, mb mailbox) {
+	if p.holdFolder == "" || ctx.Err() != nil {
 		return
 	}
-	p.log.WithField("count", len(msgs)).Info("imap poll: processing unseen messages")
-	for _, m := range msgs {
-		if ctx.Err() != nil {
-			return
-		}
-		p.process(ctx, mb, m)
+	ids, err := mb.ScanFolder(ctx, p.holdFolder, p.holdScanLimit)
+	if err != nil {
+		p.log.WithError(err).Warn("imap: hold folder scan failed")
+		return
+	}
+	if err := p.ingest.ReconcileHold(ctx, ids); err != nil {
+		p.log.WithError(err).Warn("hold reconcile failed")
 	}
 }
 

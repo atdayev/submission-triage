@@ -22,6 +22,10 @@ func (s *stubLLM) ExtractField(_ context.Context, _ llm.FieldExtractionRequest) 
 	return llm.FieldExtractionResponse{}, nil
 }
 
+func (s *stubLLM) ExtractIdentity(_ context.Context, _ llm.IdentityRequest) (llm.IdentityResponse, error) {
+	return llm.IdentityResponse{}, nil
+}
+
 func cglChecklist() model.Checklist {
 	return model.Checklist{
 		Name:       "Test",

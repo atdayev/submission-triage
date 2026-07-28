@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -230,6 +231,49 @@ func (m *imapMailbox) folderPath(leaf string) string {
 		return leaf
 	}
 	return m.folderPrefix + m.delim + leaf
+}
+
+// ScanFolder returns the Message-IDs of messages in folder, read-only and capped
+// at limit. A missing folder is created (so the agency has somewhere to drag) and
+// treated as empty. Selecting the folder ends the INBOX selection, so the poller
+// calls this only after the inbox pass is done.
+func (m *imapMailbox) ScanFolder(ctx context.Context, folder string, limit int) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	path := m.folderPath(folder)
+	sel, err := m.c.Select(path, &goimap.SelectOptions{ReadOnly: true}).Wait()
+	if err != nil {
+		_ = m.c.Create(path, nil).Wait()
+		sel, err = m.c.Select(path, &goimap.SelectOptions{ReadOnly: true}).Wait()
+		if err != nil {
+			return nil, nil // still unavailable; treat as empty
+		}
+	}
+	if sel.NumMessages == 0 {
+		return nil, nil
+	}
+	n := sel.NumMessages
+	if limit > 0 && n > uint32(limit) {
+		n = uint32(limit)
+	}
+	nums := make([]uint32, 0, n)
+	for i := uint32(1); i <= n; i++ {
+		nums = append(nums, i)
+	}
+	msgs, err := m.c.Fetch(goimap.SeqSetNum(nums...), &goimap.FetchOptions{Envelope: true}).Collect()
+	if err != nil {
+		return nil, fmt.Errorf("imap fetch hold envelopes: %w", err)
+	}
+	out := make([]string, 0, len(msgs))
+	for _, msg := range msgs {
+		if msg.Envelope != nil {
+			if id := strings.Trim(msg.Envelope.MessageID, "<>"); id != "" {
+				out = append(out, id)
+			}
+		}
+	}
+	return out, nil
 }
 
 // fileByLadder files uid into folder using the strongest capability the server

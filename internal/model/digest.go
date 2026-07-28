@@ -2,23 +2,28 @@ package model
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
 
 // Digest section keys — the bucket a submission falls into.
 const (
-	sectionEscalated = "escalated"
-	sectionAwaiting  = "awaiting"
-	sectionComplete  = "complete"
-	sectionUnknown   = "unknown"
+	sectionDeliveryFailed = "delivery_failed"
+	sectionEscalated      = "escalated"
+	sectionAwaiting       = "awaiting"
+	sectionHeld           = "held"
+	sectionComplete       = "complete"
+	sectionUnknown        = "unknown"
 )
 
 // digestSections lists the digest's groups in display priority: sections the
 // agency must act on first, complete at leisure, unknown-policy last.
 var digestSections = []struct{ key, title string }{
+	{sectionDeliveryFailed, "Delivery failed — address unreachable, needs a human"},
 	{sectionEscalated, "Escalated — broker went quiet"},
 	{sectionAwaiting, "Awaiting the broker"},
+	{sectionHeld, "On hold — paused by a human"},
 	{sectionComplete, "Complete"},
 	{sectionUnknown, "Unknown policy type"},
 }
@@ -50,6 +55,8 @@ func BuildDigest(subs []Submission, filenameOnly map[string][]string, omitted in
 			continue
 		}
 		showFilenameOnly := sec.key == sectionAwaiting || sec.key == sectionComplete
+		// order the work queue by urgency: soonest to bind first, unknowns last
+		sort.SliceStable(group, func(i, j int) bool { return bindLess(group[i], group[j]) })
 		fmt.Fprintf(&b, "\n%s (%d):\n", sec.title, len(group))
 		for i := range group {
 			var unverified []string
@@ -65,10 +72,15 @@ func BuildDigest(subs []Submission, filenameOnly map[string][]string, omitted in
 	return b.String()
 }
 
-// digestGroup buckets a submission by status priority; a policy-unknown case is
-// grouped as unknown regardless of its (awaiting) state.
+// digestGroup buckets a submission by priority. The two flags win over state: a
+// delivery failure (agency must fix the address) and a human hold (paused) are what
+// the reader needs to see first, regardless of the underlying state.
 func digestGroup(s Submission) string {
 	switch {
+	case s.DeliveryFailed:
+		return sectionDeliveryFailed
+	case s.OnHold:
+		return sectionHeld
 	case s.State == StateEscalated:
 		return sectionEscalated
 	case s.PolicyType == PolicyTypeUnknown:
@@ -85,8 +97,12 @@ func writeDigestRow(b *strings.Builder, s Submission, filenameOnly []string, now
 	if s.NeedsReview {
 		flag = " [needs review]"
 	}
-	fmt.Fprintf(b, "  - %s | from %s | age %s | idle %s%s\n",
-		digestSubject(s), digestFrom(s), humanDuration(now.Sub(s.CreatedAt)), humanDuration(now.Sub(s.LastActionAt)), flag)
+	bind := ""
+	if s.EffectiveDate != nil {
+		bind = " | " + bindLabel(*s.EffectiveDate, now)
+	}
+	fmt.Fprintf(b, "  - %s | from %s | age %s | idle %s%s%s\n",
+		digestSubject(s), digestFrom(s), humanDuration(now.Sub(s.CreatedAt)), humanDuration(now.Sub(s.LastActionAt)), bind, flag)
 	// outstanding items in customer wording (never internal item ids)
 	for _, m := range s.MissingItems {
 		if m.Reason != "" {
@@ -100,7 +116,12 @@ func writeDigestRow(b *strings.Builder, s Submission, filenameOnly []string, now
 	}
 }
 
+// digestSubject leads with the named insured (the account the agency reasons in),
+// falling back to the subject line, which is often a generic "New Submission".
 func digestSubject(s Submission) string {
+	if ni := strings.TrimSpace(s.NamedInsured); ni != "" {
+		return ni
+	}
 	if strings.TrimSpace(s.SubjectLine) == "" {
 		return "(no subject)"
 	}
@@ -112,6 +133,31 @@ func digestFrom(s Submission) string {
 		return "(unknown sender)"
 	}
 	return s.FromAddress
+}
+
+// bindLess orders submissions by effective date ascending, unknown dates last.
+func bindLess(a, b Submission) bool {
+	switch {
+	case a.EffectiveDate != nil && b.EffectiveDate != nil:
+		return a.EffectiveDate.Before(*b.EffectiveDate)
+	case a.EffectiveDate != nil:
+		return true
+	default:
+		return false
+	}
+}
+
+// bindLabel renders days-to-bind, e.g. "binds in 3d", "binds today", "bound 2d ago".
+func bindLabel(effective, now time.Time) string {
+	days := int(effective.Sub(now).Hours() / 24)
+	switch {
+	case days < 0:
+		return fmt.Sprintf("bound %dd ago", -days)
+	case days == 0:
+		return "binds today"
+	default:
+		return fmt.Sprintf("binds in %dd", days)
+	}
 }
 
 // humanDuration renders a coarse age like "3h" or "2d".

@@ -66,10 +66,25 @@ type Submission struct {
 	EscalatedAt  *time.Time
 	// NeedsReview flags a submission a human should look at (an unreadable or
 	// low-confidence document); orthogonal to State, persists until resolved.
-	NeedsReview  bool
-	Emails       []Email
-	Documents    []Document
-	MissingItems []MissingItem
+	NeedsReview bool
+	// OnHold pauses replies, escalation, and auto-close while a human works the
+	// case; set declaratively from the Hold folder, orthogonal to State.
+	OnHold bool
+	// DeliveryFailed marks a submission whose reply hard-bounced; suppresses
+	// further replies until a human fixes the unreachable address.
+	DeliveryFailed bool
+	// NamedInsured is the account the submission is for (from the application);
+	// the digest leads with it. Empty until extracted.
+	NamedInsured string
+	// EffectiveDate is the requested policy bind date; drives bind-window
+	// escalation. Nil until known.
+	EffectiveDate *time.Time
+	// LastEscalatedAt is when the submission last escalated; unlike EscalatedAt it
+	// survives a return to awaiting, so bind-window re-nudges can be rate-limited.
+	LastEscalatedAt *time.Time
+	Emails          []Email
+	Documents       []Document
+	MissingItems    []MissingItem
 }
 
 // NewSubmission creates a submission in the open state.

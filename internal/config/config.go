@@ -38,6 +38,7 @@ type Config struct {
 	Digest     DigestConfig
 	Retry      RetryConfig
 	Reply      ReplyConfig
+	Threading  ThreadingConfig
 }
 
 // ServiceConfig holds service identity.
@@ -86,6 +87,11 @@ type IMAPConfig struct {
 	FolderAwaiting      string `env:"IMAP_FOLDER_AWAITING" envDefault:"Waiting on Broker"`
 	FolderEscalated     string `env:"IMAP_FOLDER_ESCALATED" envDefault:"Escalated"`
 	FolderUnknownPolicy string `env:"IMAP_FOLDER_UNKNOWN_POLICY" envDefault:"Unknown Policy"`
+	// FolderHold is the folder the agency drags a message into to pause a submission
+	// (replies, escalation, auto-close). Folder membership is the state.
+	FolderHold string `env:"IMAP_FOLDER_HOLD" envDefault:"Hold"`
+	// HoldScanLimit caps the per-tick envelope scan of the Hold folder.
+	HoldScanLimit int `env:"IMAP_HOLD_SCAN_LIMIT" envDefault:"200"`
 	// CompleteLabel is a deprecated alias for FolderComplete (no default).
 	CompleteLabel string `env:"IMAP_COMPLETE_LABEL"`
 }
@@ -149,6 +155,9 @@ type DocumentConfig struct {
 	// UnreadableMinChars is the extracted-character count below which such a PDF
 	// is flagged unreadable.
 	UnreadableMinChars int `env:"UNREADABLE_MIN_CHARS" envDefault:"100"`
+	// AttachmentLinkDomains are file-sharing hosts whose presence in a body with no
+	// attachments signals the broker sent a link instead of files.
+	AttachmentLinkDomains []string `env:"ATTACHMENT_LINK_DOMAINS" envDefault:"sharefile,dropbox,wetransfer,box.com,drive.google,sharepoint,egnyte,hightail,smartvault"`
 }
 
 // ChecklistsConfig holds the checklists directory path.
@@ -161,6 +170,12 @@ type EscalationConfig struct {
 	IntervalMinutes     int `env:"ESCALATION_INTERVAL_MINUTES" envDefault:"15"`
 	ThresholdHours      int `env:"ESCALATION_THRESHOLD_HOURS" envDefault:"72"`
 	AutoCloseAfterHours int `env:"ESCALATION_AUTO_CLOSE_AFTER_HOURS" envDefault:"336"`
+	// BindWindowDays escalates a submission with anything broker-actionable
+	// outstanding as its effective date nears, regardless of quiet time.
+	BindWindowDays int `env:"ESCALATION_BIND_WINDOW_DAYS" envDefault:"7"`
+	// MinGapHours rate-limits bind-window re-nudges so a submission binding soon
+	// isn't escalated every tick.
+	MinGapHours int `env:"ESCALATION_MIN_GAP_HOURS" envDefault:"24"`
 }
 
 // DigestConfig holds the daily status-digest settings.
@@ -183,6 +198,11 @@ type RetryConfig struct {
 type ReplyConfig struct {
 	Workers   int `env:"REPLY_WORKERS" envDefault:"4"`
 	QueueSize int `env:"REPLY_QUEUE_SIZE" envDefault:"64"`
+	// RepliesEnabled is a global kill switch: false runs everything (ingest,
+	// classification, filing, flags, digest) but queues no broker reply. A first-week
+	// safety valve on a real mailbox, not a deployment mode. A pointer so a zero-value
+	// Config (nil) reads as enabled — only an explicit false disables.
+	RepliesEnabled *bool `env:"REPLIES_ENABLED" envDefault:"true"`
 	// CoalesceWindowSeconds spaces replies per submission: a reply waits until
 	// this long after the previous one was sent, so rapid follow-ups collapse
 	// into one. 0 sends every reply immediately (no coalescing).
@@ -190,6 +210,24 @@ type ReplyConfig struct {
 	// FlushIntervalSeconds is how often the outbox sweeper runs, sending replies
 	// whose coalesce window has elapsed and retrying failed sends.
 	FlushIntervalSeconds int `env:"REPLY_FLUSH_INTERVAL_SECONDS" envDefault:"30"`
+}
+
+// ThreadingConfig holds content-based thread-matching settings.
+type ThreadingConfig struct {
+	// MatchWindowDays bounds how far back content threading looks for an existing
+	// submission with the same named insured and sender.
+	MatchWindowDays int `env:"THREAD_MATCH_WINDOW_DAYS" envDefault:"14"`
+}
+
+const defaultThreadMatchWindowDays = 14
+
+// MatchWindow returns the content thread-matching lookback (default when unset).
+func (t ThreadingConfig) MatchWindow() time.Duration {
+	days := t.MatchWindowDays
+	if days <= 0 {
+		days = defaultThreadMatchWindowDays
+	}
+	return time.Duration(days) * 24 * time.Hour
 }
 
 // Load reads configuration from the process environment; defaults live in the
@@ -364,6 +402,16 @@ func (e EscalationConfig) Threshold() time.Duration {
 // AutoCloseAfter returns the quiet time before a completed case auto-closes.
 func (e EscalationConfig) AutoCloseAfter() time.Duration {
 	return time.Duration(e.AutoCloseAfterHours) * time.Hour
+}
+
+// BindWindow returns how close to the effective date a submission escalates early.
+func (e EscalationConfig) BindWindow() time.Duration {
+	return time.Duration(e.BindWindowDays) * 24 * time.Hour
+}
+
+// MinGap returns the minimum spacing between bind-window escalations.
+func (e EscalationConfig) MinGap() time.Duration {
+	return time.Duration(e.MinGapHours) * time.Hour
 }
 
 // Interval returns how often the daily status digest is sent.
