@@ -18,6 +18,7 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/atdayev/submission-triage/internal/config"
+	"github.com/atdayev/submission-triage/internal/database"
 	"github.com/atdayev/submission-triage/internal/service"
 	"github.com/atdayev/submission-triage/pkg/logger"
 )
@@ -137,6 +138,12 @@ func startWorkers(rootCtx context.Context, built *BuiltApp, cfg *config.Config, 
 		defer wg.Done()
 		service.NewOutboxWorker(built.Service, cfg.Reply.FlushInterval(), log).Run(rootCtx)
 	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		vacuum := func(ctx context.Context) error { return database.Vacuum(ctx, built.DB) }
+		service.NewRetentionWorker(built.Service, vacuum, cfg.Retention.Interval(), log).Run(rootCtx)
+	}()
 	if built.Poller != nil {
 		wg.Add(1)
 		go func() {
@@ -157,7 +164,26 @@ func awaitShutdownAndStop(rootCtx context.Context, server *httpstd.Server, svc *
 		log.WithError(err).Warn("http server shutdown error")
 	}
 
-	wg.Wait()
+	// bounded: a worker blocked on an unresponsive server would otherwise hold the
+	// process open indefinitely, and the service drain below never gets to run
+	if !waitBounded(wg, cfg.HTTP.ShutdownTimeout()) {
+		log.Warn("workers did not stop within the shutdown timeout; draining replies anyway")
+	}
 	svc.Shutdown()
 	log.Info("shutdown complete")
+}
+
+// waitBounded waits for wg, reporting false if d elapsed first.
+func waitBounded(wg *sync.WaitGroup, d time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(d):
+		return false
+	}
 }

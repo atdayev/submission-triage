@@ -22,7 +22,6 @@ const (
 	requestIDCtxKey
 )
 
-// RequestIDField is the log field holding the request ID.
 const RequestIDField = "request_id"
 
 // SetupLogger builds a logrus entry writing to stdout and, if logDir is set, dated rotating files.

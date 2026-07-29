@@ -34,6 +34,99 @@ func (_m *OutboxRepository) Enqueue(ctx context.Context, e *model.OutboxEntry) e
 	return r0
 }
 
+// ExpirePending provides a mock function with given fields: ctx, olderThanUnixNano
+func (_m *OutboxRepository) ExpirePending(ctx context.Context, olderThanUnixNano int64) (int64, error) {
+	ret := _m.Called(ctx, olderThanUnixNano)
+
+	if len(ret) == 0 {
+		panic("no return value specified for ExpirePending")
+	}
+
+	var r0 int64
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context, int64) (int64, error)); ok {
+		return rf(ctx, olderThanUnixNano)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context, int64) int64); ok {
+		r0 = rf(ctx, olderThanUnixNano)
+	} else {
+		r0 = ret.Get(0).(int64)
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context, int64) error); ok {
+		r1 = rf(ctx, olderThanUnixNano)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
+// ExpirePendingForSubmissions provides a mock function with given fields: ctx, submissionIDs, reason
+func (_m *OutboxRepository) ExpirePendingForSubmissions(ctx context.Context, submissionIDs []string, reason string) (int64, error) {
+	ret := _m.Called(ctx, submissionIDs, reason)
+
+	if len(ret) == 0 {
+		panic("no return value specified for ExpirePendingForSubmissions")
+	}
+
+	var r0 int64
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context, []string, string) (int64, error)); ok {
+		return rf(ctx, submissionIDs, reason)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context, []string, string) int64); ok {
+		r0 = rf(ctx, submissionIDs, reason)
+	} else {
+		r0 = ret.Get(0).(int64)
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context, []string, string) error); ok {
+		r1 = rf(ctx, submissionIDs, reason)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
+// GetPending provides a mock function with given fields: ctx, id
+func (_m *OutboxRepository) GetPending(ctx context.Context, id string) (*model.OutboxEntry, bool, error) {
+	ret := _m.Called(ctx, id)
+
+	if len(ret) == 0 {
+		panic("no return value specified for GetPending")
+	}
+
+	var r0 *model.OutboxEntry
+	var r1 bool
+	var r2 error
+	if rf, ok := ret.Get(0).(func(context.Context, string) (*model.OutboxEntry, bool, error)); ok {
+		return rf(ctx, id)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context, string) *model.OutboxEntry); ok {
+		r0 = rf(ctx, id)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(*model.OutboxEntry)
+		}
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context, string) bool); ok {
+		r1 = rf(ctx, id)
+	} else {
+		r1 = ret.Get(1).(bool)
+	}
+
+	if rf, ok := ret.Get(2).(func(context.Context, string) error); ok {
+		r2 = rf(ctx, id)
+	} else {
+		r2 = ret.Error(2)
+	}
+
+	return r0, r1, r2
+}
+
 // ListPending provides a mock function with given fields: ctx, now, retryCutoff, limit
 func (_m *OutboxRepository) ListPending(ctx context.Context, now time.Time, retryCutoff time.Time, limit int) ([]model.OutboxEntry, error) {
 	ret := _m.Called(ctx, now, retryCutoff, limit)
@@ -80,6 +173,34 @@ func (_m *OutboxRepository) MarkSent(ctx context.Context, id string, version tim
 	}
 
 	return r0
+}
+
+// Prune provides a mock function with given fields: ctx, olderThanUnixNano
+func (_m *OutboxRepository) Prune(ctx context.Context, olderThanUnixNano int64) (int64, error) {
+	ret := _m.Called(ctx, olderThanUnixNano)
+
+	if len(ret) == 0 {
+		panic("no return value specified for Prune")
+	}
+
+	var r0 int64
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context, int64) (int64, error)); ok {
+		return rf(ctx, olderThanUnixNano)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context, int64) int64); ok {
+		r0 = rf(ctx, olderThanUnixNano)
+	} else {
+		r0 = ret.Get(0).(int64)
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context, int64) error); ok {
+		r1 = rf(ctx, olderThanUnixNano)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
 }
 
 // Update provides a mock function with given fields: ctx, id, status, attempts, lastErr

@@ -57,7 +57,7 @@ func TestBuildDigest_LeadsWithNamedInsuredAndFlagSections(t *testing.T) {
 		{ID: "2", State: model.StateAwaiting, PolicyType: "cgl", SubjectLine: "unreachable", DeliveryFailed: true, CreatedAt: now, LastActionAt: now},
 		{ID: "3", State: model.StateAwaiting, PolicyType: "cgl", SubjectLine: "worked by a person", OnHold: true, CreatedAt: now, LastActionAt: now},
 	}
-	out := model.BuildDigest(subs, nil, 0, now)
+	out := model.BuildDigest(subs, nil, nil, 0, now)
 	if !strings.Contains(out, "Acme Manufacturing") {
 		t.Error("digest should lead with the named insured, not the generic subject")
 	}

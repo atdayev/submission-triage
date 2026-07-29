@@ -16,7 +16,7 @@ func TestBuildDigest_GroupsByStateInPriorityOrder(t *testing.T) {
 		{ID: "es", State: StateEscalated, PolicyType: "cgl", SubjectLine: "Escalated one", FromAddress: "e@x", CreatedAt: old, LastActionAt: old},
 		{ID: "un", State: StateAwaiting, PolicyType: PolicyTypeUnknown, SubjectLine: "Unknown one", FromAddress: "u@x", CreatedAt: old, LastActionAt: old},
 	}
-	body := BuildDigest(subs, nil, 0, now)
+	body := BuildDigest(subs, nil, nil, 0, now)
 
 	// a leading line counts the submissions needing a human
 	if !strings.Contains(body, "1 submission(s) need review") {
@@ -50,7 +50,7 @@ func TestBuildDigest_GroupsByStateInPriorityOrder(t *testing.T) {
 }
 
 func TestBuildDigest_EmptyIsBlank(t *testing.T) {
-	if got := BuildDigest(nil, nil, 0, time.Now()); got != "" {
+	if got := BuildDigest(nil, nil, nil, 0, time.Now()); got != "" {
 		t.Errorf("an empty digest should render nothing, got %q", got)
 	}
 }
@@ -58,7 +58,7 @@ func TestBuildDigest_EmptyIsBlank(t *testing.T) {
 func TestBuildDigest_OmittedLine(t *testing.T) {
 	now := time.Now()
 	subs := []Submission{{ID: "a", State: StateAwaiting, SubjectLine: "S", FromAddress: "a@x", CreatedAt: now, LastActionAt: now}}
-	if body := BuildDigest(subs, nil, 42, now); !strings.Contains(body, "42 more open submissions omitted") {
+	if body := BuildDigest(subs, nil, nil, 42, now); !strings.Contains(body, "42 more open submissions omitted") {
 		t.Errorf("omitted line missing:\n%s", body)
 	}
 }
@@ -69,7 +69,7 @@ func TestBuildDigest_NoInternalItemIds(t *testing.T) {
 		ID: "a", State: StateAwaiting, SubjectLine: "New submission", FromAddress: "a@x", CreatedAt: now, LastActionAt: now,
 		MissingItems: []MissingItem{{ID: "acord_125", Description: "ACORD 125 Application", Reason: "document not provided", Code: ReasonNotProvided}},
 	}}
-	body := BuildDigest(subs, nil, 0, now)
+	body := BuildDigest(subs, nil, nil, 0, now)
 	if strings.Contains(body, "acord_125") {
 		t.Errorf("digest leaked an internal item id:\n%s", body)
 	}
@@ -90,7 +90,7 @@ func TestBuildDigest_FlagsFilenameOnlyInCompleteAndAwaiting(t *testing.T) {
 		"wait": {"Loss Runs"},
 		"esc":  {"Should Not Appear"}, // escalated section is not flagged
 	}
-	body := BuildDigest(subs, filenameOnly, 0, now)
+	body := BuildDigest(subs, filenameOnly, nil, 0, now)
 
 	const warn = "Matched on filename only, content not verified:"
 	if !strings.Contains(body, warn+" ACORD 125 Application") {
@@ -108,7 +108,7 @@ func TestBuildDigest_NoFlagWhenCorroborated(t *testing.T) {
 	now := time.Now()
 	subs := []Submission{{ID: "done", State: StateComplete, PolicyType: "cgl", SubjectLine: "Done", FromAddress: "d@x", CreatedAt: now, LastActionAt: now}}
 	// empty filenameOnly map: every match was corroborated by keyword/LLM
-	body := BuildDigest(subs, map[string][]string{}, 0, now)
+	body := BuildDigest(subs, map[string][]string{}, nil, 0, now)
 	if strings.Contains(body, "Matched on filename only") {
 		t.Errorf("no flag expected when nothing matched by filename alone:\n%s", body)
 	}
@@ -125,5 +125,54 @@ func TestHumanDuration(t *testing.T) {
 		if got := humanDuration(d); got != want {
 			t.Errorf("humanDuration(%v) = %q, want %q", d, got, want)
 		}
+	}
+}
+
+func TestBindLabel(t *testing.T) {
+	// effective dates are stored at UTC midnight; now is whenever the digest runs
+	day := func(y int, m time.Month, d int) time.Time { return time.Date(y, m, d, 0, 0, 0, 0, time.UTC) }
+	at := func(y int, m time.Month, d, h int) time.Time { return time.Date(y, m, d, h, 0, 0, 0, time.UTC) }
+
+	cases := []struct {
+		name      string
+		effective time.Time
+		now       time.Time
+		want      string
+	}{
+		{"same day, morning", day(2026, 6, 10), at(2026, 6, 10, 9), "binds today"},
+		{"same day, late", day(2026, 6, 10), at(2026, 6, 10, 23), "binds today"},
+		// 15 hours out but a different calendar day: elapsed-hours math truncates this
+		// to 0 and reports "binds today" for something that binds tomorrow
+		{"tomorrow, 15h out", day(2026, 6, 11), at(2026, 6, 10, 9), "binds in 1d"},
+		{"tomorrow, 1h out", day(2026, 6, 11), at(2026, 6, 10, 23), "binds in 1d"},
+		{"three days out", day(2026, 6, 13), at(2026, 6, 10, 9), "binds in 3d"},
+		{"yesterday", day(2026, 6, 9), at(2026, 6, 10, 9), "bound 1d ago"},
+		{"a week ago", day(2026, 6, 3), at(2026, 6, 10, 9), "bound 7d ago"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := bindLabel(tc.effective, tc.now); got != tc.want {
+				t.Errorf("bindLabel: got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestBuildDigest_SectionsWithheldReplies(t *testing.T) {
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	subs := []Submission{
+		{ID: "w1", State: StateAwaiting, PolicyType: "cgl", SubjectLine: "Withheld", FromAddress: "a@x",
+			CreatedAt: now, LastActionAt: now},
+		{ID: "n1", State: StateAwaiting, PolicyType: "cgl", SubjectLine: "Normal", FromAddress: "b@x",
+			CreatedAt: now, LastActionAt: now},
+	}
+	body := BuildDigest(subs, nil, map[string]bool{"w1": true}, 0, now)
+	if !strings.Contains(body, "Reply withheld") {
+		t.Error("a withheld reply needs its own heading; it is never resent automatically")
+	}
+	withheldAt := strings.Index(body, "Withheld")
+	normalAt := strings.Index(body, "Normal")
+	if withheldAt < 0 || normalAt < 0 || withheldAt > normalAt {
+		t.Error("withheld submissions should lead the digest, above the ordinary awaiting rows")
 	}
 }

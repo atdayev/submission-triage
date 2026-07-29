@@ -104,6 +104,40 @@ func (f *fakeOutbox) MarkSent(_ context.Context, id string, version time.Time) e
 	return nil
 }
 
+// GetPending mirrors the real re-read under the dispatch claim.
+func (f *fakeOutbox) GetPending(_ context.Context, id string) (*model.OutboxEntry, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	e, ok := f.entries[id]
+	if !ok || e.Status != model.OutboxPending {
+		return nil, false, nil
+	}
+	cp := *e
+	return &cp, true, nil
+}
+
+// retention hooks: the fake outbox never ages rows out, so the sweeps are no-ops.
+func (f *fakeOutbox) ExpirePending(_ context.Context, _ int64) (int64, error) { return 0, nil }
+func (f *fakeOutbox) Prune(_ context.Context, _ int64) (int64, error)         { return 0, nil }
+
+func (f *fakeOutbox) ExpirePendingForSubmissions(_ context.Context, ids []string, reason string) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	want := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		want[id] = struct{}{}
+	}
+	var n int64
+	for _, e := range f.entries {
+		if _, ok := want[e.SubmissionID]; ok && e.Status == model.OutboxPending {
+			e.Status = model.OutboxFailed
+			e.LastError = reason
+			n++
+		}
+	}
+	return n, nil
+}
+
 type fakeMail struct {
 	mu         sync.Mutex
 	sent       []model.Reply
@@ -376,8 +410,9 @@ func TestIngestEmail_PersistFailureReturnsError(t *testing.T) {
 	if mail.sentCount() != 0 {
 		t.Fatalf("no reply should be sent when persistence failed, got %d", mail.sentCount())
 	}
-	// a failed persist must leave no orphan audit rows; they would duplicate on retry
-	aud.AssertNotCalled(t, "Append", mock.Anything, mock.Anything)
+	// the trail is written even when the commit fails: a dropped trail is
+	// unrecoverable, while an orphan row pointing at no submission is merely noise
+	aud.AssertCalled(t, "Append", mock.Anything, mock.Anything)
 }
 
 func TestIngestEmail_AutoSubmitted_SuppressesReply(t *testing.T) {
@@ -468,8 +503,7 @@ func TestIngestEmail_AutoSubmitted_PersistFailureReturnsError(t *testing.T) {
 	if mail.sentCount() != 0 {
 		t.Fatalf("no reply should be sent for suppressed mail, got %d", mail.sentCount())
 	}
-	// a failed persist must leave no orphan audit rows; they would duplicate on retry
-	aud.AssertNotCalled(t, "Append", mock.Anything, mock.Anything)
+	aud.AssertCalled(t, "Append", mock.Anything, mock.Anything)
 }
 
 func TestIngestEmail_FlagOnly_NoReplyWhenNothingToAsk(t *testing.T) {
@@ -679,8 +713,7 @@ func TestIngestEmail_LowConfidence_PersistFailureReturnsError(t *testing.T) {
 	if mail.sentCount() != 0 {
 		t.Fatalf("no reply for needs_review, got %d", mail.sentCount())
 	}
-	// audits must not flush before a successful commit
-	aud.AssertNotCalled(t, "Append", mock.Anything, mock.Anything)
+	aud.AssertCalled(t, "Append", mock.Anything, mock.Anything)
 }
 
 func TestSendDigest_RendersOpenSubmissions(t *testing.T) {
@@ -700,6 +733,7 @@ func TestSendDigest_RendersOpenSubmissions(t *testing.T) {
 			MissingItems: []model.MissingItem{{ID: "acord_126", Description: "ACORD 126", Reason: "document not provided", Code: model.ReasonNotProvided}}},
 	}
 	subs.On("ListOpen", mock.Anything, mock.Anything).Return(open, nil)
+	aud.On("ListSubmissionIDsByEvent", mock.Anything, mock.Anything, mock.Anything).Return(nil, nil).Maybe()
 
 	digestSent := false
 	aud.On("Append", mock.Anything, mock.Anything).Return(nil).Run(func(args mock.Arguments) {
@@ -747,6 +781,7 @@ func TestSendDigest_FlagsFilenameOnlyMatches(t *testing.T) {
 			CreatedAt: now.Add(-2 * time.Hour), LastActionAt: now.Add(-time.Hour)},
 	}
 	subs.On("ListOpen", mock.Anything, mock.Anything).Return(open, nil)
+	aud.On("ListSubmissionIDsByEvent", mock.Anything, mock.Anything, mock.Anything).Return(nil, nil).Maybe()
 	// the repo flags acord_125 as filename-only; the service resolves its human name
 	subs.On("FilenameOnlyItems", mock.Anything, mock.Anything).Return(map[string][]string{"done": {"acord_125"}}, nil)
 	aud.On("Append", mock.Anything, mock.Anything).Return(nil).Maybe()
@@ -943,22 +978,30 @@ func TestCheckEscalations(t *testing.T) {
 	}
 }
 
-func TestOutboundEmail_DeterministicIDStableAcrossProviderIDs(t *testing.T) {
+func TestOutboundEmail_DeterministicIDTracksActualSends(t *testing.T) {
 	now := time.Unix(0, 0).UTC()
 	r := model.Reply{SubmissionID: "s1", ToAddress: "x@y", Subject: "Re: a", BodyText: "body"}
 
-	// a redelivery mints a fresh providerMsgID; the row's identity must not change
+	// SMTPSender derives its Message-ID from the reply, so an outbox redelivery of
+	// the same row reports the same id and must upsert one row, not two
 	a := outboundEmail(r, "msg-1@host", now)
-	b := outboundEmail(r, "msg-2@host", now)
-	if a.DeterministicID != b.DeterministicID {
-		t.Fatalf("det id should be stable across providerMsgID: %q vs %q", a.DeterministicID, b.DeterministicID)
+	if b := outboundEmail(r, "msg-1@host", now); a.DeterministicID != b.DeterministicID {
+		t.Fatalf("a redelivery must reuse the row: %q vs %q", a.DeterministicID, b.DeterministicID)
 	}
 
-	// a genuinely different reply (completion vs missing-items) stays distinct
+	// a distinct Message-ID means a distinct send actually left; recording it under
+	// the first send's id would undercount what the broker received and lose the
+	// Message-ID a later bounce threads on
+	if c := outboundEmail(r, "msg-2@host", now); c.DeterministicID == a.DeterministicID {
+		t.Error("a genuinely separate send must get its own row")
+	}
+
+	// with no provider id to key on, content is the only thing left
+	d := outboundEmail(r, "", now)
 	r2 := r
 	r2.BodyText = "different body"
-	if c := outboundEmail(r2, "msg-1@host", now); c.DeterministicID == a.DeterministicID {
-		t.Error("different reply body should yield a different det id")
+	if e := outboundEmail(r2, "", now); d.DeterministicID == e.DeterministicID {
+		t.Error("without a provider id, a different body should yield a different det id")
 	}
 }
 
@@ -1026,6 +1069,7 @@ func newSvcWith(t *testing.T, subs *repomocks.SubmissionRepository, aud *repomoc
 	subs.On("FindByDeterministicID", mock.Anything, mock.Anything).Return(nil, model.ErrSubmissionNotFound).Maybe()
 	subs.On("ListEscalatedSince", mock.Anything, mock.Anything, mock.Anything).Return(nil, nil).Maybe()
 	subs.On("ListOpen", mock.Anything, mock.Anything).Return(nil, nil).Maybe()
+	aud.On("ListSubmissionIDsByEvent", mock.Anything, mock.Anything, mock.Anything).Return(nil, nil).Maybe()
 	subs.On("CountOpen", mock.Anything).Return(0, nil).Maybe()
 	subs.On("FilenameOnlyItems", mock.Anything, mock.Anything).Return(map[string][]string(nil), nil).Maybe()
 	subs.On("SetLastReplyAt", mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
@@ -1380,6 +1424,7 @@ func TestSendDigest_NothingOpenIsNoOp(t *testing.T) {
 	store := &multiStore{byType: map[string]model.Checklist{"cgl": cl}}
 
 	subs.On("ListOpen", mock.Anything, mock.Anything).Return([]model.Submission{}, nil)
+	aud.On("ListSubmissionIDsByEvent", mock.Anything, mock.Anything, mock.Anything).Return(nil, nil).Maybe()
 
 	svc := newSvcWith(t, subs, aud, mail, store, nil)
 

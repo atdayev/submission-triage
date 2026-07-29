@@ -39,6 +39,7 @@ type Config struct {
 	Retry      RetryConfig
 	Reply      ReplyConfig
 	Threading  ThreadingConfig
+	Retention  RetentionConfig
 }
 
 // ServiceConfig holds service identity.
@@ -92,6 +93,16 @@ type IMAPConfig struct {
 	FolderHold string `env:"IMAP_FOLDER_HOLD" envDefault:"Hold"`
 	// HoldScanLimit caps the per-tick envelope scan of the Hold folder.
 	HoldScanLimit int `env:"IMAP_HOLD_SCAN_LIMIT" envDefault:"200"`
+	// IgnoreBefore (RFC3339) skips mail delivered before it, so pointing at a
+	// mailbox with history doesn't reply to years of old submissions. Unset falls
+	// back to the first-boot timestamp persisted in service_meta.
+	IgnoreBefore string `env:"IMAP_IGNORE_BEFORE"`
+	// PollMaxAttempts quarantines a message that fails ingest this many times, so
+	// one poisoned message can't reprocess every tick forever.
+	PollMaxAttempts int `env:"POLL_MAX_ATTEMPTS" envDefault:"5"`
+	// PollTimeoutSeconds bounds one whole poll cycle. imapDialTimeout covers only
+	// TCP connect, so without this a server that accepts then stalls blocks forever.
+	PollTimeoutSeconds int `env:"IMAP_POLL_TIMEOUT_SECONDS" envDefault:"120"`
 	// CompleteLabel is a deprecated alias for FolderComplete (no default).
 	CompleteLabel string `env:"IMAP_COMPLETE_LABEL"`
 }
@@ -135,7 +146,9 @@ type AnthropicConfig struct {
 	TimeoutSec int    `env:"ANTHROPIC_TIMEOUT_SECONDS" envDefault:"30"`
 	MaxTokens  int    `env:"ANTHROPIC_MAX_TOKENS" envDefault:"2048"`
 	// DailyCapUSD bounds estimated LLM spend per UTC day; 0 disables the cap.
-	DailyCapUSD float64 `env:"LLM_DAILY_USD_CAP" envDefault:"2.00"`
+	// Past the cap classification silently degrades to filename heuristics for the
+	// rest of the day, so the default carries a few hundred submissions of headroom.
+	DailyCapUSD float64 `env:"LLM_DAILY_USD_CAP" envDefault:"10.00"`
 }
 
 // ClassifierConfig holds classification thresholds.
@@ -170,12 +183,30 @@ type EscalationConfig struct {
 	IntervalMinutes     int `env:"ESCALATION_INTERVAL_MINUTES" envDefault:"15"`
 	ThresholdHours      int `env:"ESCALATION_THRESHOLD_HOURS" envDefault:"72"`
 	AutoCloseAfterHours int `env:"ESCALATION_AUTO_CLOSE_AFTER_HOURS" envDefault:"336"`
+	// AwaitingAutoCloseAfterHours retires an awaiting or open submission no sweep
+	// would otherwise reach — one whose only gap is agency-side, so it can never
+	// escalate. Longer than the completed window: these are still nominally live.
+	AwaitingAutoCloseAfterHours int `env:"AWAITING_AUTO_CLOSE_AFTER_HOURS" envDefault:"2160"`
 	// BindWindowDays escalates a submission with anything broker-actionable
 	// outstanding as its effective date nears, regardless of quiet time.
 	BindWindowDays int `env:"ESCALATION_BIND_WINDOW_DAYS" envDefault:"7"`
+	// BindGraceDays keeps a submission bind-eligible this long past its effective
+	// date. Without a floor a passed date stays eligible forever; without grace a
+	// held submission is dropped on the day it matters most.
+	BindGraceDays int `env:"ESCALATION_BIND_GRACE_DAYS" envDefault:"3"`
 	// MinGapHours rate-limits bind-window re-nudges so a submission binding soon
 	// isn't escalated every tick.
 	MinGapHours int `env:"ESCALATION_MIN_GAP_HOURS" envDefault:"24"`
+}
+
+// RetentionConfig bounds what the database keeps; nothing else deletes rows.
+type RetentionConfig struct {
+	AuditDays int `env:"AUDIT_RETENTION_DAYS" envDefault:"90"`
+	// OutboxPendingTTLHours ages out a pending reply that never came due, which
+	// would otherwise hold the one-pending slot for its submission forever.
+	OutboxPendingTTLHours int `env:"OUTBOX_PENDING_TTL_HOURS" envDefault:"168"`
+	// IntervalHours is how often the retention sweep runs; 0 disables it.
+	IntervalHours int `env:"RETENTION_INTERVAL_HOURS" envDefault:"24"`
 }
 
 // DigestConfig holds the daily status-digest settings.
@@ -203,6 +234,9 @@ type ReplyConfig struct {
 	// safety valve on a real mailbox, not a deployment mode. A pointer so a zero-value
 	// Config (nil) reads as enabled — only an explicit false disables.
 	RepliesEnabled *bool `env:"REPLIES_ENABLED" envDefault:"true"`
+	// PolicyClarifyMaxAsks caps how many inbound emails may leave a submission with
+	// an undetermined policy type before we stop asking and flag it for a human.
+	PolicyClarifyMaxAsks int `env:"POLICY_CLARIFY_MAX_ASKS" envDefault:"3"`
 	// CoalesceWindowSeconds spaces replies per submission: a reply waits until
 	// this long after the previous one was sent, so rapid follow-ups collapse
 	// into one. 0 sends every reply immediately (no coalescing).
@@ -269,6 +303,9 @@ func (c *Config) Validate() error {
 	if c.IMAPConfigured() {
 		if c.IMAP.PollIntervalSeconds <= 0 {
 			return errors.New("config: imap.poll_interval_seconds must be > 0")
+		}
+		if _, _, err := c.IMAP.IgnoreBeforeTime(); err != nil {
+			return err
 		}
 		if c.IMAP.MaxMessageMB < 0 {
 			return errors.New("config: imap.max_message_mb must be >= 0")
@@ -378,6 +415,39 @@ func (i IMAPConfig) PollInterval() time.Duration {
 	return time.Duration(i.PollIntervalSeconds) * time.Second
 }
 
+// PollTimeout bounds one poll cycle; 0 leaves it unbounded.
+func (i IMAPConfig) PollTimeout() time.Duration {
+	return time.Duration(i.PollTimeoutSeconds) * time.Second
+}
+
+// IgnoreBeforeTime parses IMAP_IGNORE_BEFORE; ok is false when unset.
+func (i IMAPConfig) IgnoreBeforeTime() (time.Time, bool, error) {
+	raw := strings.TrimSpace(i.IgnoreBefore)
+	if raw == "" {
+		return time.Time{}, false, nil
+	}
+	t, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("config: IMAP_IGNORE_BEFORE %q is not RFC3339: %w", raw, err)
+	}
+	return t.UTC(), true, nil
+}
+
+// AuditRetention returns how long audit rows are kept; 0 keeps them forever.
+func (r RetentionConfig) AuditRetention() time.Duration {
+	return time.Duration(r.AuditDays) * 24 * time.Hour
+}
+
+// OutboxPendingTTL returns how long a pending reply may sit before being aged out.
+func (r RetentionConfig) OutboxPendingTTL() time.Duration {
+	return time.Duration(r.OutboxPendingTTLHours) * time.Hour
+}
+
+// Interval returns how often the retention sweep runs.
+func (r RetentionConfig) Interval() time.Duration {
+	return time.Duration(r.IntervalHours) * time.Hour
+}
+
 // MaxMessageBytes is the size above which a message is skipped instead of
 // pulled into memory. Zero means no limit.
 func (i IMAPConfig) MaxMessageBytes() int64 {
@@ -402,6 +472,17 @@ func (e EscalationConfig) Threshold() time.Duration {
 // AutoCloseAfter returns the quiet time before a completed case auto-closes.
 func (e EscalationConfig) AutoCloseAfter() time.Duration {
 	return time.Duration(e.AutoCloseAfterHours) * time.Hour
+}
+
+// AwaitingAutoCloseAfter returns the quiet time before an awaiting or open case
+// auto-closes; 0 disables the sweep.
+func (e EscalationConfig) AwaitingAutoCloseAfter() time.Duration {
+	return time.Duration(e.AwaitingAutoCloseAfterHours) * time.Hour
+}
+
+// BindGrace returns how long past its effective date a submission stays bind-eligible.
+func (e EscalationConfig) BindGrace() time.Duration {
+	return time.Duration(e.BindGraceDays) * 24 * time.Hour
 }
 
 // BindWindow returns how close to the effective date a submission escalates early.

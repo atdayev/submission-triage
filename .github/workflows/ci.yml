@@ -38,5 +38,21 @@ jobs:
       - name: build
         run: go build ./...
 
+      # vet the tagged files too: they are excluded from the default build, so a
+      # signature change that breaks them compiles clean until someone runs the tag
+      - name: vet (tagged builds)
+        run: |
+          go vet -tags integration ./...
+          go vet -tags stress ./...
+
       - name: test (race)
         run: go test -race -count=1 ./...
+
+      # in-memory IMAP/SMTP servers; no network or credentials needed
+      - name: test (integration)
+        run: go test -race -count=1 -tags integration ./...
+
+      # real SQLite + real concurrency. -race matters most here: this is the only
+      # suite that drives the reply pool and the outbox sweeper against each other
+      - name: test (stress)
+        run: go test -race -count=1 -tags stress -timeout 15m ./...

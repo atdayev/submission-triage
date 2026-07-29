@@ -97,10 +97,12 @@ func Build(ctx context.Context, cfg *config.Config, log *logrus.Entry, migration
 
 	var poller *imap.Poller
 	if cfg.IMAPConfigured() {
-		poller = imap.NewPoller(cfg.IMAP, imapAuth, svc, log)
+		poller = imap.NewPoller(cfg.IMAP, imapAuth, svc, repo.IngestControl, log)
 	} else {
 		log.Warn("IMAP not configured; the service will not ingest mail")
 	}
+
+	warnStartupGaps(cfg, checklists, sender.Name(), log)
 
 	// a nil *imap.Poller must reach the router as a nil interface, not a typed nil
 	var pollStatus handler.PollStatus
@@ -115,6 +117,45 @@ func Build(ctx context.Context, cfg *config.Config, log *logrus.Entry, migration
 		Router:  router,
 		Poller:  poller,
 	}, nil
+}
+
+// warnStartupGaps reports configurations that pass validation but leave the service
+// unable to do its job. Each is legitimate somewhere — a local run, a dry run — so
+// none is fatal, but none announces itself at runtime either.
+func warnStartupGaps(cfg *config.Config, checklists checklist.Store, senderName string, log *logrus.Entry) {
+	if cfg.Digest.Recipient == "" && !anyChecklistDigestRecipient(checklists) {
+		log.Error("DIGEST_RECIPIENT is not set; escalation sends no mail of its own, so no status email will reach anyone (mailbox filing still runs)")
+	}
+	if len(checklists.All()) == 0 {
+		log.Error("no checklists loaded; every submission will be treated as an unknown policy type")
+	}
+	if cfg.Anthropic.APIKey == "" {
+		log.Warn("ANTHROPIC_API_KEY is not set; classification is filename/keyword only and no effective date is ever extracted, so bind-window escalation stays dormant")
+	}
+	if senderName == "log" {
+		log.Warn("outbound provider is \"log\"; replies are written to the log and no mail leaves the process")
+	}
+	if cfg.Reply.RepliesEnabled != nil && !*cfg.Reply.RepliesEnabled {
+		log.Warn("REPLIES_ENABLED=false; submissions are ingested and classified but no broker reply is queued, and none is resent when it goes back on")
+	}
+	if cfg.Digest.IntervalHours <= 0 {
+		log.Warn("DIGEST_INTERVAL_HOURS is 0; no daily digest will be sent")
+	}
+	if cfg.Retention.IntervalHours <= 0 {
+		log.Warn("RETENTION_INTERVAL_HOURS is 0; nothing prunes the database and it will grow without bound")
+	}
+	if cfg.IMAP.MaxMessageMB == 0 {
+		log.Warn("IMAP_MAX_MESSAGE_MB is 0; the message size cap is disabled and one large message can exhaust memory")
+	}
+}
+
+func anyChecklistDigestRecipient(checklists checklist.Store) bool {
+	for _, c := range checklists.All() {
+		if c.Escalation.DigestRecipient != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // resolveDeprecatedConfig applies deprecated env aliases onto their replacements

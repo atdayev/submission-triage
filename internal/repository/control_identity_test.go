@@ -88,7 +88,7 @@ func TestSubmissionRepo_ListBindSoon(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := subs.ListBindSoon(ctx, now.Add(7*24*time.Hour).UnixNano(), 100)
+	got, err := subs.ListBindSoon(ctx, 0, now.Add(7*24*time.Hour).UnixNano(), 100)
 	if err != nil {
 		t.Fatal(err)
 	}

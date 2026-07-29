@@ -115,7 +115,6 @@ func (s *YAMLStore) Reload() error {
 	return nil
 }
 
-// Get returns the checklist for a policy type.
 func (s *YAMLStore) Get(policyType string) (model.Checklist, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

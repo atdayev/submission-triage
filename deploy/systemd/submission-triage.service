@@ -1,11 +1,10 @@
-# submission-triage systemd unit.
-#
 # Install:
 #   sudo useradd --system --no-create-home --shell /usr/sbin/nologin submission-triage
 #   sudo mkdir -p /opt/submission-triage /etc/submission-triage
 #   sudo cp bin/server /opt/submission-triage/submission-triage
 #   sudo cp -r checklists migrations /opt/submission-triage/
-#   sudo cp .env /etc/submission-triage/env          # filled-in config, chmod 600
+#   sudo cp .env /etc/submission-triage/env          # the filled-in config
+#   sudo chmod 600 /etc/submission-triage/env        # it holds the mailbox password
 #   sudo chown -R submission-triage:submission-triage /opt/submission-triage
 #   sudo cp deploy/systemd/submission-triage.service /etc/systemd/system/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now submission-triage

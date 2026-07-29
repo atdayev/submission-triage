@@ -1,7 +1,11 @@
 # testdata
 
-Synthetic, non-real submission emails used by the end-to-end test in
-`internal/delivery/imap/e2e_test.go`.
+Synthetic, non-real submission emails used by the end-to-end tests in
+`internal/delivery/imap/e2e_test.go` (`//go:build integration`). They are driven
+through the real Poller, so a run covers emlparse → emailingest → the real
+classifier and shipped checklists → a real migrated SQLite database:
+
+    go test -tags integration ./internal/delivery/imap/ -run TestE2E -v
 
 **Nothing here represents a real submission, real insured, or real broker.**
 All names, addresses, and claim narratives are fabricated. The "PDF"
@@ -20,7 +24,17 @@ state regardless of whether text extraction succeeded.
 | New submission, all docs present | `01_*` `02_*` `03_*` | `complete` |
 | New submission, 1–3 docs missing | `04_*` `05_*` `06_*` `07_*` | `awaiting`, reply with missing list |
 | Follow-up with missing docs attached | `08_*` `09_*` `10_*` | re-threads onto the original, transitions to `complete` |
-| Stale, dated past the escalation threshold | `11_*` `12_*` | hits `escalated` on the next worker tick |
+| Stale, dated months in the past | `11_*` `12_*` | `awaiting`; does **not** escalate on the next tick |
+
+### On the stale bucket
+
+These two carry `Date` headers months in the past, but the escalation clock is
+`last_action_at`, stamped **when the service ingests the message** — not the
+message's own date. A submission we have only just read has had no chance to go
+quiet, so it does not escalate until the threshold elapses from ingest. An earlier
+version of this file claimed they escalate on the next tick; that described a design
+the code never had. `IMAP_IGNORE_BEFORE` is the setting that keeps genuinely old
+mail out of the mailbox scan in the first place.
 
 ## Regenerating
 

@@ -466,10 +466,16 @@ func TestSubmissionRepo_ListCompletedBefore(t *testing.T) {
 		{"old-escalated", model.StateEscalated, old, false, -1},
 	}
 	for _, tc := range cases {
-		if err := subs.UpsertSubmission(ctx, &model.Submission{
+		row := &model.Submission{
 			ID: tc.id, PolicyType: "cgl", State: tc.state,
 			CreatedAt: tc.updated, UpdatedAt: tc.updated, LastActionAt: tc.updated,
-		}); err != nil {
+		}
+		// the close clock is completed_at, not updated_at, so inbound mail can't defer it
+		if tc.state == model.StateComplete {
+			stamped := tc.updated
+			row.CompletedAt = &stamped
+		}
+		if err := subs.UpsertSubmission(ctx, row); err != nil {
 			t.Fatal(err)
 		}
 	}

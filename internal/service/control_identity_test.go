@@ -109,7 +109,10 @@ func TestIngestEmail_HardBounce_FlagsDeliveryFailedNoReply(t *testing.T) {
 	}
 }
 
-func TestIngestEmail_DeliveryFailed_SuppressesFurtherReplies(t *testing.T) {
+// A fresh message from the broker clears a prior hard bounce: the flag exists to
+// stop replying into a black hole, and a message arriving proves the address is
+// live. Staying mute forever would strand the submission with no route back.
+func TestIngestEmail_DeliveryFailed_ClearedByNewInbound(t *testing.T) {
 	subs := repomocks.NewSubmissionRepository(t)
 	aud := repomocks.NewAuditRepository(t)
 	mail := &fakeMail{}
@@ -118,13 +121,13 @@ func TestIngestEmail_DeliveryFailed_SuppressesFurtherReplies(t *testing.T) {
 		Emails: []model.Email{{DeterministicID: "e0", MessageID: "orig"}},
 	}
 	subs.On("FindByEmailReference", mock.Anything, mock.Anything).Return(existing, false, nil)
-	subs.On("UpsertSubmission", mock.Anything, mock.Anything).Return(nil)
+	subs.On("UpsertSubmissionWithReply", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 	subs.On("UpsertEmail", mock.Anything, mock.Anything).Return(nil).Maybe()
-	suppressed := false
+	subs.On("SetLastReplyAt", mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+	retried := false
 	aud.On("Append", mock.Anything, mock.Anything).Return(nil).Run(func(a mock.Arguments) {
-		e := a.Get(1).(*model.AuditEntry)
-		if e.EventType == model.EventReplySuppressed && e.Payload["reason"] == "delivery_failed" {
-			suppressed = true
+		if a.Get(1).(*model.AuditEntry).EventType == model.EventDeliveryRetried {
+			retried = true
 		}
 	})
 	svc := newSvcCfg(t, subs, aud, mail, &fakeStore{cl: smallChecklist()}, baseCfg(), nil, nil)
@@ -136,11 +139,44 @@ func TestIngestEmail_DeliveryFailed_SuppressesFurtherReplies(t *testing.T) {
 		t.Fatalf("ingest: %v", err)
 	}
 	svc.Wait()
-	if mail.sentCount() != 0 {
-		t.Fatalf("delivery-failed submission must not be replied to, got %d", mail.sentCount())
+	if mail.sentCount() != 1 {
+		t.Fatalf("a new inbound message should let one reply through, got %d", mail.sentCount())
 	}
-	if !suppressed {
-		t.Error("expected a reply.suppressed(delivery_failed) audit")
+	if !retried {
+		t.Error("expected a reply.delivery_retried audit")
+	}
+	if existing.DeliveryFailed {
+		t.Error("delivery_failed should be cleared by the new inbound message")
+	}
+}
+
+// Without a new inbound message the flag stands and nothing is sent.
+func TestIngestEmail_DeliveryFailed_SuppressesOnBounce(t *testing.T) {
+	subs := repomocks.NewSubmissionRepository(t)
+	aud := repomocks.NewAuditRepository(t)
+	mail := &fakeMail{}
+	existing := &model.Submission{
+		ID: "sub-df", State: model.StateAwaiting, PolicyType: "cgl", FromAddress: "broker@x", DeliveryFailed: true,
+		Emails: []model.Email{{DeterministicID: "e0", MessageID: "orig"}},
+	}
+	subs.On("FindByEmailReference", mock.Anything, mock.Anything).Return(existing, false, nil)
+	subs.On("UpsertSubmission", mock.Anything, mock.Anything).Return(nil)
+	subs.On("UpsertEmail", mock.Anything, mock.Anything).Return(nil).Maybe()
+	aud.On("Append", mock.Anything, mock.Anything).Return(nil)
+	svc := newSvcCfg(t, subs, aud, mail, &fakeStore{cl: smallChecklist()}, baseCfg(), nil, nil)
+
+	if _, err := svc.IngestEmail(context.Background(), IngestRequest{
+		MessageID: "m2", InReplyTo: "orig", FromAddress: "mailer-daemon@x", Subject: "Undeliverable",
+		Bounce: true, BouncePermanent: true,
+	}); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	svc.Wait()
+	if mail.sentCount() != 0 {
+		t.Fatalf("a bounce must never draw a reply, got %d", mail.sentCount())
+	}
+	if !existing.DeliveryFailed {
+		t.Error("a re-bounce must leave delivery_failed set")
 	}
 }
 
@@ -309,7 +345,9 @@ func TestIngestEmail_OnHold_SuppressesReply(t *testing.T) {
 
 // B2 --------------------------------------------------------------------------
 
-func TestIngestEmail_RepliesDisabled_NoOutboundAuditsOnce(t *testing.T) {
+// The kill switch queues nothing and never resends, so every skipped submission has
+// to be recoverable by hand — which means one audit row each, not one per process.
+func TestIngestEmail_RepliesDisabled_AuditsEverySkippedSubmission(t *testing.T) {
 	subs := repomocks.NewSubmissionRepository(t)
 	aud := repomocks.NewAuditRepository(t)
 	mail := &fakeMail{}
@@ -338,8 +376,8 @@ func TestIngestEmail_RepliesDisabled_NoOutboundAuditsOnce(t *testing.T) {
 	if mail.sentCount() != 0 {
 		t.Fatalf("kill switch must queue no replies, got %d", mail.sentCount())
 	}
-	if disabled != 1 {
-		t.Errorf("reply.disabled should be audited once per process, got %d", disabled)
+	if disabled != 2 {
+		t.Errorf("reply.disabled should be audited per skipped submission, got %d for 2 submissions", disabled)
 	}
 }
 
@@ -468,7 +506,7 @@ func TestCheckEscalations_BindWindow_EscalatesImmediately(t *testing.T) {
 		MissingItems:  []model.MissingItem{{ID: "acord_126", Code: model.ReasonNotProvided}},
 	}
 	subs.On("ListStale", mock.Anything, mock.Anything, mock.Anything).Return([]model.Submission{}, nil)
-	subs.On("ListBindSoon", mock.Anything, mock.Anything, mock.Anything).Return([]model.Submission{sub}, nil)
+	subs.On("ListBindSoon", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return([]model.Submission{sub}, nil)
 	var escalated *model.Submission
 	subs.On("UpsertSubmission", mock.Anything, mock.Anything).Return(nil).Run(func(a mock.Arguments) {
 		escalated = a.Get(1).(*model.Submission)
@@ -500,7 +538,7 @@ func TestCheckEscalations_BindWindow_RateLimitedWithinMinGap(t *testing.T) {
 		MissingItems:    []model.MissingItem{{ID: "acord_126", Code: model.ReasonNotProvided}},
 	}
 	subs.On("ListStale", mock.Anything, mock.Anything, mock.Anything).Return([]model.Submission{}, nil)
-	subs.On("ListBindSoon", mock.Anything, mock.Anything, mock.Anything).Return([]model.Submission{sub}, nil)
+	subs.On("ListBindSoon", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return([]model.Submission{sub}, nil)
 	escalatedAudit := false
 	aud.On("Append", mock.Anything, mock.Anything).Return(nil).Maybe().Run(func(a mock.Arguments) {
 		if a.Get(1).(*model.AuditEntry).EventType == model.EventEscalated {

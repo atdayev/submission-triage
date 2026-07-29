@@ -48,6 +48,11 @@ var allowed = map[State]map[State]struct{}{
 		StateComplete: {},
 		StateClosed:   {},
 	},
+	// a broker replying into a closed thread reopens the case; without these the message loops
+	StateClosed: {
+		StateAwaiting: {},
+		StateComplete: {},
+	},
 }
 
 // Submission tracks one incoming submission through triage.
@@ -82,9 +87,18 @@ type Submission struct {
 	// LastEscalatedAt is when the submission last escalated; unlike EscalatedAt it
 	// survives a return to awaiting, so bind-window re-nudges can be rate-limited.
 	LastEscalatedAt *time.Time
-	Emails          []Email
-	Documents       []Document
-	MissingItems    []MissingItem
+	// CompletedAt is when the submission last entered complete; unlike UpdatedAt it
+	// is not moved by inbound mail, so a thank-you reply can't defer auto-close.
+	CompletedAt *time.Time
+	// LastReplyHash fingerprints what the last queued reply told the broker; an
+	// identical fingerprint means a new reply would repeat itself.
+	LastReplyHash string
+	// PolicyClarifyAsks counts how many times we've asked which line of business
+	// this is; past the cap the ask stops and a human is flagged.
+	PolicyClarifyAsks int
+	Emails            []Email
+	Documents         []Document
+	MissingItems      []MissingItem
 }
 
 // NewSubmission creates a submission in the open state.
@@ -123,8 +137,11 @@ func (s *Submission) TransitionTo(next State, now time.Time) error {
 	case StateEscalated:
 		t := now
 		s.EscalatedAt = &t
-	case StateAwaiting, StateComplete:
-		s.EscalatedAt = nil
+	case StateComplete:
+		t := now
+		s.EscalatedAt, s.CompletedAt = nil, &t
+	case StateAwaiting:
+		s.EscalatedAt, s.CompletedAt = nil, nil
 	}
 	return nil
 }

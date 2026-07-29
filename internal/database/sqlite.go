@@ -46,6 +46,20 @@ func Open(ctx context.Context, path string, log *logrus.Entry) (*sql.DB, error) 
 	return db, nil
 }
 
+// Vacuum rebuilds the database file, returning pages freed by a prune to the OS.
+// Without it deletes only mark pages reusable, so a database that shrank logically
+// still occupies its high-water mark on disk. Needs free space roughly equal to the
+// current file, so it fails on a nearly-full disk rather than fixing one.
+func Vacuum(ctx context.Context, db *sql.DB) error {
+	if _, err := db.ExecContext(ctx, "VACUUM"); err != nil {
+		return fmt.Errorf("sqlite vacuum: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+		return fmt.Errorf("sqlite wal checkpoint: %w", err)
+	}
+	return nil
+}
+
 // Migrate applies pending .sql migrations from dir in lexical order.
 func Migrate(ctx context.Context, db *sql.DB, dir string, log *logrus.Entry) error {
 	if _, err := db.ExecContext(ctx, `

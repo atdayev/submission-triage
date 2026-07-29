@@ -6,7 +6,6 @@ required_items:
     match:
       filename_patterns:
         - "*ACORD*125*"
-        - "*acord*125*"
         - "*application*"
       content_keywords:
         - "Commercial Insurance Application"
@@ -16,7 +15,6 @@ required_items:
     match:
       filename_patterns:
         - "*ACORD*126*"
-        - "*acord*126*"
         - "*GL*section*"
       content_keywords:
         - "Commercial General Liability Section"

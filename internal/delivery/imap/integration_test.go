@@ -124,7 +124,7 @@ func TestIntegration_RealAdapter_FetchMarkSeenRefetch(t *testing.T) {
 	}
 	defer mb.Close()
 
-	msgs, err := mb.FetchUnseen(ctx, 50)
+	msgs, err := mb.FetchUnseen(ctx, 50, time.Time{})
 	if err != nil {
 		t.Fatalf("FetchUnseen: %v", err)
 	}
@@ -153,7 +153,7 @@ func TestIntegration_RealAdapter_FetchMarkSeenRefetch(t *testing.T) {
 	if err := mb.MarkSeen(ctx, msgs[0].UID); err != nil {
 		t.Fatalf("MarkSeen: %v", err)
 	}
-	remaining, err := mb.FetchUnseen(ctx, 50)
+	remaining, err := mb.FetchUnseen(ctx, 50, time.Time{})
 	if err != nil {
 		t.Fatalf("re-FetchUnseen: %v", err)
 	}
@@ -177,7 +177,7 @@ func TestIntegration_RealAdapter_FileMovesMessage(t *testing.T) {
 	}
 	defer mb.Close()
 
-	msgs, err := mb.FetchUnseen(ctx, 50)
+	msgs, err := mb.FetchUnseen(ctx, 50, time.Time{})
 	if err != nil || len(msgs) != 1 {
 		t.Fatalf("FetchUnseen: got %d (err %v), want 1", len(msgs), err)
 	}
@@ -223,7 +223,7 @@ func TestIntegration_RealAdapter_RespectsBatchLimit(t *testing.T) {
 	}
 	defer mb.Close()
 
-	msgs, err := mb.FetchUnseen(context.Background(), 1)
+	msgs, err := mb.FetchUnseen(context.Background(), 1, time.Time{})
 	if err != nil {
 		t.Fatalf("FetchUnseen: %v", err)
 	}
@@ -238,12 +238,14 @@ func TestIntegration_PollerEndToEnd(t *testing.T) {
 
 	ing := &fakeIngester{}
 	p := &Poller{
-		dial:       dialIMAP(cfgFor(addr), passwordAuthFor(cfgFor(addr)), testLog()),
-		ingest:     ing,
-		interval:   time.Hour,
-		batchLimit: 50,
-		mailbox:    "INBOX",
-		log:        logrus.NewEntry(logrus.New()),
+		dial:        dialIMAP(cfgFor(addr), passwordAuthFor(cfgFor(addr)), testLog()),
+		ingest:      ing,
+		control:     newFakeControl(),
+		interval:    time.Hour,
+		batchLimit:  50,
+		maxAttempts: 5,
+		mailbox:     "INBOX",
+		log:         logrus.NewEntry(logrus.New()),
 	}
 
 	p.pollOnce(context.Background())
@@ -407,7 +409,7 @@ func TestIntegration_RealAdapter_XOAUTH2Auth(t *testing.T) {
 	}
 	defer mb.Close()
 
-	msgs, err := mb.FetchUnseen(ctx, 50)
+	msgs, err := mb.FetchUnseen(ctx, 50, time.Time{})
 	if err != nil {
 		t.Fatalf("FetchUnseen after XOAUTH2 auth: %v", err)
 	}
@@ -444,7 +446,7 @@ func TestIntegration_RealAdapter_SkipsOversized(t *testing.T) {
 	}
 	defer mb.Close()
 
-	msgs, err := mb.FetchUnseen(context.Background(), 50)
+	msgs, err := mb.FetchUnseen(context.Background(), 50, time.Time{})
 	if err != nil {
 		t.Fatalf("FetchUnseen: %v", err)
 	}

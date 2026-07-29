@@ -24,11 +24,17 @@ type SubmissionRepository interface {
 	FindByEmailReference(ctx context.Context, messageIDs []string) (*model.Submission, bool, error)
 	FindByDeterministicID(ctx context.Context, deterministicID string) (*model.Submission, error)
 	ListStale(ctx context.Context, olderThanUnixNano int64, limit int) ([]model.Submission, error)
-	// ListBindSoon returns awaiting submissions whose effective date is at or before
-	// the cutoff (the bind window), excluding held/delivery-failed ones.
-	ListBindSoon(ctx context.Context, effectiveBeforeUnixNano int64, limit int) ([]model.Submission, error)
+	// ListBindSoon returns awaiting submissions whose effective date falls inside the
+	// bind window, excluding held/delivery-failed ones.
+	ListBindSoon(ctx context.Context, effectiveAfterUnixNano, effectiveBeforeUnixNano int64, limit int) ([]model.Submission, error)
 	ListCompletedBefore(ctx context.Context, olderThanUnixNano int64, limit int) ([]model.Submission, error)
 	ListEscalatedSince(ctx context.Context, sinceUnixNano int64, limit int) ([]model.Submission, error)
+	// ListStalledBefore returns awaiting and open submissions idle since the cutoff —
+	// the ones no other sweep reaches, so without it they never terminate.
+	ListStalledBefore(ctx context.Context, olderThanUnixNano int64, limit int) ([]model.Submission, error)
+	// ClearExtractedTextForClosed drops the stored document text of submissions closed
+	// before the cutoff; it is the bulk of what a submission occupies on disk.
+	ClearExtractedTextForClosed(ctx context.Context, closedBeforeUnixNano int64) (int64, error)
 	// ListOpen returns non-closed submissions for the daily digest, ordered by
 	// state then oldest inactivity, capped at limit.
 	ListOpen(ctx context.Context, limit int) ([]model.Submission, error)
@@ -41,10 +47,18 @@ type SubmissionRepository interface {
 	UpsertEmail(ctx context.Context, e *model.Email) error
 	// SetLastReplyAt records when a submission's last reply was sent (coalesce spacing).
 	SetLastReplyAt(ctx context.Context, submissionID string, t time.Time) error
+	// ClearReplyHash forgets the last reply's fingerprint, so the same ask is allowed
+	// to be made again. Used when a queued reply dead-letters: the broker never
+	// received it, so suppressing the repeat would strand the submission.
+	ClearReplyHash(ctx context.Context, submissionID string) error
 	// SetOnHold sets on_hold on the given submissions (declarative Hold-folder sync).
 	SetOnHold(ctx context.Context, submissionIDs []string, onHold bool) error
 	// ListHeldIDs returns the ids of all currently-held submissions.
 	ListHeldIDs(ctx context.Context) ([]string, error)
+	// ReplyBlockedIDs returns which of the given submissions must not be replied to
+	// right now — held or hard-bounced. Checked at dispatch, not only at build:
+	// either can become true after a reply is queued but before its window elapses.
+	ReplyBlockedIDs(ctx context.Context, submissionIDs []string) ([]string, error)
 	// SubmissionIDsByMessageIDs resolves inbound Message-IDs to their submission ids.
 	SubmissionIDsByMessageIDs(ctx context.Context, messageIDs []string) ([]string, error)
 	// FindContentMatch returns the most recent open/awaiting submission from the same
@@ -56,13 +70,11 @@ type scanner interface {
 	Scan(dest ...any) error
 }
 
-// SubmissionRepositoryImpl is the SQLite-backed SubmissionRepository.
 type SubmissionRepositoryImpl struct {
 	db  *sql.DB
 	log *logrus.Entry
 }
 
-// NewSubmissionRepository returns a SQLite-backed SubmissionRepository.
 func NewSubmissionRepository(db *sql.DB, log *logrus.Entry) *SubmissionRepositoryImpl {
 	return &SubmissionRepositoryImpl{db: db, log: log}
 }
@@ -139,7 +151,8 @@ func (r *SubmissionRepositoryImpl) GetByID(ctx context.Context, id string) (*mod
 		SELECT id, policy_type, state, subject_line, from_address, from_name,
 		       thread_key, created_at, updated_at, last_action_at,
 		       escalated_at, missing_items, last_reply_at, needs_review,
-		       named_insured, effective_date, on_hold, delivery_failed, last_escalated_at
+		       named_insured, effective_date, on_hold, delivery_failed, last_escalated_at,
+		       completed_at, last_reply_hash, policy_clarify_asks
 		FROM submissions WHERE id = ?`, id)
 
 	s, err := scanSubmission(row, r.log)
@@ -292,7 +305,9 @@ func placeholderList(n int) string {
 	return strings.TrimRight(strings.Repeat("?,", n), ",")
 }
 
-// ListCompletedBefore returns completed submissions last updated before the given time.
+// ListCompletedBefore returns submissions that completed before the given time.
+// Keyed on completed_at, not updated_at: inbound mail moves updated_at, so a broker
+// thanking us every day would otherwise defer auto-close indefinitely.
 func (r *SubmissionRepositoryImpl) ListCompletedBefore(ctx context.Context, olderThanUnixNano int64, limit int) ([]model.Submission, error) {
 	if limit <= 0 {
 		limit = 100
@@ -301,10 +316,11 @@ func (r *SubmissionRepositoryImpl) ListCompletedBefore(ctx context.Context, olde
 		SELECT id, policy_type, state, subject_line, from_address, from_name,
 		       thread_key, created_at, updated_at, last_action_at,
 		       escalated_at, missing_items, last_reply_at, needs_review,
-		       named_insured, effective_date, on_hold, delivery_failed, last_escalated_at
+		       named_insured, effective_date, on_hold, delivery_failed, last_escalated_at,
+		       completed_at, last_reply_hash, policy_clarify_asks
 		FROM submissions
-		WHERE state = ? AND updated_at < ? AND on_hold = 0
-		ORDER BY updated_at ASC
+		WHERE state = ? AND completed_at IS NOT NULL AND completed_at < ? AND on_hold = 0
+		ORDER BY completed_at ASC
 		LIMIT ?`, string(model.StateComplete), olderThanUnixNano, limit)
 	if err != nil {
 		return nil, fmt.Errorf("query completed-before: %w", err)
@@ -331,7 +347,8 @@ func (r *SubmissionRepositoryImpl) ListEscalatedSince(ctx context.Context, since
 		SELECT id, policy_type, state, subject_line, from_address, from_name,
 		       thread_key, created_at, updated_at, last_action_at,
 		       escalated_at, missing_items, last_reply_at, needs_review,
-		       named_insured, effective_date, on_hold, delivery_failed, last_escalated_at
+		       named_insured, effective_date, on_hold, delivery_failed, last_escalated_at,
+		       completed_at, last_reply_hash, policy_clarify_asks
 		FROM submissions
 		WHERE state = ? AND escalated_at IS NOT NULL AND escalated_at >= ? AND on_hold = 0
 		ORDER BY escalated_at ASC
@@ -361,7 +378,8 @@ func (r *SubmissionRepositoryImpl) ListStale(ctx context.Context, olderThanUnixN
 		SELECT id, policy_type, state, subject_line, from_address, from_name,
 		       thread_key, created_at, updated_at, last_action_at,
 		       escalated_at, missing_items, last_reply_at, needs_review,
-		       named_insured, effective_date, on_hold, delivery_failed, last_escalated_at
+		       named_insured, effective_date, on_hold, delivery_failed, last_escalated_at,
+		       completed_at, last_reply_hash, policy_clarify_asks
 		FROM submissions
 		WHERE state = ? AND last_action_at < ? AND on_hold = 0 AND delivery_failed = 0
 		ORDER BY last_action_at ASC
@@ -382,8 +400,10 @@ func (r *SubmissionRepositoryImpl) ListStale(ctx context.Context, olderThanUnixN
 	return out, rows.Err()
 }
 
-// ListBindSoon returns awaiting submissions binding at or before the cutoff.
-func (r *SubmissionRepositoryImpl) ListBindSoon(ctx context.Context, effectiveBeforeUnixNano int64, limit int) ([]model.Submission, error) {
+// ListBindSoon returns awaiting submissions binding within the window. The lower
+// bound retires a submission once its effective date is well past — without it a
+// bound-and-gone case re-nudges every day forever.
+func (r *SubmissionRepositoryImpl) ListBindSoon(ctx context.Context, effectiveAfterUnixNano, effectiveBeforeUnixNano int64, limit int) ([]model.Submission, error) {
 	if limit <= 0 {
 		limit = 100
 	}
@@ -391,12 +411,14 @@ func (r *SubmissionRepositoryImpl) ListBindSoon(ctx context.Context, effectiveBe
 		SELECT id, policy_type, state, subject_line, from_address, from_name,
 		       thread_key, created_at, updated_at, last_action_at,
 		       escalated_at, missing_items, last_reply_at, needs_review,
-		       named_insured, effective_date, on_hold, delivery_failed, last_escalated_at
+		       named_insured, effective_date, on_hold, delivery_failed, last_escalated_at,
+		       completed_at, last_reply_hash, policy_clarify_asks
 		FROM submissions
-		WHERE state = ? AND effective_date IS NOT NULL AND effective_date <= ?
+		WHERE state = ? AND effective_date IS NOT NULL
+		  AND effective_date >= ? AND effective_date <= ?
 		  AND on_hold = 0 AND delivery_failed = 0
 		ORDER BY effective_date ASC
-		LIMIT ?`, string(model.StateAwaiting), effectiveBeforeUnixNano, limit)
+		LIMIT ?`, string(model.StateAwaiting), effectiveAfterUnixNano, effectiveBeforeUnixNano, limit)
 	if err != nil {
 		return nil, fmt.Errorf("query bind-soon: %w", err)
 	}
@@ -413,6 +435,53 @@ func (r *SubmissionRepositoryImpl) ListBindSoon(ctx context.Context, effectiveBe
 	return out, rows.Err()
 }
 
+// ListStalledBefore returns awaiting and open submissions idle since the cutoff.
+func (r *SubmissionRepositoryImpl) ListStalledBefore(ctx context.Context, olderThanUnixNano int64, limit int) ([]model.Submission, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT id, policy_type, state, subject_line, from_address, from_name,
+		       thread_key, created_at, updated_at, last_action_at,
+		       escalated_at, missing_items, last_reply_at, needs_review,
+		       named_insured, effective_date, on_hold, delivery_failed, last_escalated_at,
+		       completed_at, last_reply_hash, policy_clarify_asks
+		FROM submissions
+		WHERE state IN (?, ?) AND last_action_at < ? AND on_hold = 0
+		ORDER BY last_action_at ASC
+		LIMIT ?`, string(model.StateAwaiting), string(model.StateOpen), olderThanUnixNano, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query stalled-before: %w", err)
+	}
+	defer rows.Close()
+
+	var out []model.Submission
+	for rows.Next() {
+		s, err := scanSubmission(rows, r.log)
+		if err != nil {
+			return nil, fmt.Errorf("scan stalled-before: %w", err)
+		}
+		out = append(out, *s)
+	}
+	return out, rows.Err()
+}
+
+// ClearExtractedTextForClosed nulls out the stored text of closed submissions'
+// documents. The classification verdict, filename, and hash all stay — only the
+// text body goes, and only once the case can no longer be reopened by a sweep.
+func (r *SubmissionRepositoryImpl) ClearExtractedTextForClosed(ctx context.Context, closedBeforeUnixNano int64) (int64, error) {
+	res, err := r.db.ExecContext(ctx, `
+		UPDATE documents SET extracted_text = ''
+		WHERE extracted_text != '' AND submission_id IN (
+			SELECT id FROM submissions WHERE state = ? AND updated_at < ?
+		)`, string(model.StateClosed), closedBeforeUnixNano)
+	if err != nil {
+		return 0, fmt.Errorf("clear extracted text: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
 // ListOpen returns non-closed submissions, ordered by state then oldest inactivity.
 func (r *SubmissionRepositoryImpl) ListOpen(ctx context.Context, limit int) ([]model.Submission, error) {
 	if limit <= 0 {
@@ -422,7 +491,8 @@ func (r *SubmissionRepositoryImpl) ListOpen(ctx context.Context, limit int) ([]m
 		SELECT id, policy_type, state, subject_line, from_address, from_name,
 		       thread_key, created_at, updated_at, last_action_at,
 		       escalated_at, missing_items, last_reply_at, needs_review,
-		       named_insured, effective_date, on_hold, delivery_failed, last_escalated_at
+		       named_insured, effective_date, on_hold, delivery_failed, last_escalated_at,
+		       completed_at, last_reply_hash, policy_clarify_asks
 		FROM submissions
 		WHERE state != ?
 		ORDER BY state ASC, last_action_at ASC
@@ -503,6 +573,15 @@ func (r *SubmissionRepositoryImpl) SetLastReplyAt(ctx context.Context, submissio
 	return nil
 }
 
+// ClearReplyHash forgets the last reply's fingerprint so the same ask may repeat.
+func (r *SubmissionRepositoryImpl) ClearReplyHash(ctx context.Context, submissionID string) error {
+	if _, err := r.db.ExecContext(ctx,
+		`UPDATE submissions SET last_reply_hash = '' WHERE id = ?`, submissionID); err != nil {
+		return fmt.Errorf("clear reply hash: %w", err)
+	}
+	return nil
+}
+
 // SetOnHold sets on_hold for the given submissions in one statement (no-op on empty).
 func (r *SubmissionRepositoryImpl) SetOnHold(ctx context.Context, submissionIDs []string, onHold bool) error {
 	if len(submissionIDs) == 0 {
@@ -528,6 +607,26 @@ func (r *SubmissionRepositoryImpl) ListHeldIDs(ctx context.Context) ([]string, e
 	}
 	defer rows.Close()
 	return scanIDs(rows, "held")
+}
+
+// ReplyBlockedIDs returns which of the given submissions are held or hard-bounced.
+func (r *SubmissionRepositoryImpl) ReplyBlockedIDs(ctx context.Context, submissionIDs []string) ([]string, error) {
+	ids := nonEmpty(submissionIDs)
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	in := placeholderList(len(ids))
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	rows, err := r.db.QueryContext(ctx, fmt.Sprintf(
+		`SELECT id FROM submissions WHERE id IN (%s) AND (on_hold = 1 OR delivery_failed = 1)`, in), args...)
+	if err != nil {
+		return nil, fmt.Errorf("query reply-blocked: %w", err)
+	}
+	defer rows.Close()
+	return scanIDs(rows, "reply-blocked id")
 }
 
 // SubmissionIDsByMessageIDs resolves inbound Message-IDs to distinct submission ids.
@@ -618,6 +717,10 @@ func upsertSubmissionRow(ctx context.Context, tx *sql.Tx, s *model.Submission) e
 	if s.LastEscalatedAt != nil {
 		lastEscalated = sql.NullInt64{Int64: s.LastEscalatedAt.UnixNano(), Valid: true}
 	}
+	var completedAt sql.NullInt64
+	if s.CompletedAt != nil {
+		completedAt = sql.NullInt64{Int64: s.CompletedAt.UnixNano(), Valid: true}
+	}
 	// last_reply_at and on_hold are written on insert but never on conflict:
 	// SetLastReplyAt and the Hold-folder reconcile own them, so a re-upsert can't
 	// clobber a concurrent send's timestamp or a human's hold toggle.
@@ -626,8 +729,9 @@ func upsertSubmissionRow(ctx context.Context, tx *sql.Tx, s *model.Submission) e
 			id, policy_type, state, subject_line, from_address, from_name,
 			thread_key, created_at, updated_at, last_action_at,
 			escalated_at, missing_items, last_reply_at, needs_review,
-			named_insured, effective_date, on_hold, delivery_failed, last_escalated_at
-		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+			named_insured, effective_date, on_hold, delivery_failed, last_escalated_at,
+			completed_at, last_reply_hash, policy_clarify_asks
+		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 			policy_type=excluded.policy_type,
 			state=excluded.state,
@@ -643,11 +747,15 @@ func upsertSubmissionRow(ctx context.Context, tx *sql.Tx, s *model.Submission) e
 			named_insured=excluded.named_insured,
 			effective_date=excluded.effective_date,
 			delivery_failed=excluded.delivery_failed,
-			last_escalated_at=excluded.last_escalated_at`,
+			last_escalated_at=excluded.last_escalated_at,
+			completed_at=excluded.completed_at,
+			last_reply_hash=excluded.last_reply_hash,
+			policy_clarify_asks=excluded.policy_clarify_asks`,
 		s.ID, s.PolicyType, string(s.State), s.SubjectLine, s.FromAddress, s.FromName,
 		s.ThreadKey, nanoOrNow(s.CreatedAt), nanoOrNow(s.UpdatedAt), nanoOrNow(s.LastActionAt),
 		escalatedAt, string(missingJSON), nanoOrZero(s.LastReplyAt), boolToInt(s.NeedsReview),
 		s.NamedInsured, effectiveDate, boolToInt(s.OnHold), boolToInt(s.DeliveryFailed), lastEscalated,
+		completedAt, s.LastReplyHash, s.PolicyClarifyAsks,
 	)
 	if err != nil {
 		return fmt.Errorf("upsert submission: %w", err)
@@ -754,12 +862,14 @@ func scanSubmission(s scanner, log *logrus.Entry) (*model.Submission, error) {
 		onHold         int
 		deliveryFailed int
 		lastEscalated  sql.NullInt64
+		completedAt    sql.NullInt64
 	)
 	err := s.Scan(
 		&sub.ID, &sub.PolicyType, &stateStr, &sub.SubjectLine, &sub.FromAddress, &sub.FromName,
 		&sub.ThreadKey, &createdAt, &updatedAt, &lastAction,
 		&escalatedAt, &missingJSON, &lastReply, &needsReview,
 		&sub.NamedInsured, &effectiveDate, &onHold, &deliveryFailed, &lastEscalated,
+		&completedAt, &sub.LastReplyHash, &sub.PolicyClarifyAsks,
 	)
 	if err != nil {
 		return nil, err
@@ -775,6 +885,10 @@ func scanSubmission(s scanner, log *logrus.Entry) (*model.Submission, error) {
 	if lastEscalated.Valid {
 		t := time.Unix(0, lastEscalated.Int64).UTC()
 		sub.LastEscalatedAt = &t
+	}
+	if completedAt.Valid {
+		t := time.Unix(0, completedAt.Int64).UTC()
+		sub.CompletedAt = &t
 	}
 	sub.CreatedAt = time.Unix(0, createdAt).UTC()
 	sub.UpdatedAt = time.Unix(0, updatedAt).UTC()

@@ -6,7 +6,6 @@ required_items:
     match:
       filename_patterns:
         - "*ACORD*130*"
-        - "*acord*130*"
         - "*workers*comp*application*"
       content_keywords:
         - "Workers Compensation Application"

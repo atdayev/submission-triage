@@ -51,6 +51,7 @@ type imapMailbox struct {
 	filer        filer
 	folderPrefix string
 	delim        string
+	uidValidity  uint32
 	warnNoMove   func() // called once per process when the server can't MOVE or UID EXPUNGE
 }
 
@@ -79,10 +80,12 @@ func dialIMAP(cfg config.IMAPConfig, auth Authenticator, log *logrus.Entry) func
 			_ = mb.Close()
 			return nil, fmt.Errorf("imap auth: %w", err)
 		}
-		if _, err := c.Select(cfg.Mailbox, nil).Wait(); err != nil {
+		sel, err := c.Select(cfg.Mailbox, nil).Wait()
+		if err != nil {
 			_ = mb.Close()
 			return nil, fmt.Errorf("imap select %q: %w", cfg.Mailbox, err)
 		}
+		mb.uidValidity = sel.UIDValidity
 		// refresh caps post-auth: MOVE/UIDPLUS are often advertised only after login
 		if _, err := c.Capability().Wait(); err != nil {
 			log.WithError(err).Debug("imap: capability refresh failed; using cached caps")
@@ -114,14 +117,18 @@ func (m *imapMailbox) closeOnCancel(ctx context.Context) {
 	}
 }
 
-// FetchUnseen returns unseen messages, size-filtered and capped by limit.
-func (m *imapMailbox) FetchUnseen(ctx context.Context, limit int) ([]rawMessage, error) {
+// FetchUnseen returns unseen messages delivered at or after since, size-filtered
+// and capped by limit. The cutoff is applied server-side so a mailbox with years of
+// history isn't pulled over the wire only to be discarded.
+func (m *imapMailbox) FetchUnseen(ctx context.Context, limit int, since time.Time) ([]rawMessage, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	data, err := m.c.UIDSearch(&goimap.SearchCriteria{
-		NotFlag: []goimap.Flag{goimap.FlagSeen},
-	}, nil).Wait()
+	criteria := &goimap.SearchCriteria{NotFlag: []goimap.Flag{goimap.FlagSeen}}
+	if !since.IsZero() {
+		criteria.Since = since.UTC()
+	}
+	data, err := m.c.UIDSearch(criteria, nil).Wait()
 	if err != nil {
 		return nil, fmt.Errorf("imap search: %w", err)
 	}
@@ -198,6 +205,9 @@ func (m *imapMailbox) underCap(ctx context.Context, uids []goimap.UID) []goimap.
 	}
 	return keep
 }
+
+// UIDValidity reports the selected mailbox's UID generation, read at SELECT.
+func (m *imapMailbox) UIDValidity() uint32 { return m.uidValidity }
 
 func (m *imapMailbox) MarkSeen(_ context.Context, uid uint32) error {
 	return m.c.Store(goimap.UIDSetNum(goimap.UID(uid)), &goimap.StoreFlags{
