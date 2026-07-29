@@ -3,6 +3,7 @@ package imap
 import (
 	"bytes"
 	"context"
+	"errors"
 	"sync/atomic"
 	"time"
 
@@ -26,12 +27,17 @@ type rawMessage struct {
 
 // mailbox is what the poller needs from IMAP; client.go has the real adapter.
 type mailbox interface {
-	FetchUnseen(ctx context.Context, limit int) ([]rawMessage, error)
+	// FetchUnseen returns unseen messages delivered at or after since (zero for all),
+	// capped at limit.
+	FetchUnseen(ctx context.Context, limit int, since time.Time) ([]rawMessage, error)
 	MarkSeen(ctx context.Context, uid uint32) error
 	Flag(ctx context.Context, uid uint32) error
 	File(ctx context.Context, uid uint32, folder string) error
 	// ScanFolder returns the Message-IDs in folder (read-only), capped at limit.
 	ScanFolder(ctx context.Context, folder string, limit int) ([]string, error)
+	// UIDValidity identifies the mailbox's UID generation; a UID means nothing
+	// without it, so per-message state must be keyed on both.
+	UIDValidity() uint32
 	Close() error
 }
 
@@ -42,6 +48,14 @@ type ingester interface {
 	ReconcileHold(ctx context.Context, messageIDs []string) error
 }
 
+// ingestControl is the poller's durable state: the ingest cutoff and the per-message
+// failure counts that quarantine a message no retry will ever get through.
+type ingestControl interface {
+	FirstBootAt(ctx context.Context, now time.Time) (time.Time, error)
+	RecordFailure(ctx context.Context, uidValidity, uid uint32, reason string, now time.Time) (int, error)
+	ClearFailure(ctx context.Context, uidValidity, uid uint32) error
+}
+
 // statusFolders maps a submission's post-ingest status to its mailbox folder.
 type statusFolders struct {
 	complete, awaiting, escalated, unknownPolicy string
@@ -49,28 +63,37 @@ type statusFolders struct {
 
 // Poller polls an IMAP inbox for new mail and ingests it.
 type Poller struct {
-	dial          func(ctx context.Context) (mailbox, error)
-	ingest        ingester
-	interval      time.Duration
-	batchLimit    int
-	mailbox       string
-	fileByStatus  bool
-	folders       statusFolders
-	holdFolder    string
-	holdScanLimit int
-	log           *logrus.Entry
+	dial             func(ctx context.Context) (mailbox, error)
+	ingest           ingester
+	control          ingestControl
+	interval         time.Duration
+	timeout          time.Duration
+	batchLimit       int
+	maxAttempts      int
+	mailbox          string
+	fileByStatus     bool
+	folders          statusFolders
+	holdFolder       string
+	holdScanLimit    int
+	configuredCutoff time.Time // IMAP_IGNORE_BEFORE; zero falls back to first boot
+	cutoff           time.Time // resolved once at Run
+	log              *logrus.Entry
 
 	lastPoll atomic.Int64 // unix nanos of the last successful fetch cycle
 	failures atomic.Int64 // consecutive dial/fetch failures
 }
 
 // NewPoller returns a Poller configured from cfg, authenticating with auth.
-func NewPoller(cfg config.IMAPConfig, auth Authenticator, svc ingester, log *logrus.Entry) *Poller {
+func NewPoller(cfg config.IMAPConfig, auth Authenticator, svc ingester, control ingestControl, log *logrus.Entry) *Poller {
+	cutoff, _, _ := cfg.IgnoreBeforeTime() // validated at config load
 	p := &Poller{
 		dial:         dialIMAP(cfg, auth, log),
 		ingest:       svc,
+		control:      control,
 		interval:     cfg.PollInterval(),
+		timeout:      cfg.PollTimeout(),
 		batchLimit:   defaultBatchLimit,
+		maxAttempts:  cfg.PollMaxAttempts,
 		mailbox:      cfg.Mailbox,
 		fileByStatus: cfg.FileByStatus,
 		folders: statusFolders{
@@ -79,9 +102,10 @@ func NewPoller(cfg config.IMAPConfig, auth Authenticator, svc ingester, log *log
 			escalated:     cfg.FolderEscalated,
 			unknownPolicy: cfg.FolderUnknownPolicy,
 		},
-		holdFolder:    cfg.FolderHold,
-		holdScanLimit: cfg.HoldScanLimit,
-		log:           log,
+		holdFolder:       cfg.FolderHold,
+		holdScanLimit:    cfg.HoldScanLimit,
+		configuredCutoff: cutoff,
+		log:              log,
 	}
 	// seed with startup time so the first interval after boot isn't reported stale
 	p.lastPoll.Store(time.Now().UnixNano())
@@ -103,9 +127,11 @@ func (p *Poller) recordFailure() int64 { return p.failures.Add(1) }
 
 // Run polls until ctx is cancelled, fetching once at startup then per interval.
 func (p *Poller) Run(ctx context.Context) {
+	p.cutoff = p.resolveCutoff(ctx)
 	p.log.WithFields(logrus.Fields{
 		"interval": p.interval.String(),
 		"mailbox":  p.mailbox,
+		"cutoff":   p.cutoff.Format(time.RFC3339),
 	}).Info("imap poller started")
 
 	p.pollOnce(ctx) // catch up at startup rather than waiting a full interval
@@ -122,9 +148,32 @@ func (p *Poller) Run(ctx context.Context) {
 	}
 }
 
+// resolveCutoff returns the timestamp below which mail is ignored. Configured value
+// wins; otherwise the first-boot timestamp is read from the database. It must be
+// persisted rather than derived at boot — deriving it would make a restart after a
+// week of downtime skip a week of real mail.
+func (p *Poller) resolveCutoff(ctx context.Context) time.Time {
+	if !p.configuredCutoff.IsZero() {
+		return p.configuredCutoff
+	}
+	t, err := p.control.FirstBootAt(ctx, time.Now())
+	if err != nil {
+		p.log.WithError(err).Error("could not resolve the first-boot ingest cutoff; every unseen message will be ingested")
+		return time.Time{}
+	}
+	return t
+}
+
 func (p *Poller) pollOnce(ctx context.Context) {
 	if ctx.Err() != nil {
 		return // shutting down: don't open a fresh connection
+	}
+	// the dial timeout covers TCP connect only, not the handshake, LOGIN, SELECT, or
+	// FETCH; without this a server that accepts then stalls blocks every later tick
+	if p.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, p.timeout)
+		defer cancel()
 	}
 	mb, err := p.dial(ctx)
 	if err != nil {
@@ -133,7 +182,7 @@ func (p *Poller) pollOnce(ctx context.Context) {
 	}
 	defer mb.Close()
 
-	msgs, err := mb.FetchUnseen(ctx, p.batchLimit)
+	msgs, err := mb.FetchUnseen(ctx, p.batchLimit, p.cutoff)
 	if err != nil {
 		p.log.WithError(err).WithField("consecutive_failures", p.recordFailure()).Warn("imap fetch failed")
 		return
@@ -192,7 +241,7 @@ func (p *Poller) process(ctx context.Context, mb mailbox, m rawMessage) {
 
 	res, err := p.ingest.IngestEmail(ctx, emailingest.Translate(payload, "imap"))
 	if err != nil {
-		log.WithError(err).Warn("imap: ingest failed; leaving unread for retry")
+		p.handleIngestFailure(ctx, mb, m, err, log)
 		return
 	}
 	log.WithFields(logrus.Fields{
@@ -207,6 +256,10 @@ func (p *Poller) process(ctx context.Context, mb mailbox, m rawMessage) {
 	if err := mb.MarkSeen(ctx, m.UID); err != nil {
 		log.WithError(err).Warn("imap: mark-seen failed; leaving unread for retry")
 		return
+	}
+	// bookkeeping only, so it follows the step that actually had to happen
+	if err := p.control.ClearFailure(ctx, mb.UIDValidity(), m.UID); err != nil {
+		log.WithError(err).Debug("imap: clearing the failure count failed")
 	}
 	// flag before filing: MOVE invalidates the source UID, so flags go on the
 	// original first; a flag failure is cosmetic (status lives in the DB + digest)
@@ -225,6 +278,29 @@ func (p *Poller) process(ctx context.Context, mb mailbox, m rawMessage) {
 		log.WithError(err).WithField("folder", folder).Warn("imap: file failed; message stays in inbox")
 		p.ingest.AuditFileFailed(ctx, res.SubmissionID, folder, err.Error())
 	}
+}
+
+// handleIngestFailure decides whether a failed message is retried or quarantined.
+// Leaving it unread suits a transient failure and is ruinous for a deterministic one:
+// the message would reprocess, and re-pay its LLM cost, every tick forever.
+func (p *Poller) handleIngestFailure(ctx context.Context, mb mailbox, m rawMessage, err error, log *logrus.Entry) {
+	if errors.Is(err, model.ErrInvalidTransition) {
+		log.WithError(err).Error("imap: message cannot be ingested in its submission's state; marking read")
+		_ = mb.MarkSeen(ctx, m.UID)
+		return
+	}
+	attempts, rerr := p.control.RecordFailure(ctx, mb.UIDValidity(), m.UID, err.Error(), time.Now())
+	if rerr != nil {
+		log.WithError(rerr).Warn("imap: recording the ingest failure failed; leaving unread for retry")
+		return
+	}
+	if p.maxAttempts > 0 && attempts >= p.maxAttempts {
+		log.WithError(err).WithField("attempts", attempts).
+			Error("imap: ingest failed repeatedly; quarantining the message so the poller can move on")
+		_ = mb.MarkSeen(ctx, m.UID)
+		return
+	}
+	log.WithError(err).WithField("attempts", attempts).Warn("imap: ingest failed; leaving unread for retry")
 }
 
 // folderFor returns the status folder for the just-processed message, or "" to

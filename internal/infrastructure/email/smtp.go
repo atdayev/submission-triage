@@ -48,8 +48,7 @@ type SMTPSender struct {
 	retryBase     time.Duration
 }
 
-// NewSMTPSender returns an SMTPSender using the real network send. auth is nil
-// for password mode (PlainAuth from cfg) or an XOAUTH2 mechanism for oauth mode.
+// NewSMTPSender returns an SMTPSender using the real network send.
 func NewSMTPSender(cfg config.SMTPConfig, auth AuthMech, retryAttempts int, retryBase time.Duration, log *logrus.Entry) *SMTPSender {
 	return &SMTPSender{
 		cfg: cfg,
@@ -98,7 +97,6 @@ func (a xoauth2Auth) Next(fromServer []byte, more bool) ([]byte, error) {
 	return nil, nil
 }
 
-// Name reports the outbound channel.
 func (s *SMTPSender) Name() string { return "smtp" }
 
 // SendThreadedReply sends r over SMTP with retries and returns the Message-ID.
@@ -217,7 +215,6 @@ func truncateRunes(s string, max int) string {
 	return string(rs[:max])
 }
 
-// isLocalhost reports loopback hosts.
 func isLocalhost(host string) bool {
 	switch strings.ToLower(host) {
 	case "localhost", "127.0.0.1", "::1":
@@ -233,8 +230,7 @@ func domainOf(addr string) string {
 	return "localhost"
 }
 
-// replyMessageID derives a stable Message-ID local part from the reply's
-// identity so a redelivery of the same reply carries the same id.
+// replyMessageID derives a stable Message-ID local part from the reply's identity.
 func replyMessageID(r model.Reply) string {
 	sum := sha256.Sum256([]byte(r.SubmissionID + "\x00" + r.ToAddress + "\x00" + r.Subject + "\x00" + r.BodyText))
 	return hex.EncodeToString(sum[:16])

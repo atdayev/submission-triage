@@ -62,6 +62,64 @@ func (_m *AuditRepository) ListBySubmission(ctx context.Context, submissionID st
 	return r0, r1
 }
 
+// ListSubmissionIDsByEvent provides a mock function with given fields: ctx, eventType, sinceUnixNano
+func (_m *AuditRepository) ListSubmissionIDsByEvent(ctx context.Context, eventType model.EventType, sinceUnixNano int64) ([]string, error) {
+	ret := _m.Called(ctx, eventType, sinceUnixNano)
+
+	if len(ret) == 0 {
+		panic("no return value specified for ListSubmissionIDsByEvent")
+	}
+
+	var r0 []string
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context, model.EventType, int64) ([]string, error)); ok {
+		return rf(ctx, eventType, sinceUnixNano)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context, model.EventType, int64) []string); ok {
+		r0 = rf(ctx, eventType, sinceUnixNano)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).([]string)
+		}
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context, model.EventType, int64) error); ok {
+		r1 = rf(ctx, eventType, sinceUnixNano)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
+// Prune provides a mock function with given fields: ctx, olderThanUnixNano
+func (_m *AuditRepository) Prune(ctx context.Context, olderThanUnixNano int64) (int64, error) {
+	ret := _m.Called(ctx, olderThanUnixNano)
+
+	if len(ret) == 0 {
+		panic("no return value specified for Prune")
+	}
+
+	var r0 int64
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context, int64) (int64, error)); ok {
+		return rf(ctx, olderThanUnixNano)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context, int64) int64); ok {
+		r0 = rf(ctx, olderThanUnixNano)
+	} else {
+		r0 = ret.Get(0).(int64)
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context, int64) error); ok {
+		r1 = rf(ctx, olderThanUnixNano)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
 // NewAuditRepository creates a new instance of AuditRepository. It also registers a testing interface on the mock and a cleanup function to assert the mocks expectations.
 // The first argument is typically a *testing.T value.
 func NewAuditRepository(t interface {

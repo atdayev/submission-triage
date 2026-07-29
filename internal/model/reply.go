@@ -1,7 +1,10 @@
 package model
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -15,15 +18,40 @@ type Reply struct {
 	References   []string
 }
 
+// ReplyKind is which of the three replies a submission would receive.
+type ReplyKind string
+
+const (
+	ReplyKindPolicyUnknown ReplyKind = "policy_unknown"
+	ReplyKindCompletion    ReplyKind = "completion"
+	ReplyKindMissingItems  ReplyKind = "missing_items"
+)
+
+// ReplyFingerprint hashes what a reply would tell the broker: its kind plus the
+// sorted item ids and reason codes behind it. An identical fingerprint means the
+// reply would repeat itself.
+func ReplyFingerprint(kind ReplyKind, items []MissingItem) string {
+	keys := make([]string, 0, len(items))
+	for _, m := range items {
+		keys = append(keys, m.ID+"\x1f"+string(m.Code))
+	}
+	sort.Strings(keys)
+	h := sha256.New()
+	h.Write([]byte(kind))
+	for _, k := range keys {
+		h.Write([]byte{0})
+		h.Write([]byte(k))
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
 const (
 	missingAttachmentLine = "We didn't find any attachments on this message. If you sent a download link, could you attach the files directly instead?"
 	encryptedLineFmt      = "We received %s but it's password-protected and we can't open it. Could you resend it unlocked, or send the password separately?"
 )
 
-// BuildMissingItemsReply lists the outstanding documents for the sender, given
-// only broker-actionable items (unreadable/low-confidence are handled agency-side).
-// A missing-attachment signal supersedes the list — the broker referenced files but
-// sent none, so asking for specific documents would read as ignoring them; each
+// BuildMissingItemsReply lists the outstanding documents for the sender, given only
+// broker-actionable items. A missing-attachment signal supersedes the list; each
 // password-protected item gets its own resend-unlocked ask.
 func BuildMissingItemsReply(s Submission, missing []MissingItem, lastInbound Email) Reply {
 	var b strings.Builder
@@ -158,8 +186,7 @@ var roleLocalParts = map[string]bool{
 	"support":     true,
 }
 
-// usableGreeting reports whether an email local-part reads as a first name,
-// rejecting digit-bearing, very short, and role addresses.
+// usableGreeting reports whether an email local-part reads as a first name.
 func usableGreeting(local string) bool {
 	if len(local) < 3 {
 		return false

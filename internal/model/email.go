@@ -20,8 +20,7 @@ type Email struct {
 	References      []string
 	FromAddress     string
 	FromName        string
-	// ReplyTo is the address the producer wants replies at (assistants/shared
-	// inboxes send From, own the file on Reply-To); empty when absent.
+	// ReplyTo is the address the producer wants replies at; empty when absent.
 	ReplyTo       string
 	ToAddresses   []string
 	Subject       string

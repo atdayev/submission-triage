@@ -8,6 +8,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/mock"
 
+	"github.com/atdayev/submission-triage/internal/config"
 	"github.com/atdayev/submission-triage/internal/model"
 	"github.com/atdayev/submission-triage/internal/repository"
 	repomocks "github.com/atdayev/submission-triage/internal/repository/mocks"
@@ -15,7 +16,10 @@ import (
 
 func outboxSvc(ob repository.OutboxRepository, mail *fakeMail, subs *repomocks.SubmissionRepository, aud *repomocks.AuditRepository, maxAttempts int) *SubmissionsService {
 	subs.On("SetLastReplyAt", mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+	subs.On("ReplyBlockedIDs", mock.Anything, mock.Anything).Return(nil, nil).Maybe()
+	subs.On("ClearReplyHash", mock.Anything, mock.Anything).Return(nil).Maybe()
 	return &SubmissionsService{
+		cfg:               &config.Config{},
 		repo:              &repository.Repository{Submissions: subs, Audit: aud, Outbox: ob},
 		mail:              mail,
 		now:               time.Now,
@@ -202,7 +206,15 @@ func TestRedeliverOutbox_SkipsInFlight(t *testing.T) {
 	e := &model.OutboxEntry{SubmissionID: "s1", Reply: model.Reply{ToAddress: "broker@x"}}
 	_ = ob.Enqueue(ctx, e)
 
-	svc.claimDispatch(e.ID) // online worker is sending it
+	// the claim is keyed on the submission, not the outbox row: the submission id is
+	// the only one of the two known before the row is committed, which is where the
+	// online path has to claim to stay ahead of the sweeper
+	if !svc.claimDispatch(e.SubmissionID) { // online worker is sending it
+		t.Fatal("claim should succeed on an unclaimed submission")
+	}
+	if svc.claimDispatch(e.SubmissionID) {
+		t.Error("a second claim on the same submission must fail; it is what stops two senders")
+	}
 	if err := svc.RedeliverOutbox(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -210,7 +222,7 @@ func TestRedeliverOutbox_SkipsInFlight(t *testing.T) {
 		t.Fatalf("sweeper double-sent an in-flight entry: %d", mail.sentCount())
 	}
 
-	svc.releaseDispatch(e.ID) // online send finished (here, without marking sent)
+	svc.releaseDispatch(e.SubmissionID) // online send finished (here, without marking sent)
 	if err := svc.RedeliverOutbox(ctx); err != nil {
 		t.Fatal(err)
 	}

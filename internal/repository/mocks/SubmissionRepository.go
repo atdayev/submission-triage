@@ -16,6 +16,52 @@ type SubmissionRepository struct {
 	mock.Mock
 }
 
+// ClearExtractedTextForClosed provides a mock function with given fields: ctx, closedBeforeUnixNano
+func (_m *SubmissionRepository) ClearExtractedTextForClosed(ctx context.Context, closedBeforeUnixNano int64) (int64, error) {
+	ret := _m.Called(ctx, closedBeforeUnixNano)
+
+	if len(ret) == 0 {
+		panic("no return value specified for ClearExtractedTextForClosed")
+	}
+
+	var r0 int64
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context, int64) (int64, error)); ok {
+		return rf(ctx, closedBeforeUnixNano)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context, int64) int64); ok {
+		r0 = rf(ctx, closedBeforeUnixNano)
+	} else {
+		r0 = ret.Get(0).(int64)
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context, int64) error); ok {
+		r1 = rf(ctx, closedBeforeUnixNano)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
+// ClearReplyHash provides a mock function with given fields: ctx, submissionID
+func (_m *SubmissionRepository) ClearReplyHash(ctx context.Context, submissionID string) error {
+	ret := _m.Called(ctx, submissionID)
+
+	if len(ret) == 0 {
+		panic("no return value specified for ClearReplyHash")
+	}
+
+	var r0 error
+	if rf, ok := ret.Get(0).(func(context.Context, string) error); ok {
+		r0 = rf(ctx, submissionID)
+	} else {
+		r0 = ret.Error(0)
+	}
+
+	return r0
+}
+
 // CountOpen provides a mock function with given fields: ctx
 func (_m *SubmissionRepository) CountOpen(ctx context.Context) (int, error) {
 	ret := _m.Called(ctx)
@@ -171,9 +217,9 @@ func (_m *SubmissionRepository) FindContentMatch(ctx context.Context, namedInsur
 	return r0, r1
 }
 
-// ListBindSoon provides a mock function with given fields: ctx, effectiveBeforeUnixNano, limit
-func (_m *SubmissionRepository) ListBindSoon(ctx context.Context, effectiveBeforeUnixNano int64, limit int) ([]model.Submission, error) {
-	ret := _m.Called(ctx, effectiveBeforeUnixNano, limit)
+// ListBindSoon provides a mock function with given fields: ctx, effectiveAfterUnixNano, effectiveBeforeUnixNano, limit
+func (_m *SubmissionRepository) ListBindSoon(ctx context.Context, effectiveAfterUnixNano int64, effectiveBeforeUnixNano int64, limit int) ([]model.Submission, error) {
+	ret := _m.Called(ctx, effectiveAfterUnixNano, effectiveBeforeUnixNano, limit)
 
 	if len(ret) == 0 {
 		panic("no return value specified for ListBindSoon")
@@ -181,19 +227,19 @@ func (_m *SubmissionRepository) ListBindSoon(ctx context.Context, effectiveBefor
 
 	var r0 []model.Submission
 	var r1 error
-	if rf, ok := ret.Get(0).(func(context.Context, int64, int) ([]model.Submission, error)); ok {
-		return rf(ctx, effectiveBeforeUnixNano, limit)
+	if rf, ok := ret.Get(0).(func(context.Context, int64, int64, int) ([]model.Submission, error)); ok {
+		return rf(ctx, effectiveAfterUnixNano, effectiveBeforeUnixNano, limit)
 	}
-	if rf, ok := ret.Get(0).(func(context.Context, int64, int) []model.Submission); ok {
-		r0 = rf(ctx, effectiveBeforeUnixNano, limit)
+	if rf, ok := ret.Get(0).(func(context.Context, int64, int64, int) []model.Submission); ok {
+		r0 = rf(ctx, effectiveAfterUnixNano, effectiveBeforeUnixNano, limit)
 	} else {
 		if ret.Get(0) != nil {
 			r0 = ret.Get(0).([]model.Submission)
 		}
 	}
 
-	if rf, ok := ret.Get(1).(func(context.Context, int64, int) error); ok {
-		r1 = rf(ctx, effectiveBeforeUnixNano, limit)
+	if rf, ok := ret.Get(1).(func(context.Context, int64, int64, int) error); ok {
+		r1 = rf(ctx, effectiveAfterUnixNano, effectiveBeforeUnixNano, limit)
 	} else {
 		r1 = ret.Error(1)
 	}
@@ -344,6 +390,66 @@ func (_m *SubmissionRepository) ListStale(ctx context.Context, olderThanUnixNano
 
 	if rf, ok := ret.Get(1).(func(context.Context, int64, int) error); ok {
 		r1 = rf(ctx, olderThanUnixNano, limit)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
+// ListStalledBefore provides a mock function with given fields: ctx, olderThanUnixNano, limit
+func (_m *SubmissionRepository) ListStalledBefore(ctx context.Context, olderThanUnixNano int64, limit int) ([]model.Submission, error) {
+	ret := _m.Called(ctx, olderThanUnixNano, limit)
+
+	if len(ret) == 0 {
+		panic("no return value specified for ListStalledBefore")
+	}
+
+	var r0 []model.Submission
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context, int64, int) ([]model.Submission, error)); ok {
+		return rf(ctx, olderThanUnixNano, limit)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context, int64, int) []model.Submission); ok {
+		r0 = rf(ctx, olderThanUnixNano, limit)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).([]model.Submission)
+		}
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context, int64, int) error); ok {
+		r1 = rf(ctx, olderThanUnixNano, limit)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
+// ReplyBlockedIDs provides a mock function with given fields: ctx, submissionIDs
+func (_m *SubmissionRepository) ReplyBlockedIDs(ctx context.Context, submissionIDs []string) ([]string, error) {
+	ret := _m.Called(ctx, submissionIDs)
+
+	if len(ret) == 0 {
+		panic("no return value specified for ReplyBlockedIDs")
+	}
+
+	var r0 []string
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context, []string) ([]string, error)); ok {
+		return rf(ctx, submissionIDs)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context, []string) []string); ok {
+		r0 = rf(ctx, submissionIDs)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).([]string)
+		}
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context, []string) error); ok {
+		r1 = rf(ctx, submissionIDs)
 	} else {
 		r1 = ret.Error(1)
 	}

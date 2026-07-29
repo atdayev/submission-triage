@@ -68,6 +68,11 @@ func Translate(p emlparse.Payload, source string) service.IngestRequest {
 	if p.Bounce {
 		req.Bounce = true
 		req.BouncePermanent = p.BouncePermanent
+		// many DSNs omit In-Reply-To; the embedded copy of the failed message is then
+		// the only thing tying the bounce back to the submission that sent it
+		if id := trimAngle(p.BouncedMessageID); id != "" {
+			req.References = append(req.References, id)
+		}
 	} else if detectAutoSubmitted(autoHeaders) {
 		req.AutoSubmitted = true
 		req.AutoResponseHeaders = autoHeaders

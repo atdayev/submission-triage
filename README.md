@@ -1,59 +1,139 @@
 # submission-triage
 
-An open-source Go service that watches an insurance agency's submission inbox,
-checks each incoming submission against a per-policy-type requirements
-checklist, and replies in-thread with exactly what's missing. It runs against
-any Gmail inbox with an App Password, stores everything in a single SQLite
-file, and ships as one static binary.
+An open-source service that watches an insurance agency's submission inbox,
+checks every incoming submission against a checklist for that line of business,
+and replies in-thread with exactly what's missing.
+
+It runs against a normal Gmail mailbox, stores everything in a single file, and
+ships as one binary with nothing else to install.
 
 ## Why
 
-Commercial submissions arrive incomplete. A broker emails over an ACORD
-application but forgets the loss runs, or sends loss runs covering three years
-when the carrier wants five. Today a human notices that — eventually — and
-emails back to ask. Until they do, the file sits, the quote slips, and nobody
-is sure whose turn it is.
+Commercial submissions arrive incomplete. A broker emails an ACORD application
+but forgets the loss runs, or sends loss runs covering three years when the
+carrier wants five. Today a human notices that — eventually — and emails back to
+ask. Until they do, the file sits, the quote slips, and nobody is sure whose
+turn it is.
 
-submission-triage does that first pass automatically and immediately: it reads
-the attachments, compares them to what the line of business actually requires,
-and sends a clear "we still need X" reply on the same thread within seconds —
-so the back-and-forth starts now instead of whenever someone gets to it.
+submission-triage does that first pass immediately: it reads the attachments,
+compares them to what the line of business actually requires, and sends a clear
+"we still need X" reply on the same thread within seconds. The back-and-forth
+starts now instead of whenever someone gets to it.
 
-## Status
+## What a broker sees
 
-Five lines of business ship today, each with its own checklist: **Commercial
-General Liability, Business Owners Policy (BOP), Workers' Compensation,
-Commercial Property, and Cyber Liability**.
+When something is missing, they get a reply on their own thread:
+
+```text
+Subject: Re: New CGL submission - Oakview Construction
+
+Hi Diane,
+
+Thanks for the submission. To finish the file we still need:
+
+  - Loss runs for the past 5 years
+  - Schedule of insured locations
+
+Reply to this thread with the documents and we'll continue.
+```
+
+When they send the rest, the thread closes out:
+
+```text
+Hi Diane,
+
+Thanks — everything on our checklist for this submission is now accounted for.
+Nothing further is needed from you at this time.
+```
+
+Two variations show up as needed: asking which line of business it is when the
+subject doesn't say, and asking for a file to be resent when it arrived
+password-protected or as a download link instead of an attachment. If a document
+arrives but falls short of a rule, the bullet says so — *"Loss runs for the past
+5 years (covers only 3 years, need at least 5)"*.
+
+Replies are plain text with no footer or disclaimer, go to the sender's Reply-To
+address if they set one, never copy the original CC list, and are marked
+auto-generated so other autoresponders stay quiet.
+
+The service never speaks for the agency. It reports what it can and can't see,
+and makes no promise about what happens next — no "moving to underwriting", no
+"you'll hear back shortly". That's enforced by a test, not just convention.
+
+## What the agency sees
+
+**The mailbox organizes itself.** Each message is filed into a folder as it's
+processed:
+
+| Folder | What's in it |
+|---|---|
+| `Triage/Ready for Underwriting` | Everything on the checklist is accounted for |
+| `Triage/Waiting on Broker` | A reply went out; waiting on documents |
+| `Triage/Escalated` | The broker went quiet, or the bind date is close |
+| `Triage/Unknown Policy` | The line of business couldn't be determined |
+| `Triage/Hold` | Paused by a person — see below |
+
+Anything a human should look at is **starred** — usually a document that arrived
+as an unreadable scan, or one the service couldn't confidently identify. Those
+are never mentioned to the broker; they're the agency's to resolve.
+
+**Drag a message into `Triage/Hold` to pause it.** No replies, no escalation, no
+auto-close, for as long as it sits there. Drag it out to resume. That's the whole
+gesture — the folder *is* the switch.
+
+**A daily digest** lands in the agency's inbox with every open submission
+grouped by what needs attention. It's skipped entirely on a day with nothing
+open, so an empty one never trains people to ignore it:
+
+```
+1 submission(s) need review (marked below).
+
+Open submissions:
+
+Escalated — broker went quiet (1):
+  - Oakview Construction | from diane@acme-broker.com | age 5d | idle 4d | binds in 3d
+      Loss runs for the past 5 years: document not provided
+
+Awaiting the broker (1):
+  - Riverbend Diner | from sam@broker.example | age 2h | idle 1h [needs review]
+      Schedule of insured locations: document not provided
+```
+
+## Lines of business
+
+Five ship today, each with its own checklist you can edit:
+
+**Commercial General Liability**, **Business Owners Policy**, **Workers
+Compensation**, **Commercial Property**, and **Cyber Liability**.
 
 ## How it works
 
-For each unread message in the watched mailbox:
+Every 30 seconds it checks the mailbox for unread mail. For each message it:
 
-1. **Poll** the inbox over IMAP (every `IMAP_POLL_INTERVAL_SECONDS`).
-2. **Parse** the email and its attachments (PDF, DOCX, XLSX, CSV, plain text).
-3. **Infer the policy type** from the subject line, then **classify** each
-   attachment against that checklist — filename/keyword heuristics first,
-   falling back to **Claude Haiku 4.5** only when the heuristics are
-   inconclusive.
-4. **Evaluate** the checklist: which required documents are present, and do
-   declared fields meet their rule (e.g. loss runs covering ≥ 5 years).
-5. **Reply in-thread** with what's outstanding — or ask which line of business
-   it is when the subject doesn't say.
-6. **Escalate** cases that go quiet, email a periodic digest, and auto-close
-   completed ones after a quiet period.
-7. **Audit** every state change and external call to SQLite.
+1. Reads the email and its attachments — PDF, DOCX, XLSX, CSV, plain text.
+2. Works out the line of business from the subject, or from the broker's reply
+   if the subject didn't say.
+3. Identifies each attachment against that checklist, by filename and document
+   text first, asking Claude only when that's inconclusive.
+4. Checks what's still outstanding — including rules like "loss runs covering at
+   least 5 years", not just "a file called loss runs is present".
+5. Replies in-thread, files the message into its folder, and stars it if a human
+   should look.
 
-Reliability: replies are written to a durable outbox in the same transaction
-as the submission and redelivered until sent (surviving crashes and provider
-outages), or dead-lettered after repeated failures. Ingest is idempotent on a
-content hash over the Message-ID, body, and attachments, so the same message
-seen twice is processed once.
+Then, on its own schedule: it nudges submissions that go quiet, escalates ones
+whose bind date is approaching, sends the daily digest, and closes out
+submissions that have been settled for a while.
 
-## Quickstart (~15 minutes)
+If it's mid-reply when the machine restarts, the reply still goes out. If the
+same message arrives twice, it's handled once — and a broker never gets the same
+request twice in a row.
 
-You need Go 1.25+ and a Gmail account.
+## Install
 
-**1. Clone and build.**
+You need **Go 1.25+** and a Gmail account. Nothing else — no database server, no
+container runtime.
+
+**1. Build.**
 
 ```bash
 git clone https://github.com/atdayev/submission-triage.git
@@ -61,13 +141,12 @@ cd submission-triage
 make build          # produces ./bin/server
 ```
 
-**2. Get a Gmail App Password.** Enable 2-Step Verification on the account,
+**2. Get a Gmail App Password.** Turn on 2-Step Verification for the account,
 then create a 16-character App Password at
-<https://myaccount.google.com/apppasswords>. This lets the service log in over
-IMAP/SMTP without your real password.
+<https://myaccount.google.com/apppasswords>. This lets the service sign in
+without your real password, and you can revoke it independently.
 
-**3. Configure.** Copy the example env file and fill in the IMAP and SMTP
-blocks (for Gmail they're the same account and the same App Password):
+**3. Configure.** Copy the example file and fill in the mailbox:
 
 ```bash
 cp .env.example .env
@@ -77,120 +156,134 @@ cp .env.example .env
 IMAP_HOST=imap.gmail.com   IMAP_USERNAME=you@gmail.com   IMAP_PASSWORD=<app-password>
 SMTP_HOST=smtp.gmail.com   SMTP_USERNAME=you@gmail.com   SMTP_PASSWORD=<app-password>
 SMTP_FROM_ADDRESS=you@gmail.com
+DIGEST_RECIPIENT=underwriting@youragency.com
 ```
 
-**4. (Optional) Enable the LLM.** Set `ANTHROPIC_API_KEY` to let Claude resolve
-attachments the heuristics can't and read declared checklist fields. Without a
-key the service still runs; ambiguous classification falls back to the
-heuristic and field rules pass on document presence.
+Optionally set `ANTHROPIC_API_KEY` to let Claude identify attachments the
+filename and keyword rules can't place, and read values like "years covered" out
+of a document. Without a key it still runs — identification falls back to
+filename and keyword matching, and rules like the 5-year one pass as long as the
+document is there.
 
-**5. Start it.**
+**⚠️ If the mailbox already has mail in it, set `IMAP_IGNORE_BEFORE` too** (see
+[First week](#first-week)). Otherwise the first run treats every old unread
+email as a new submission and replies to all of them.
+
+**4. Run it.**
 
 ```bash
-make run            # build + run; or ./bin/server after make build
+make run
 ```
 
-**6. Send a test.** From another account, email the watched inbox with a
-subject naming the line of business (e.g. `New CGL submission – Acme LLC`) and
-attach an ACORD 125. Within the poll interval (default 30s) plus normal mail
-delivery, you'll get a threaded reply listing whatever the CGL checklist still
-wants. Reply with the missing documents and it continues the thread; when the
-file is complete it sends a "moving to underwriting" note.
+**5. Send a test.** From another account, email the watched inbox with a subject
+naming the line of business — `New CGL submission - Acme LLC` — and attach an
+ACORD 125. Within a minute you'll get a threaded reply listing what the CGL
+checklist still wants. Reply with those documents and the thread completes.
 
-**7. Run it in production.** Keep it always-on under a process manager — it's a
-long-lived IMAP poller and escalation worker, not a request-driven service. A
-ready systemd unit (install steps in its header) lives at
-[`deploy/systemd/submission-triage.service`](deploy/systemd/submission-triage.service).
+### Running it for real
+
+It's a long-lived mailbox watcher, not a request-driven web service, so it needs
+to stay running. A ready systemd unit with copy-paste install steps in its header
+is at [`deploy/systemd/submission-triage.service`](deploy/systemd/submission-triage.service):
+
+```bash
+sudo cp bin/server /opt/submission-triage/submission-triage
+sudo cp -r checklists migrations /opt/submission-triage/
+sudo cp .env /etc/submission-triage/env
+sudo chmod 600 /etc/submission-triage/env      # it holds the mailbox password
+sudo systemctl enable --now submission-triage
+```
+
+Logs go to `journalctl -u submission-triage -f`. `GET /health` on port 8080
+reports whether the mailbox is still reachable — point a monitor at it.
+
+If you deploy to a Google Cloud VM, `scripts/deploy.sh` cross-compiles and ships
+a new binary over your own `gcloud` credentials; configure it via
+`.deploy.env.example`.
+
+## First week
+
+Three settings exist specifically so you can point this at a real mailbox
+without it doing anything you didn't intend.
+
+| Setting | Use it to |
+|---|---|
+| `IMAP_IGNORE_BEFORE` | Ignore mail older than a date (RFC3339, e.g. `2026-01-01T00:00:00Z`). **Set this on any mailbox with history** — without it the first run replies to every old unread email. |
+| `REPLIES_ENABLED=false` | Run everything — reading, identifying, filing, starring, the digest — but send brokers nothing. Turn it on when the digest looks right. |
+| `Triage/Hold` | Pause one submission by hand, any time (drag the message into the folder). |
+
+Nothing queued while `REPLIES_ENABLED=false` is sent later when you turn replies
+back on. Those submissions appear under their own heading in the digest so you
+can pick them up deliberately.
+
+## What it costs
+
+**Claude usage** is a few tenths of a cent per submission, and only for
+attachments the filename and keyword rules can't place. `LLM_DAILY_USD_CAP`
+(default `$10.00`) is a hard ceiling per day — past it, identification falls back
+to filename matching for the rest of the day rather than spending more.
+
+**Disk** is roughly 60 KB per submission, so a busy agency at 200 submissions a
+day uses a few GB a year. Old records are pruned automatically after
+`AUDIT_RETENTION_DAYS` (default 90).
 
 ## Configuration
 
-All configuration is environment variables, loaded from `.env` at startup.
-`.env.example` documents every one; the essentials:
+Everything is environment variables, read from `.env` at startup.
+**[`.env.example`](.env.example) documents every one**, grouped and commented.
+The ones most agencies actually change:
 
-**IMAP — the inbox to watch (required).** The poller is inactive until host,
-username, and password are all set.
-
-| Variable | Purpose | Default |
+| Variable | What it does | Default |
 |---|---|---|
-| `IMAP_HOST` | IMAP server (`imap.gmail.com` for Gmail) | — (required) |
-| `IMAP_USERNAME` | Mailbox login | — (required) |
-| `IMAP_PASSWORD` | App Password | — (required) |
-| `IMAP_PORT` | IMAP port (implicit TLS) | `993` |
-| `IMAP_MAILBOX` | Folder to watch | `INBOX` |
+| `IMAP_HOST` `IMAP_USERNAME` `IMAP_PASSWORD` | The mailbox to watch | — required |
+| `SMTP_HOST` `SMTP_USERNAME` `SMTP_PASSWORD` `SMTP_FROM_ADDRESS` | Where replies come from | — required |
+| `DIGEST_RECIPIENT` | Who gets the daily digest. Blank means no digest — the folders still organize, but nobody is told anything | — off if blank |
+| `IMAP_IGNORE_BEFORE` | Ignore mail older than this date | first run |
+| `REPLIES_ENABLED` | `false` to run without emailing brokers | `true` |
+| `ANTHROPIC_API_KEY` | Enables Claude-assisted identification | — off if blank |
+| `LLM_DAILY_USD_CAP` | Daily spend ceiling | `10.00` |
 | `IMAP_POLL_INTERVAL_SECONDS` | How often to check for mail | `30` |
-| `IMAP_MAX_MESSAGE_MB` | Skip messages larger than this (logged once, marked read) | `32` |
+| `ESCALATION_THRESHOLD_HOURS` | Quiet time before a submission is escalated | `72` |
+| `DIGEST_INTERVAL_HOURS` | How often the digest goes out | `24` |
+| `IMAP_MAILBOX` | Which folder to watch | `INBOX` |
+| `IMAP_FOLDER_PREFIX` | Prefix for the status folders | `Triage` |
 
-**SMTP — where replies are sent from (required).** Same mailbox/App Password as
-IMAP for Gmail. Port 587 uses STARTTLS, 465 uses implicit TLS.
-
-| Variable | Purpose | Default |
-|---|---|---|
-| `SMTP_HOST` | SMTP server (`smtp.gmail.com` for Gmail) | — (required) |
-| `SMTP_USERNAME` | Mailbox login | — (required) |
-| `SMTP_PASSWORD` | App Password | — (required) |
-| `SMTP_FROM_ADDRESS` | From address on replies | — (required) |
-| `SMTP_PORT` | SMTP port | `587` |
-| `SMTP_FROM_NAME` | Display name on replies | `Submission Triage` |
-| `OUTBOUND_PROVIDER` | `smtp`, `log`, or blank (auto) | auto |
-
-**LLM — Anthropic (optional).**
-
-| Variable | Purpose | Default |
-|---|---|---|
-| `ANTHROPIC_API_KEY` | Enables LLM classification + field extraction | — (off if blank) |
-| `ANTHROPIC_MODEL` | Model id | `claude-haiku-4-5` |
-| `ANTHROPIC_TIMEOUT_SECONDS` | Per-call timeout | `30` |
-| `ANTHROPIC_MAX_TOKENS` | Output token cap | `2048` |
-
-**Escalation timers (optional).**
-
-| Variable | Purpose | Default |
-|---|---|---|
-| `ESCALATION_INTERVAL_MINUTES` | How often the worker runs | `15` |
-| `ESCALATION_THRESHOLD_HOURS` | Quiet time before a case escalates | `72` |
-| `ESCALATION_AUTO_CLOSE_AFTER_HOURS` | Auto-close after quiet hours | `336` |
-| `ESCALATION_DIGEST_INTERVAL_HOURS` | Digest send cadence | `24` |
-| `ESCALATION_DIGEST_RECIPIENT` | Digest recipient | — (off if blank) |
-
-**Other (optional):** `DB_PATH` (`./data/submission-triage.db`),
-`CHECKLISTS_DIR` (`./checklists`), `HTTP_PORT` (`8080`, health endpoint only),
-logging (`LOG_LEVEL`, `LOG_FORMAT`, `LOG_DIR`), reply worker pool
-(`REPLY_WORKERS`, `REPLY_QUEUE_SIZE`), and retries (`RETRY_ATTEMPTS`,
-`RETRY_BASE_DELAY_MS`). See `.env.example` for all of them.
+The rest are timing and safety limits with sensible defaults; you shouldn't need
+to touch them.
 
 ## Customizing checklists
 
-A checklist is one YAML file per policy type in `checklists/`. Add a file and
-restart. Here's an excerpt of the shipped CGL checklist, annotated (the real
-file lists more required items):
+One YAML file per line of business in `checklists/`. Add or edit a file and
+restart — here's the shipped CGL checklist, trimmed:
 
 ```yaml
 name: Commercial General Liability
-policy_type: cgl                 # matched against the inferred line of business
+policy_type: cgl
 required_items:
   - id: acord_125
-    description: "ACORD 125 Commercial Insurance Application"   # shown to the sender
+    description: "ACORD 125 Commercial Insurance Application"   # shown to the broker
     match:
       filename_patterns: ["*ACORD*125*", "*application*"]       # tried first
-      content_keywords: ["Commercial Insurance Application"]    # then document text
+      content_keywords: ["Commercial Insurance Application"]    # then the document text
   - id: loss_runs
     description: "Loss runs for the past 5 years"
     match:
       filename_patterns: ["*loss*run*", "*claims*history*"]
       content_keywords: ["Loss Run", "Claims History"]
-    requires_field:            # the only supported predicate beyond presence
-      name: years_covered      # field the LLM extracts from the document
+    requires_field:            # optional: check a value, not just presence
+      name: years_covered
       type: number
-      min_value: 5             # fails if the value is below this
-      unit: years              # noun used in the customer-facing reply
+      min_value: 5             # a 3-year loss run is reported as not enough
+      unit: years              # wording used in the reply to the broker
 escalation:
-  threshold_hours: 72          # overrides the global threshold for this line
+  threshold_hours: 72          # overrides the global setting for this line
 ```
 
-`requires_field` is the **only** rule beyond "is the document present", and it
-needs the LLM enabled to extract the value (without a key it passes on
-presence). Wording like "5 years" in the other four checklists is descriptive
-text only — it is not enforced. Unknown YAML keys are rejected at startup.
+`description` is what a broker reads, so write it the way you'd write it to
+them. `requires_field` is the only check beyond "is the document here", and it
+needs `ANTHROPIC_API_KEY` set to read the value — without a key it passes on the
+document being present. Mistyped keys are rejected at startup rather than
+silently ignored.
 
 ## Help
 
@@ -200,9 +293,19 @@ maintainer on LinkedIn.
 
 ## Contributing
 
-Issues and pull requests are welcome — for anything non-trivial, open an issue
-first to discuss the approach. CI runs gofmt, golangci-lint, and `go test -race`
-on every PR; keep it green.
+Issues and pull requests welcome — for anything non-trivial, open an issue first
+to discuss the approach.
+
+CI runs gofmt, golangci-lint, and the tests on every PR; keep it green. Locally:
+
+```bash
+make test               # unit
+make test-integration   # in-process IMAP + SMTP servers, plus the sample corpus
+make test-stress        # concurrency and load, against a real database
+```
+
+The tests are the specification — most describe the behaviour they protect and
+why it matters, so start there rather than reverse-engineering from the code.
 
 ## License
 

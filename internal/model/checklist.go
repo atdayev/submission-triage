@@ -25,6 +25,7 @@ const (
 	ReasonFieldShortfall    ReasonCode = "field_shortfall"    // present, but a required field fails its rule
 	ReasonEncrypted         ReasonCode = "encrypted"          // present, but password-protected; the broker can resend it unlocked
 	ReasonMissingAttachment ReasonCode = "missing_attachment" // the broker referenced files but attached none
+	ReasonPolicyUnknown     ReasonCode = "policy_unknown"     // no checklist matched; the broker can name the line of business
 )
 
 const (
@@ -32,7 +33,22 @@ const (
 	reasonLowConfidenceText = "received but not confidently identified"
 	reasonUnreadableText    = "received but no readable text (appears scanned)"
 	reasonEncryptedText     = "received but password-protected (cannot open)"
+	reasonPolicyUnknownText = "awaiting clarification from sender"
 )
+
+// PolicyUnknownItemID is the synthetic item standing in for an undetermined policy type.
+const PolicyUnknownItemID = "policy_unknown"
+
+// PolicyUnknownItem is the sole outstanding item on a submission no checklist
+// matched; its reason code routes it as a broker-actionable gap.
+func PolicyUnknownItem() MissingItem {
+	return MissingItem{
+		ID:          PolicyUnknownItemID,
+		Description: "Policy type not yet determined",
+		Reason:      reasonPolicyUnknownText,
+		Code:        ReasonPolicyUnknown,
+	}
+}
 
 // MissingItem is a required item not satisfied by a submission.
 type MissingItem struct {
@@ -40,13 +56,11 @@ type MissingItem struct {
 	Description string
 	Reason      string
 	Code        ReasonCode
-	// Confidence is the classifier's best guess for a low-confidence item, so a
-	// reviewer sees how close the call was; 0 when not applicable.
+	// Confidence is the classifier's best guess for a low-confidence item; 0 when not applicable.
 	Confidence float64 `json:",omitempty"`
 }
 
-// RequiresReview reports whether any missing item needs a human — an unreadable
-// or low-confidence document, neither of which the broker can act on.
+// RequiresReview reports whether any missing item needs a human rather than the broker.
 func RequiresReview(missing []MissingItem) bool {
 	for _, m := range missing {
 		if m.Code == ReasonUnreadable || m.Code == ReasonLowConfidence {
@@ -56,14 +70,13 @@ func RequiresReview(missing []MissingItem) bool {
 	return false
 }
 
-// BrokerActionable returns the missing items worth asking the broker for — absent
-// docs, field shortfalls, password-protected files, and referenced-but-missing
-// attachments; unreadable/low-confidence items are the agency's, omitted.
+// BrokerActionable returns the missing items worth asking the broker for;
+// unreadable/low-confidence items are the agency's, omitted.
 func BrokerActionable(missing []MissingItem) []MissingItem {
 	out := make([]MissingItem, 0, len(missing))
 	for _, m := range missing {
 		switch m.Code {
-		case ReasonNotProvided, ReasonFieldShortfall, ReasonEncrypted, ReasonMissingAttachment:
+		case ReasonNotProvided, ReasonFieldShortfall, ReasonEncrypted, ReasonMissingAttachment, ReasonPolicyUnknown:
 			out = append(out, m)
 		}
 	}
@@ -124,8 +137,7 @@ type itemDocs struct {
 }
 
 // EvaluateChecklist returns the items a submission is still missing. A document
-// counts toward an item only if it clears the confidence floor and is readable;
-// otherwise the item is unsatisfied with a reason code the caller routes on.
+// counts toward an item only if it clears the confidence floor and is readable.
 func EvaluateChecklist(s Submission, c Checklist, opts ChecklistOptions) []MissingItem {
 	byItem := make(map[string]*itemDocs, len(c.Required))
 	for i := range s.Documents {
@@ -188,8 +200,7 @@ func EvaluateChecklist(s Submission, c Checklist, opts ChecklistOptions) []Missi
 }
 
 // unsatisfiedItem classifies why an item with no qualifying document is missing,
-// most-specific cause first: encrypted (resend unlocked) over unreadable over
-// low-confidence over not-provided.
+// most-specific cause first.
 func unsatisfiedItem(item RequiredItem, b *itemDocs) MissingItem {
 	m := MissingItem{ID: item.ID, Description: item.Description}
 	switch {

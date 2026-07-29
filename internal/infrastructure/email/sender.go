@@ -21,12 +21,10 @@ type LogSender struct {
 	log *logrus.Entry
 }
 
-// NewLogSender returns a LogSender writing to log.
 func NewLogSender(log *logrus.Entry) *LogSender {
 	return &LogSender{log: log}
 }
 
-// Name reports the outbound channel.
 func (s *LogSender) Name() string { return "log" }
 
 // SendThreadedReply logs r and returns a synthetic message id.

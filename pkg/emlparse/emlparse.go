@@ -21,10 +21,9 @@ const (
 	maxAttachments    = 100 // bound per-message attachment count
 )
 
-// autoResponseHeaders are surfaced on Payload.Headers so the pipeline can
-// detect automated mail (out-of-office, bulk, list, bounces) and record why a
-// reply was suppressed. Not every header drives detection (see detectAutoSubmitted);
-// X-Auto-Response-Suppress is kept only for the suppression audit trail.
+// autoResponseHeaders are surfaced on Payload.Headers so the pipeline can detect
+// automated mail and record why a reply was suppressed. Not every header drives
+// detection — X-Auto-Response-Suppress is kept only for the audit trail.
 var autoResponseHeaders = []string{
 	"Auto-Submitted",
 	"Precedence",
@@ -71,6 +70,10 @@ type Payload struct {
 	// our replies); BouncePermanent is true for a 5.x.x DSN or an unparseable code.
 	Bounce          bool
 	BouncePermanent bool
+	// BouncedMessageID is the Message-ID of the message that bounced, read from the
+	// DSN's embedded copy of it. Compliant reports also carry In-Reply-To, but many
+	// don't, and without this those bounces thread to nothing.
+	BouncedMessageID string
 }
 
 // FromFile parses an RFC822 message file into a Payload.
@@ -102,7 +105,7 @@ func FromReader(r io.Reader) (Payload, error) {
 	replyTo := splitAddress(msg.Header.Get("Reply-To"))
 	to := splitAddress(msg.Header.Get("To"))
 
-	text, atts, deliveryStatus, err := parseBody(msg)
+	text, atts, report, err := parseBody(msg)
 	if err != nil {
 		return p, err
 	}
@@ -129,15 +132,38 @@ func FromReader(r io.Reader) (Payload, error) {
 	p.Attachments = atts
 
 	topType, ctParams, _ := mime.ParseMediaType(msg.Header.Get("Content-Type"))
-	p.Bounce, p.BouncePermanent = detectBounce(topType, ctParams, from.Email, msg.Header.Get("Return-Path"), deliveryStatus)
+	p.Bounce, p.BouncePermanent = detectBounce(topType, ctParams, from.Email, msg.Header.Get("Return-Path"), report.deliveryStatus)
+	if p.Bounce {
+		p.BouncedMessageID = report.originalMessageID
+	}
 	return p, nil
 }
 
+// bounceReport is what a delivery-status notification's parts yield: the DSN status
+// field and the Message-ID of the message that failed.
+type bounceReport struct {
+	deliveryStatus    string
+	originalMessageID string
+}
+
+// originalMessageID reads the Message-ID out of a DSN's embedded copy of the failed
+// message — a message/rfc822 body or a text/rfc822-headers part.
+func originalMessageID(body []byte) string {
+	for line := range strings.SplitSeq(string(body), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			return "" // end of the header block; the body below is not ours to read
+		}
+		if !strings.HasPrefix(strings.ToLower(line), "message-id:") {
+			continue
+		}
+		return strings.Trim(strings.TrimSpace(line[len("message-id:"):]), "<>")
+	}
+	return ""
+}
+
 // detectBounce reports whether the message is a delivery-status notification and,
-// if so, whether the failure is permanent. Any one of three signals triggers it:
-// a multipart/report delivery-status, a mailer-daemon/postmaster sender, or a
-// null return-path alongside a message/delivery-status part. A 4.x.x DSN status
-// is transient; anything else (including an unparseable code) is permanent.
+// if so, whether the failure is permanent.
 func detectBounce(mediaType string, ctParams map[string]string, fromEmail, returnPath, deliveryStatus string) (bounce, permanent bool) {
 	report := mediaType == "multipart/report" && strings.EqualFold(ctParams["report-type"], "delivery-status")
 	nullReturn := strings.TrimSpace(returnPath) == "<>"
@@ -146,6 +172,10 @@ func detectBounce(mediaType string, ctParams map[string]string, fromEmail, retur
 		return false, false
 	}
 	return true, dsnPermanent(deliveryStatus)
+}
+
+func isOriginalMessagePart(partType string) bool {
+	return partType == "message/rfc822" || partType == "text/rfc822-headers"
 }
 
 func isDaemonAddress(email string) bool {
@@ -173,35 +203,36 @@ func dsnPermanent(deliveryStatus string) bool {
 	return true
 }
 
-func parseBody(msg *mail.Message) (string, []Attachment, string, error) {
+func parseBody(msg *mail.Message) (string, []Attachment, bounceReport, error) {
+	var report bounceReport
 	contentType := msg.Header.Get("Content-Type")
 	mediaType, params, err := mime.ParseMediaType(contentType)
 	if err != nil || !strings.HasPrefix(mediaType, "multipart/") || params["boundary"] == "" {
 		body, derr := decodeBody(msg.Body, msg.Header.Get("Content-Transfer-Encoding"))
 		if derr != nil {
-			return "", nil, "", derr
+			return "", nil, report, derr
 		}
 		text := toUTF8(body, params["charset"])
 		if strings.HasPrefix(mediaType, "text/html") {
 			text = stripHTML(text)
 		}
-		return text, nil, "", nil
+		return text, nil, report, nil
 	}
 
-	var text, htmlBody, deliveryStatus string
+	var text, htmlBody string
 	var atts []Attachment
-	if err := walkParts(msg.Body, params["boundary"], &text, &htmlBody, &atts, &deliveryStatus, 0); err != nil {
-		return text, atts, deliveryStatus, err
+	if err := walkParts(msg.Body, params["boundary"], &text, &htmlBody, &atts, &report, 0); err != nil {
+		return text, atts, report, err
 	}
 	if text == "" && htmlBody != "" {
 		text = stripHTML(htmlBody)
 	}
-	return text, atts, deliveryStatus, nil
+	return text, atts, report, nil
 }
 
 // walkParts collects text, HTML, and attachments from a multipart stream,
 // recovering what it parsed past per-part or truncated-stream errors.
-func walkParts(r io.Reader, boundary string, text, htmlBody *string, atts *[]Attachment, deliveryStatus *string, depth int) error {
+func walkParts(r io.Reader, boundary string, text, htmlBody *string, atts *[]Attachment, report *bounceReport, depth int) error {
 	if depth > maxMultipartDepth {
 		return fmt.Errorf("multipart: nesting exceeds depth %d", maxMultipartDepth)
 	}
@@ -222,7 +253,7 @@ func walkParts(r io.Reader, boundary string, text, htmlBody *string, atts *[]Att
 
 		if strings.HasPrefix(partType, "multipart/") {
 			// nested-walk failures don't abort the outer walk; recover what we can
-			_ = walkParts(part, partParams["boundary"], text, htmlBody, atts, deliveryStatus, depth+1)
+			_ = walkParts(part, partParams["boundary"], text, htmlBody, atts, report, depth+1)
 			continue
 		}
 
@@ -233,8 +264,14 @@ func walkParts(r io.Reader, boundary string, text, htmlBody *string, atts *[]Att
 
 		// a delivery-status report part carries the DSN Status code that tells a
 		// hard bounce from a transient one
-		if partType == "message/delivery-status" && *deliveryStatus == "" {
-			*deliveryStatus = string(body)
+		if partType == "message/delivery-status" && report.deliveryStatus == "" {
+			report.deliveryStatus = string(body)
+			continue
+		}
+		// the report's copy of the failed message carries its Message-ID, the only
+		// thread anchor a DSN without In-Reply-To has
+		if isOriginalMessagePart(partType) && report.originalMessageID == "" {
+			report.originalMessageID = originalMessageID(body)
 			continue
 		}
 

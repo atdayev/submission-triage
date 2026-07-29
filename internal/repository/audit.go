@@ -19,15 +19,19 @@ import (
 type AuditRepository interface {
 	Append(ctx context.Context, e *model.AuditEntry) error
 	ListBySubmission(ctx context.Context, submissionID string) ([]model.AuditEntry, error)
+	// ListSubmissionIDsByEvent returns the distinct submission ids carrying an event
+	// of this type recorded at or after since.
+	ListSubmissionIDsByEvent(ctx context.Context, eventType model.EventType, sinceUnixNano int64) ([]string, error)
+	// Prune deletes entries older than the cutoff, returning how many went. Nothing
+	// else deletes from audit_log, so without this the table grows forever.
+	Prune(ctx context.Context, olderThanUnixNano int64) (int64, error)
 }
 
-// AuditRepositoryImpl is the SQLite-backed AuditRepository.
 type AuditRepositoryImpl struct {
 	db  *sql.DB
 	log *logrus.Entry
 }
 
-// NewAuditRepository returns a SQLite-backed AuditRepository.
 func NewAuditRepository(db *sql.DB, log *logrus.Entry) *AuditRepositoryImpl {
 	return &AuditRepositoryImpl{db: db, log: log}
 }
@@ -69,6 +73,30 @@ func (r *AuditRepositoryImpl) ListBySubmission(ctx context.Context, submissionID
 	}
 	defer rows.Close()
 	return r.scanAuditRows(rows)
+}
+
+// ListSubmissionIDsByEvent returns the distinct submission ids with an event of
+// this type at or after since.
+func (r *AuditRepositoryImpl) ListSubmissionIDsByEvent(ctx context.Context, eventType model.EventType, sinceUnixNano int64) ([]string, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT DISTINCT submission_id FROM audit_log
+		WHERE event_type = ? AND created_at >= ? AND submission_id != ''`,
+		string(eventType), sinceUnixNano)
+	if err != nil {
+		return nil, fmt.Errorf("audit: query by event: %w", err)
+	}
+	defer rows.Close()
+	return scanIDs(rows, "audit submission id")
+}
+
+// Prune deletes entries older than the cutoff.
+func (r *AuditRepositoryImpl) Prune(ctx context.Context, olderThanUnixNano int64) (int64, error) {
+	res, err := r.db.ExecContext(ctx, `DELETE FROM audit_log WHERE created_at < ?`, olderThanUnixNano)
+	if err != nil {
+		return 0, fmt.Errorf("audit: prune: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
 }
 
 func (r *AuditRepositoryImpl) scanAuditRows(rows *sql.Rows) ([]model.AuditEntry, error) {

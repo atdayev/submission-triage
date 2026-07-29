@@ -35,7 +35,6 @@ const (
 
 // FilenameOnlyMatches returns the item ids a filename glob matched with no
 // keyword or LLM corroboration; the digest flags these as content-unverified.
-// An id backed by any stronger evidence is excluded.
 func FilenameOnlyMatches(docs []Document) []string {
 	filename := map[string]bool{}
 	corroborated := map[string]bool{}

@@ -18,6 +18,8 @@ type fileOp struct {
 	folder string
 }
 
+const testUIDValidity = 42
+
 type fakeMailbox struct {
 	msgs          []rawMessage
 	seen          []uint32
@@ -26,6 +28,7 @@ type fakeMailbox struct {
 	ops           []string // ordered log of "seen"/"flag"/"file" for ordering assertions
 	fileErr       error
 	fetchLimit    int
+	fetchSince    time.Time
 	fetchErr      error
 	closed        bool
 	holdIDs       []string // Message-IDs ScanFolder returns
@@ -33,10 +36,43 @@ type fakeMailbox struct {
 	scanErr       error
 }
 
-func (f *fakeMailbox) FetchUnseen(_ context.Context, limit int) ([]rawMessage, error) {
+// fakeControl records failure bookkeeping and hands back a fixed boot cutoff.
+type fakeControl struct {
+	bootAt   time.Time
+	attempts map[uint32]int
+	cleared  []uint32
+	recErr   error
+}
+
+func newFakeControl() *fakeControl { return &fakeControl{attempts: map[uint32]int{}} }
+
+func (f *fakeControl) FirstBootAt(_ context.Context, now time.Time) (time.Time, error) {
+	if f.bootAt.IsZero() {
+		f.bootAt = now
+	}
+	return f.bootAt, nil
+}
+
+func (f *fakeControl) RecordFailure(_ context.Context, _, uid uint32, _ string, _ time.Time) (int, error) {
+	if f.recErr != nil {
+		return 0, f.recErr
+	}
+	f.attempts[uid]++
+	return f.attempts[uid], nil
+}
+
+func (f *fakeControl) ClearFailure(_ context.Context, _, uid uint32) error {
+	f.cleared = append(f.cleared, uid)
+	return nil
+}
+
+func (f *fakeMailbox) FetchUnseen(_ context.Context, limit int, since time.Time) ([]rawMessage, error) {
 	f.fetchLimit = limit
+	f.fetchSince = since
 	return f.msgs, f.fetchErr
 }
+
+func (f *fakeMailbox) UIDValidity() uint32 { return testUIDValidity }
 
 func (f *fakeMailbox) MarkSeen(_ context.Context, uid uint32) error {
 	f.seen = append(f.seen, uid)
@@ -102,13 +138,19 @@ func (f *fakeIngester) ReconcileHold(_ context.Context, messageIDs []string) err
 }
 
 func testPoller(mb mailbox, ing ingester) *Poller {
+	return testPollerWithControl(mb, ing, newFakeControl())
+}
+
+func testPollerWithControl(mb mailbox, ing ingester, ctrl ingestControl) *Poller {
 	return &Poller{
-		dial:       func(context.Context) (mailbox, error) { return mb, nil },
-		ingest:     ing,
-		interval:   time.Hour,
-		batchLimit: 50,
-		mailbox:    "INBOX",
-		log:        logrus.NewEntry(logrus.New()),
+		dial:        func(context.Context) (mailbox, error) { return mb, nil },
+		ingest:      ing,
+		control:     ctrl,
+		interval:    time.Hour,
+		batchLimit:  50,
+		maxAttempts: 5,
+		mailbox:     "INBOX",
+		log:         logrus.NewEntry(logrus.New()),
 	}
 }
 
@@ -350,6 +392,7 @@ func TestNewPoller_SeedsLastPollAtStartup(t *testing.T) {
 		config.IMAPConfig{Host: "imap.x", Username: "u", Password: "p", PollIntervalSeconds: 30},
 		PasswordAuth("u", "p"),
 		&fakeIngester{},
+		newFakeControl(),
 		logrus.NewEntry(logrus.New()),
 	)
 	// a freshly booted poller must not read as stale before its first tick

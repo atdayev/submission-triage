@@ -98,7 +98,6 @@ func Do(ctx context.Context, attempts int, baseDelay time.Duration, fn func(ctx 
 	return fmt.Errorf("retry exhausted after %d attempts: %w", attempts, lastErr)
 }
 
-// Error returns the wrapped error's message.
 func (p *Permanent) Error() string {
 	if p.Err == nil {
 		return "permanent error"

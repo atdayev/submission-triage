@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -24,21 +25,31 @@ type OutboxRepository interface {
 	// retryCutoff). A never-attempted row is due as soon as not_before passes.
 	ListPending(ctx context.Context, now, retryCutoff time.Time, limit int) ([]model.OutboxEntry, error)
 	Update(ctx context.Context, id string, status model.OutboxStatus, attempts int, lastErr string) error
-	// MarkSent marks a pending row sent only if it hasn't been superseded since
-	// version (the updated_at observed when the reply was read for sending). If a
-	// follow-up coalesced into the row in the meantime (updated_at advanced), the
-	// mark no-ops and the newer reply stays pending for the sweeper — so a
-	// coalesced reply is never lost to a stale mark-sent.
+	// MarkSent marks a pending row sent only if updated_at still matches version. A
+	// follow-up that coalesced into the row advances it, so the mark no-ops and the newer
+	// reply stays pending rather than being lost to a stale mark-sent.
 	MarkSent(ctx context.Context, id string, version time.Time) error
+	// GetPending re-reads a row that is still pending, returning ok=false once it has
+	// been sent or failed. ListPending's result is a snapshot: by the time the sweeper
+	// reaches a row the online path may already have sent it, and delivering from the
+	// stale snapshot would send the broker a second copy.
+	GetPending(ctx context.Context, id string) (*model.OutboxEntry, bool, error)
+	// ExpirePending fails pending rows created before the cutoff. A row whose
+	// not_before never came due is never handed to the sender, so its attempt count
+	// never rises and it can never dead-letter — it would hold its submission's
+	// one-pending slot forever.
+	ExpirePending(ctx context.Context, olderThanUnixNano int64) (int64, error)
+	// Prune deletes settled (sent/failed) rows older than the cutoff.
+	Prune(ctx context.Context, olderThanUnixNano int64) (int64, error)
+	// ExpirePendingForSubmissions fails the pending rows of the given submissions.
+	ExpirePendingForSubmissions(ctx context.Context, submissionIDs []string, reason string) (int64, error)
 }
 
-// OutboxRepositoryImpl is the SQLite-backed OutboxRepository.
 type OutboxRepositoryImpl struct {
 	db  *sql.DB
 	log *logrus.Entry
 }
 
-// NewOutboxRepository returns a SQLite-backed OutboxRepository.
 func NewOutboxRepository(db *sql.DB, log *logrus.Entry) *OutboxRepositoryImpl {
 	return &OutboxRepositoryImpl{db: db, log: log}
 }
@@ -148,6 +159,35 @@ func (r *OutboxRepositoryImpl) ListPending(ctx context.Context, now, retryCutoff
 	return out, nil
 }
 
+// GetPending re-reads a row iff it is still pending.
+func (r *OutboxRepositoryImpl) GetPending(ctx context.Context, id string) (*model.OutboxEntry, bool, error) {
+	var (
+		e                           model.OutboxEntry
+		replyJSON, status           string
+		created, updated, notBefore int64
+	)
+	err := r.db.QueryRowContext(ctx, `
+		SELECT id, submission_id, reply_json, status, attempts, last_error, created_at, updated_at, not_before
+		FROM outbox WHERE id = ? AND status = ?`, id, string(model.OutboxPending)).
+		Scan(&e.ID, &e.SubmissionID, &replyJSON, &status, &e.Attempts, &e.LastError, &created, &updated, &notBefore)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("outbox: get pending: %w", err)
+	}
+	e.Status = model.OutboxStatus(status)
+	e.CreatedAt = time.Unix(0, created).UTC()
+	e.UpdatedAt = time.Unix(0, updated).UTC()
+	if notBefore != 0 {
+		e.NotBefore = time.Unix(0, notBefore).UTC()
+	}
+	if err := json.Unmarshal([]byte(replyJSON), &e.Reply); err != nil {
+		return nil, false, fmt.Errorf("outbox: decode pending reply: %w", err)
+	}
+	return &e, true, nil
+}
+
 // MarkSent marks a pending row sent iff its version (updated_at) is unchanged
 // since it was read; a superseded row (coalesced follow-up) is left pending.
 func (r *OutboxRepositoryImpl) MarkSent(ctx context.Context, id string, version time.Time) error {
@@ -161,6 +201,55 @@ func (r *OutboxRepositoryImpl) MarkSent(ctx context.Context, id string, version 
 		return fmt.Errorf("outbox: mark sent: %w", err)
 	}
 	return nil
+}
+
+// ExpirePending fails pending rows created before the cutoff.
+func (r *OutboxRepositoryImpl) ExpirePending(ctx context.Context, olderThanUnixNano int64) (int64, error) {
+	res, err := r.db.ExecContext(ctx, `
+		UPDATE outbox SET status = ?, last_error = ?, updated_at = ?
+		WHERE status = ? AND created_at < ?`,
+		string(model.OutboxFailed), "expired: pending past TTL", time.Now().UTC().UnixNano(),
+		string(model.OutboxPending), olderThanUnixNano,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("outbox: expire pending: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
+// ExpirePendingForSubmissions fails the pending rows of the given submissions.
+func (r *OutboxRepositoryImpl) ExpirePendingForSubmissions(ctx context.Context, submissionIDs []string, reason string) (int64, error) {
+	if len(submissionIDs) == 0 {
+		return 0, nil
+	}
+	in := placeholderList(len(submissionIDs))
+	args := make([]any, 0, len(submissionIDs)+4)
+	args = append(args, string(model.OutboxFailed), reason, time.Now().UTC().UnixNano(), string(model.OutboxPending))
+	for _, id := range submissionIDs {
+		args = append(args, id)
+	}
+	res, err := r.db.ExecContext(ctx, fmt.Sprintf(`
+		UPDATE outbox SET status = ?, last_error = ?, updated_at = ?
+		WHERE status = ? AND submission_id IN (%s)`, in), args...)
+	if err != nil {
+		return 0, fmt.Errorf("outbox: expire for submissions: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
+// Prune deletes settled rows older than the cutoff.
+func (r *OutboxRepositoryImpl) Prune(ctx context.Context, olderThanUnixNano int64) (int64, error) {
+	res, err := r.db.ExecContext(ctx, `
+		DELETE FROM outbox WHERE status IN (?, ?) AND created_at < ?`,
+		string(model.OutboxSent), string(model.OutboxFailed), olderThanUnixNano,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("outbox: prune: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
 }
 
 // Update sets the status, attempt count, and last error of an outbox entry.

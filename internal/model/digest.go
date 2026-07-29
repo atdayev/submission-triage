@@ -9,6 +9,7 @@ import (
 
 // Digest section keys — the bucket a submission falls into.
 const (
+	sectionReplyBlocked   = "reply_blocked"
 	sectionDeliveryFailed = "delivery_failed"
 	sectionEscalated      = "escalated"
 	sectionAwaiting       = "awaiting"
@@ -17,9 +18,9 @@ const (
 	sectionUnknown        = "unknown"
 )
 
-// digestSections lists the digest's groups in display priority: sections the
-// agency must act on first, complete at leisure, unknown-policy last.
+// digestSections lists the digest's groups in display priority.
 var digestSections = []struct{ key, title string }{
+	{sectionReplyBlocked, "Reply withheld — REPLIES_ENABLED=false, nothing was sent"},
 	{sectionDeliveryFailed, "Delivery failed — address unreachable, needs a human"},
 	{sectionEscalated, "Escalated — broker went quiet"},
 	{sectionAwaiting, "Awaiting the broker"},
@@ -29,8 +30,9 @@ var digestSections = []struct{ key, title string }{
 }
 
 // BuildDigest renders the daily status digest: open submissions grouped by status
-// priority with ages/outstanding items, a leading review count, flagged rows marked.
-func BuildDigest(subs []Submission, filenameOnly map[string][]string, omitted int, now time.Time) string {
+// priority. replyBlocked holds the ids whose reply the kill switch withheld — never
+// resent automatically, so the digest is the only place they surface.
+func BuildDigest(subs []Submission, filenameOnly map[string][]string, replyBlocked map[string]bool, omitted int, now time.Time) string {
 	if len(subs) == 0 {
 		return ""
 	}
@@ -40,7 +42,7 @@ func BuildDigest(subs []Submission, filenameOnly map[string][]string, omitted in
 		if s.NeedsReview {
 			review++
 		}
-		key := digestGroup(s)
+		key := digestGroup(s, replyBlocked[s.ID])
 		byKey[key] = append(byKey[key], s)
 	}
 
@@ -55,7 +57,7 @@ func BuildDigest(subs []Submission, filenameOnly map[string][]string, omitted in
 			continue
 		}
 		showFilenameOnly := sec.key == sectionAwaiting || sec.key == sectionComplete
-		// order the work queue by urgency: soonest to bind first, unknowns last
+		// order the work queue by urgency
 		sort.SliceStable(group, func(i, j int) bool { return bindLess(group[i], group[j]) })
 		fmt.Fprintf(&b, "\n%s (%d):\n", sec.title, len(group))
 		for i := range group {
@@ -72,11 +74,11 @@ func BuildDigest(subs []Submission, filenameOnly map[string][]string, omitted in
 	return b.String()
 }
 
-// digestGroup buckets a submission by priority. The two flags win over state: a
-// delivery failure (agency must fix the address) and a human hold (paused) are what
-// the reader needs to see first, regardless of the underlying state.
-func digestGroup(s Submission) string {
+// digestGroup buckets a submission by priority; flags win over state.
+func digestGroup(s Submission, replyBlocked bool) string {
 	switch {
+	case replyBlocked:
+		return sectionReplyBlocked
 	case s.DeliveryFailed:
 		return sectionDeliveryFailed
 	case s.OnHold:
@@ -116,8 +118,7 @@ func writeDigestRow(b *strings.Builder, s Submission, filenameOnly []string, now
 	}
 }
 
-// digestSubject leads with the named insured (the account the agency reasons in),
-// falling back to the subject line, which is often a generic "New Submission".
+// digestSubject leads with the named insured, falling back to the subject line.
 func digestSubject(s Submission) string {
 	if ni := strings.TrimSpace(s.NamedInsured); ni != "" {
 		return ni
@@ -148,8 +149,10 @@ func bindLess(a, b Submission) bool {
 }
 
 // bindLabel renders days-to-bind, e.g. "binds in 3d", "binds today", "bound 2d ago".
+// Whole UTC calendar days, not elapsed hours: a raw duration truncated to days puts
+// both today and tomorrow in the same bucket and labels the whole 48h span "today".
 func bindLabel(effective, now time.Time) string {
-	days := int(effective.Sub(now).Hours() / 24)
+	days := int(utcMidnight(effective).Sub(utcMidnight(now)) / (24 * time.Hour))
 	switch {
 	case days < 0:
 		return fmt.Sprintf("bound %dd ago", -days)
@@ -158,6 +161,11 @@ func bindLabel(effective, now time.Time) string {
 	default:
 		return fmt.Sprintf("binds in %dd", days)
 	}
+}
+
+func utcMidnight(t time.Time) time.Time {
+	u := t.UTC()
+	return time.Date(u.Year(), u.Month(), u.Day(), 0, 0, 0, 0, time.UTC)
 }
 
 // humanDuration renders a coarse age like "3h" or "2d".

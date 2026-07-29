@@ -108,9 +108,7 @@ func (r *reuseSource) Token(ctx context.Context) (string, error) {
 	return tok.AccessToken, nil
 }
 
-// classify reports the token error's class and whether it is permanent. The
-// token endpoint returns invalid_grant / invalid_client (and other 400s) for
-// revoked consent, a bad refresh token, or an expired secret — none retryable.
+// classify reports the token error's class and whether it is permanent.
 func classify(err error) (class string, permanent bool) {
 	var re *oauth2.RetrieveError
 	if !errors.As(err, &re) {

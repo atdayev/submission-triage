@@ -28,8 +28,10 @@ func TestSubmission_TransitionTo(t *testing.T) {
 		{"escalated to awaiting", StateEscalated, StateAwaiting, nil},
 		{"escalated to complete", StateEscalated, StateComplete, nil},
 		{"escalated to closed", StateEscalated, StateClosed, nil},
-		{"closed to awaiting rejected", StateClosed, StateAwaiting, ErrInvalidTransition},
-		{"closed to complete rejected", StateClosed, StateComplete, ErrInvalidTransition},
+		// a broker replying into a closed thread reopens it; rejecting the transition
+		// left the message unmarked and re-ingesting on every poll forever
+		{"closed reopens to awaiting", StateClosed, StateAwaiting, nil},
+		{"closed reopens to complete", StateClosed, StateComplete, nil},
 		{"closed to escalated rejected", StateClosed, StateEscalated, ErrInvalidTransition},
 	}
 	for _, tc := range cases {
